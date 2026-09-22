@@ -1,0 +1,9 @@
+# Sensitive keys and environment variables
+.env
+data/
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
