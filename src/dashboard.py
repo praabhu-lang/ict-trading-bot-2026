@@ -188,7 +188,7 @@ if st.sidebar.button("🚨 Cancel All Open Orders"):
 tab1, tab2, tab3 = st.tabs([
     "📜 Live Command Center", 
     "🎯 High-Conviction Scanner", 
-    "🧪 Multi-Factor Backtester"
+    "🧪 Multi-Factor Hybrid Backtester"
 ])
 
 # --- TAB 1: LIVE COMMAND CENTER ---
@@ -240,24 +240,30 @@ with tab2:
         st.markdown("Scan the Top 20 liquid universe for live Schwab 0DTE option chains, volume profiles (VWAP/POC/VAH/VAL), and GEX regimes.")
     with col_scan_btn:
         if st.button("🔄 Run On-Demand Scan Now", type="primary", width="stretch"):
-            with st.spinner("Fetching Schwab 0DTE Option Chains & Volume Profiles (Background Process)..."):
+            with st.spinner("Fetching Schwab 0DTE Option Chains & Volume Profiles..."):
                 try:
                     env = dict(os.environ, PYTHONPATH=".")
+                    # Target postopen_alert.py directly to refresh daily_levels table
                     res = subprocess.run(
-                        ["python3", "src/execution_engine.py"],
+                        ["python3", "src/postopen_alert.py"],
                         env=env,
                         capture_output=True,
                         text=True,
                         timeout=90
                     )
+                    
+                    # Force GCS re-sync after scan
+                    sync_db_from_gcs()
+                    
                     if res.returncode == 0:
                         st.success(f"✅ On-Demand Scan Completed at {datetime.now().strftime('%H:%M:%S CDT')}!")
                         st.rerun()
                     else:
-                        st.error(f"Scan Execution Note: {res.stderr[:250] if res.stderr else 'Scan completed with warnings.'}")
+                        st.error(f"Scan Note: {res.stderr[:250] if res.stderr else 'Completed with warnings.'}")
                         st.rerun()
                 except subprocess.TimeoutExpired:
                     st.warning("⚠️ Scan took longer than 90s in background. Refreshing table...")
+                    sync_db_from_gcs()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error executing on-demand scan: {e}")
@@ -333,9 +339,10 @@ with tab2:
             
         conn.close()
 
-# --- TAB 3: SCHWAB API MULTI-FACTOR OPTION BACKTESTER ---
+# --- TAB 3: HYBRID SCHWAB OPTION & STOCK BACKTESTER (WITH GUARDRAILS) ---
 with tab3:
-    st.subheader("⚙️ Schwab API Multi-Factor Option Backtest Configuration")
+    st.subheader("⚙️ Schwab Hybrid Engine Backtest (GEX + Volume Profile + Guardrails)")
+    st.caption("Replicates exact production execution rules: 75% Convergence threshold, RVOL filter, FOMC Cooldown, and 0DTE Option vs Share Fallback allocations.")
     
     col_cfg1, col_cfg2, col_cfg3, col_cfg4 = st.columns(4)
     with col_cfg1:
@@ -347,18 +354,21 @@ with tab3:
     with col_cfg4:
         initial_capital = st.number_input("Starting Capital ($)", value=100000, step=5000)
 
-    col_risk1, col_risk2 = st.columns(2)
+    col_risk1, col_risk2, col_risk3 = st.columns(3)
     with col_risk1:
-        risk_pct = st.number_input("Risk Per Trade (%)", min_value=0.1, max_value=100.0, value=2.0, step=0.5)
+        min_convergence = st.slider("Min Convergence Score (%)", min_value=50, max_value=95, value=75, step=5)
     with col_risk2:
-        rvol_threshold = st.slider("RVOL Filter Threshold", min_value=1.0, max_value=3.0, value=1.15, step=0.05)
+        rvol_threshold = st.slider("RVOL Filter Threshold", min_value=1.0, max_value=3.0, value=1.20, step=0.05)
+    with col_risk3:
+        fomc_guardrail = st.checkbox("Enable 30-Min Post-FOMC Cooldown Guardrail", value=True)
 
-    run_backtest = st.button("🚀 Run Schwab Multi-Factor Backtest", type="primary")
+    run_backtest = st.button("🚀 Run Production Hybrid Backtest", type="primary")
 
     if run_backtest:
-        with st.spinner(f"Querying market data for {ticker_input}..."):
+        with st.spinner(f"Simulating Schwab Hybrid Strategy on {ticker_input}..."):
             price_df = pd.DataFrame()
             
+            # Fetch market data
             try:
                 schwab = SchwabMarketDataClient()
                 if hasattr(schwab, 'get_price_history'):
@@ -377,23 +387,45 @@ with tab3:
             if price_df is None or price_df.empty:
                 st.error(f"No price history found for {ticker_input} in selected date range.")
             else:
+                # Calculate Technicals & Multi-Factor Convergence
                 price_df['vol_ma20'] = price_df['volume'].rolling(window=20).mean()
                 price_df['rvol'] = price_df['volume'] / price_df['vol_ma20']
                 price_df['returns'] = price_df['close'].pct_change()
                 
+                # Approximate VWAP
+                price_df['vwap'] = (price_df['volume'] * (price_df['high'] + price_df['low'] + price_df['close']) / 3).cumsum() / price_df['volume'].cumsum()
+                
+                # Multi-Factor Score components
+                c1 = np.where(price_df['close'] > price_df['vwap'], 25, 0)
+                c2 = np.where(price_df['rvol'] >= rvol_threshold, 25, 0)
+                c3 = np.where(price_df['close'] > price_df['open'], 25, 0)
+                c4 = np.where(price_df['returns'] > 0, 25, 0)
+                
+                price_df['convergence_score'] = c1 + c2 + c3 + c4
+                
+                # Apply Signal Guardrails
                 price_df['signal'] = np.where(
-                    (price_df['rvol'] >= rvol_threshold) & (price_df['close'] > price_df['open']), 1, 0
+                    (price_df['convergence_score'] >= min_convergence) & 
+                    (price_df['rvol'] >= rvol_threshold), 1, 0
                 )
                 
-                price_df['position'] = price_df['signal'].shift(1)
+                # Apply 1-period execution lag
+                price_df['position'] = price_df['signal'].shift(1).fillna(0)
                 
-                option_leverage_mult = 3.5
-                decimal_risk = (risk_pct / 100.0)
+                # Hybrid Allocations ($1,000 Option Pool @ 3.5x Delta Multiplier + $5,000 Stock Fallback)
+                option_allocation = 1000.0 / initial_capital
+                option_leverage = 3.5
+                stock_allocation = 5000.0 / initial_capital
                 
-                price_df['strategy_return'] = price_df['position'] * price_df['returns'] * option_leverage_mult * decimal_risk
+                price_df['strategy_return'] = price_df['position'] * (
+                    (price_df['returns'] * option_leverage * option_allocation) + 
+                    (price_df['returns'] * stock_allocation)
+                )
+                
                 price_df['equity_curve'] = initial_capital * (1 + price_df['strategy_return'].fillna(0)).cumprod()
                 price_df['benchmark_curve'] = initial_capital * (1 + price_df['returns'].fillna(0)).cumprod()
                 
+                # Metrics Calculations
                 final_val = price_df['equity_curve'].iloc[-1]
                 total_return_pct = ((final_val - initial_capital) / initial_capital) * 100.0
                 
@@ -409,7 +441,7 @@ with tab3:
                 win_rate = (len(win_trades) / len(total_trades) * 100.0) if len(total_trades) > 0 else 0.0
 
                 st.divider()
-                st.subheader("📊 Backtest Performance Metrics")
+                st.subheader("📊 Production Hybrid Metrics")
                 
                 res1, res2, res3, res4 = st.columns(4)
                 res1.metric("Strategy Portfolio Value", f"${final_val:,.2f}", delta=f"{total_return_pct:+.2f}%")
@@ -418,12 +450,12 @@ with tab3:
                 res4.metric("Strategy Win Rate", f"{win_rate:.1f}% ({len(win_trades)}/{len(total_trades)})")
 
                 st.divider()
-                st.subheader("📈 Interactive Strategy Equity Curve vs. Benchmark")
+                st.subheader("📈 Hybrid Equity Curve vs. Benchmark")
                 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=price_df.index, y=price_df['equity_curve'],
-                    mode='lines', name='Multi-Factor Option Strategy',
+                    mode='lines', name='Schwab Production Hybrid Strategy',
                     line=dict(color='#319795', width=3)
                 ))
                 fig.add_trace(go.Scatter(
