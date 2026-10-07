@@ -1,4 +1,3 @@
-# Paste code above into src/dashboard.py
 import os
 import json
 import sqlite3
@@ -243,10 +242,9 @@ with tab2:
         if st.button("🔄 Run On-Demand Scan Now", type="primary", width="stretch"):
             with st.spinner("Fetching Schwab 0DTE Option Chains & Volume Profiles (Background Process)..."):
                 try:
-                    # Execute scan in an isolated non-blocking subprocess to keep Streamlit UI responsive
                     env = dict(os.environ, PYTHONPATH=".")
                     res = subprocess.run(
-                        ["python3", "src/postopen_alert.py"],
+                        ["python3", "src/execution_engine.py"],
                         env=env,
                         capture_output=True,
                         text=True,
@@ -271,7 +269,6 @@ with tab2:
     if os.path.exists(DB_PATH):
         conn = sqlite3.connect(DB_PATH)
         
-        # 1. Daily Key Levels Table (With Explicit Bias / Action Column)
         try:
             levels_df = pd.read_sql_query('''
                 SELECT ticker AS Ticker, 
@@ -316,7 +313,6 @@ with tab2:
 
         st.divider()
 
-        # 2. Active Signals Table (>= 85% Conviction & CDT Timezone)
         try:
             signals_df = pd.read_sql_query('''
                 SELECT ticker AS Ticker, contract_symbol AS Contract, action AS Action, 
@@ -363,7 +359,6 @@ with tab3:
         with st.spinner(f"Querying market data for {ticker_input}..."):
             price_df = pd.DataFrame()
             
-            # 1. Try Schwab Client get_price_history / get_quotes safely
             try:
                 schwab = SchwabMarketDataClient()
                 if hasattr(schwab, 'get_price_history'):
@@ -371,7 +366,6 @@ with tab3:
             except Exception as e:
                 st.caption(f"Schwab API direct history fallback note: {e}")
                 
-            # 2. Fallback to Yahoo Finance historical candles if Schwab history method isn't bound
             if price_df is None or price_df.empty:
                 raw_data = yf.download(ticker_input, start=start_date, end=end_date, progress=False)
                 if not raw_data.empty:
@@ -383,20 +377,16 @@ with tab3:
             if price_df is None or price_df.empty:
                 st.error(f"No price history found for {ticker_input} in selected date range.")
             else:
-                # 3. Strategy Calculations
                 price_df['vol_ma20'] = price_df['volume'].rolling(window=20).mean()
                 price_df['rvol'] = price_df['volume'] / price_df['vol_ma20']
                 price_df['returns'] = price_df['close'].pct_change()
                 
-                # Signal Generation: RVOL Surge + Bullish Close
                 price_df['signal'] = np.where(
                     (price_df['rvol'] >= rvol_threshold) & (price_df['close'] > price_df['open']), 1, 0
                 )
                 
-                # Apply 1-day trade lag
                 price_df['position'] = price_df['signal'].shift(1)
                 
-                # Model Option Premium Leverage (~3.5x Delta Multiplier for 0DTE/ATM Options)
                 option_leverage_mult = 3.5
                 decimal_risk = (risk_pct / 100.0)
                 
@@ -404,7 +394,6 @@ with tab3:
                 price_df['equity_curve'] = initial_capital * (1 + price_df['strategy_return'].fillna(0)).cumprod()
                 price_df['benchmark_curve'] = initial_capital * (1 + price_df['returns'].fillna(0)).cumprod()
                 
-                # Performance Metrics
                 final_val = price_df['equity_curve'].iloc[-1]
                 total_return_pct = ((final_val - initial_capital) / initial_capital) * 100.0
                 
@@ -431,7 +420,6 @@ with tab3:
                 st.divider()
                 st.subheader("📈 Interactive Strategy Equity Curve vs. Benchmark")
                 
-                # Plotly Interactive Chart
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=price_df.index, y=price_df['equity_curve'],
