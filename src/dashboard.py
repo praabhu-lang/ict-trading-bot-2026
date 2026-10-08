@@ -62,8 +62,11 @@ if "code" in st.query_params:
     try:
         SchwabTokenStore(store).exchange_to_pending(_code)
         ss["schwab_pending_msg"] = "Schwab login received. Enter your Authenticator code to activate it."
+        print("Schwab OAuth code exchanged; pending Authenticator confirmation", file=sys.stderr, flush=True)
     except Exception as exc:  # noqa: BLE001
         ss["schwab_pending_msg"] = f"Schwab login could not be completed: {exc}"
+        ss["schwab_login_error"] = ss["schwab_pending_msg"]
+        print(f"Schwab OAuth code exchange FAILED: {exc}", file=sys.stderr, flush=True)
 
 if time.time() - ss.auth_at > SESSION_HOURS * 3600:
     st.title("🔒 ICT Trading Bot")
@@ -111,6 +114,9 @@ if SchwabTokenStore(store).has_pending():
     # The user just passed the Authenticator check, which authorizes activating the pending Schwab login.
     if SchwabTokenStore(store).activate_pending():
         st.success("✅ Schwab connected. The engine uses the new login within ~30 s (next cycle).")
+if ss.get("schwab_login_error"):
+    # Shown after unlock too - otherwise a failed exchange is invisible when the session was already open.
+    st.error(ss.pop("schwab_login_error"))
 ss.pop("schwab_pending_msg", None)
 
 settings = Settings.from_overrides(control())
@@ -304,11 +310,21 @@ with tab_levels:
     health = engine_status.get("data_health") or {}
     pm = (led.get_kv("premarket_report") if led else None) or {}
     last_scan = (led.get_kv("last_scan") if led else None) or {}
-    schwab_down = ("error" in str(health.get("chains:schwab", "")) or "error" in str(last_scan.get("schwab", ""))
-                   or bool(pm and not pm.get("token_ok") and str(pm.get("ts", "")).startswith(today.isoformat())))
-    if schwab_down:
+    schwab_err = str(health.get("chains:schwab", "")) if "error" in str(health.get("chains:schwab", "")) else (
+        str(last_scan.get("schwab", "")) if "error" in str(last_scan.get("schwab", "")) else "")
+    schwab_down = bool(schwab_err) or bool(pm and not pm.get("token_ok") and str(pm.get("ts", "")).startswith(today.isoformat()))
+    # The errors above are only refreshed by the next scan / tomorrow's pre-market run; a login saved after
+    # them means Schwab is already fixed and the engine just has not re-checked yet.
+    issued = SchwabTokenStore(store).load().get("issued_at")
+    checked = [datetime.fromisoformat(str(x)) for x in (engine_status.get("ts"), last_scan.get("ts"), pm.get("ts")) if x]
+    relogged = bool(issued and checked and datetime.fromisoformat(issued) > max(checked))
+    if schwab_down and relogged:
+        st.info(f"Schwab re-connected at {et(issued)}. Waiting for the engine's next scan to confirm option chains.")
+    elif schwab_down and ("token" in schwab_err.lower() or not schwab_err):
         st.error("Schwab login expired - no option chains or GEX, so the engine will not open trades. "
                  "Fix: Settings → Schwab connection → Log in to Schwab.")
+    elif schwab_down:
+        st.error(f"Schwab option-chain data failing - no GEX, so the engine will not open trades. {schwab_err[:200]}")
 
     level_cols = {"ticker": "Ticker", "spot": "Spot", "gap_pct": "Gap %", "vwap": "VWAP", "poc": "POC", "vah": "VAH",
                   "val": "VAL", "rvol": "RVOL", "gex_regime": "GEX", "gamma_flip": "Gamma flip",
