@@ -1,0 +1,16 @@
+# Never bake secrets, local state or old code into the image
+.env
+env.yaml
+*.env
+data/
+logs/
+*.log
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+legacy/
+docs/
+grafana/
+tests/

@@ -1,5 +1,6 @@
-# Sensitive keys and environment variables
 .env
+env.yaml
+*.env
 data/
 *.log
 __pycache__/
@@ -7,4 +8,4 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-env.yaml
+.pytest_cache/
