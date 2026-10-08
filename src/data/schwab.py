@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 API = "https://api.schwabapi.com"
 TOKEN_KEY = "secrets/schwab_token.json"
+PENDING_KEY = "secrets/schwab_token_pending.json"
 REFRESH_TOKEN_DAYS = 7
 
 
@@ -57,7 +58,24 @@ class SchwabTokenStore:
         q = urllib.parse.urlencode({"client_id": self.client_id, "redirect_uri": self.redirect_uri})
         return f"{API}/v1/oauth/authorize?{q}"
 
-    def exchange_redirect(self, redirected_url: str) -> dict:
+    def exchange_to_pending(self, redirected_url: str) -> dict:
+        """Swap the short-lived (~30 s) login code for a 7-day refresh token right away, but hold it as
+        pending until the dashboard user confirms with their Authenticator code."""
+        return self.exchange_redirect(redirected_url, key=PENDING_KEY)
+
+    def activate_pending(self) -> bool:
+        pending = self.store.read_json(PENDING_KEY, None) if self.store else None
+        if not pending or not pending.get("refresh_token"):
+            return False
+        self.store.update_json(TOKEN_KEY, lambda _: pending)
+        self.store.update_json(PENDING_KEY, lambda _: {})
+        return True
+
+    def has_pending(self) -> bool:
+        pending = self.store.read_json(PENDING_KEY, None) if self.store else None
+        return bool(pending and pending.get("refresh_token"))
+
+    def exchange_redirect(self, redirected_url: str, key: str = TOKEN_KEY) -> dict:
         """Complete the OAuth login from the URL Schwab redirected the browser to."""
         query = urllib.parse.urlparse(redirected_url.strip()).query
         code = urllib.parse.parse_qs(query).get("code", [redirected_url.strip()])[0]
@@ -76,7 +94,7 @@ class SchwabTokenStore:
             "issued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         if self.store:
-            self.store.update_json(TOKEN_KEY, lambda _: record)
+            self.store.update_json(key, lambda _: record)
         return record
 
 

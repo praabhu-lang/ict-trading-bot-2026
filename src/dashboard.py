@@ -54,15 +54,21 @@ ss.setdefault("auth_at", 0.0)
 ss.setdefault("failed", 0)
 ss.setdefault("locked_until", 0.0)
 
-# Schwab redirects back here with ?code=... after its login; keep it until we are authenticated.
+# Schwab redirects back here with ?code=... (valid ~30 s). Exchange it immediately into a PENDING token;
+# it only becomes active after the Authenticator code is entered, so there is no race with the login form.
 if "code" in st.query_params:
-    ss["schwab_code"] = st.query_params["code"]
+    _code = st.query_params["code"]
     st.query_params.clear()
+    try:
+        SchwabTokenStore(store).exchange_to_pending(_code)
+        ss["schwab_pending_msg"] = "Schwab login received. Enter your Authenticator code to activate it."
+    except Exception as exc:  # noqa: BLE001
+        ss["schwab_pending_msg"] = f"Schwab login could not be completed: {exc}"
 
 if time.time() - ss.auth_at > SESSION_HOURS * 3600:
     st.title("🔒 ICT Trading Bot")
-    if ss.get("schwab_code"):
-        st.info("Schwab login received. Enter your Authenticator code to save it (Schwab codes expire quickly).")
+    if ss.get("schwab_pending_msg"):
+        st.info(ss["schwab_pending_msg"])
     if time.time() < ss.locked_until:
         st.error(f"Too many failed attempts. Try again in {int(ss.locked_until - time.time())} s.")
         st.stop()
@@ -101,13 +107,11 @@ def save_control(changes: dict) -> None:
                                                  "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
 
 
-if ss.get("schwab_code"):
-    _code = ss.pop("schwab_code")
-    try:
-        SchwabTokenStore(store).exchange_redirect(_code)
-        st.success("Schwab connected. Market data jobs use the new login on their next run.")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Schwab login could not be saved ({exc}). Start again from Settings → Schwab connection.")
+if SchwabTokenStore(store).has_pending():
+    # The user just passed the Authenticator check, which authorizes activating the pending Schwab login.
+    if SchwabTokenStore(store).activate_pending():
+        st.success("✅ Schwab connected. The engine uses the new login within ~30 s (next cycle).")
+ss.pop("schwab_pending_msg", None)
 
 settings = Settings.from_overrides(control())
 led = get_ledger()

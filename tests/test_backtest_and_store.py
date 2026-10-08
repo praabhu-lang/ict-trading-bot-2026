@@ -108,3 +108,20 @@ def test_lock_waits_for_short_holder(tmp_path):
     with store.lock("locks/engine.lock", ttl_seconds=60, wait_seconds=5, poll_seconds=0.1):
         pass
     th.join()
+
+
+def test_schwab_relogin_is_pending_until_authenticator_confirms(tmp_path, monkeypatch):
+    import src.data.schwab as sch
+
+    monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
+    monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "sec")
+    monkeypatch.setenv("SCHWAB_REFRESH_TOKEN", "old-expired")
+    monkeypatch.setattr(sch.requests, "post", lambda *a, **k: _Resp(200, {"refresh_token": "fresh", "access_token": "a"}))
+    store = Store(str(tmp_path))
+    tokens = SchwabTokenStore(store)
+    tokens.exchange_to_pending("https://dash/?code=C0DE%40&session=x")
+    assert tokens.has_pending()
+    assert tokens.load()["refresh_token"] == "old-expired"      # not used until activated
+    assert tokens.activate_pending()
+    assert tokens.load()["refresh_token"] == "fresh" and not tokens.has_pending()
+    assert 6.9 < tokens.days_left() <= 7
