@@ -27,7 +27,7 @@ class Field:
 class Platform:
     id: str
     label: str
-    status: str                  # supported | experimental | unavailable
+    status: str                  # supported | experimental | crypto_only | unavailable
     note: str
     fields: tuple[Field, ...] = field(default_factory=tuple)
 
@@ -56,10 +56,13 @@ PLATFORMS: dict[str, Platform] = {
          Field("verify_ssl", "Verify gateway TLS certificate", env="IBKR_VERIFY_SSL", default="false", kind="bool")),
     ),
     "robinhood": Platform(
-        "robinhood", "Robinhood", "unavailable",
-        "Robinhood has no official API for stock or options trading (its official API covers crypto only). "
-        "Unofficial libraries reverse-engineer the app and can get an account restricted, so the bot does "
-        "not support it. It can be added here if Robinhood publishes an equities/options API.",
+        "robinhood", "Robinhood (Crypto Trading API)", "crypto_only",
+        "Robinhood's official API (docs.robinhood.com/crypto/trading) trades crypto pairs such as BTC-USD only. "
+        "You can save your key and test the connection here, but it cannot place this strategy's stock or "
+        "0DTE options orders, so it cannot be selected as the active platform. Unofficial stock/options "
+        "libraries are not supported (they reverse-engineer the app and risk account restrictions).",
+        (Field("api_key", "API key", env="ROBINHOOD_API_KEY"),
+         Field("private_key", "Ed25519 private key (base64)", secret=True, env="ROBINHOOD_PRIVATE_KEY")),
     ),
 }
 
@@ -85,7 +88,7 @@ class CredentialStore:
 
     def is_configured(self, platform_id: str) -> bool:
         p = PLATFORMS[platform_id]
-        if p.status == "unavailable":
+        if p.status == "unavailable" or not p.fields:
             return False
         creds = self.get(platform_id)
         return all(creds.get(f.key) not in (None, "") for f in p.fields if f.kind != "bool")

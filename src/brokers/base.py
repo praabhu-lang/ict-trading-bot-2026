@@ -36,6 +36,7 @@ class OrderStatus:
     filled_qty: float = 0.0
     filled_avg_price: float = 0.0
     legs: list[str] = field(default_factory=list)
+    order_type: str = ""       # market | limit | stop | ...
 
     @property
     def is_final(self) -> bool:
@@ -73,6 +74,15 @@ class Broker(ABC):
 
     @abstractmethod
     def submit_stock_bracket(self, symbol: str, qty: int, side: str, stop: float, target: float) -> OrderStatus: ...
+
+    def submit_stop(self, symbol: str, qty: float, side: str, stop_price: float) -> str:
+        """Resting stop (market-on-trigger) order held at the broker. Raise if unsupported."""
+        raise NotImplementedError(f"{self.name} does not support stop orders")
+
+    def replace_stop(self, order_id: str, qty: float, symbol: str, side: str, stop_price: float) -> str:
+        """Move a resting stop. Default: cancel then re-submit. Returns the (possibly new) order id."""
+        self.cancel(order_id)
+        return self.submit_stop(symbol, qty, side, stop_price)
 
     @abstractmethod
     def get_order(self, order_id: str) -> OrderStatus: ...

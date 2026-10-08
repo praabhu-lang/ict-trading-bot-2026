@@ -92,6 +92,8 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001
                 self._error("scan failed", exc)
         self.status["open_trades"] = len(self.ledger.open_trades())
+        if is_trading_day(now.date()) and now >= flatten_time(now, self.s) and not self.status["open_trades"]:
+            self.daily_summary(now)
         self.status["data_health"] = self.market.health
         self.ledger.set_kv("engine_status", self.status)
         return self.status
@@ -114,13 +116,16 @@ class TradingEngine:
             if t["symbol"] in positions:
                 continue
             exit_price, reason = None, "CLOSED_AT_BROKER"
-            for leg_id in _json_list(t.get("exit_order_ids")):
+            leg_ids = _json_list(t.get("exit_order_ids")) + ([t["broker_stop_id"]] if t.get("broker_stop_id") else [])
+            for leg_id in leg_ids:
                 try:
                     leg = self.broker.get_order(leg_id)
                 except Exception:  # noqa: BLE001
                     continue
                 if leg.status == "filled" and leg.filled_avg_price:
-                    exit_price, reason = leg.filled_avg_price, "BRACKET_EXIT"
+                    is_stop = leg_id == t.get("broker_stop_id") or leg.order_type.startswith("stop")
+                    exit_price = leg.filled_avg_price
+                    reason = "STOP_LOSS (broker)" if is_stop else "TARGET (broker)" if leg.order_type == "limit" else "BROKER_EXIT"
                     break
             if exit_price is None:
                 exit_price = 0.0 if t["asset_class"] == "option" else float(t["entry_price"])
@@ -163,9 +168,13 @@ class TradingEngine:
                     self.ledger.update_trade(t["id"], high_water=mid)
                     t["high_water"] = mid
                 reason = force_reason or option_exit_reason(t, mid, self.s, now, flatten_at, underlying_px, fading)
-                if reason:
-                    fill = self.execution.sell_option(t["symbol"], t["qty"], bid, ask, urgent=reason in URGENT_EXITS)
-                    self._record_exit(t, fill, reason, 100.0)
+                if not reason:
+                    self._sync_option_stop(t, bid)
+                    continue
+                if not self._release_broker_stop(t):
+                    continue  # the broker stop already filled; reconcile() books it next cycle
+                fill = self.execution.sell_option(t["symbol"], t["qty"], bid, ask, urgent=reason in URGENT_EXITS)
+                self._record_exit(t, fill, reason, 100.0)
             else:
                 price = underlying_px
                 try:
@@ -191,8 +200,11 @@ class TradingEngine:
             if t["asset_class"] == "stock" and t["direction"] == "bear":
                 partial_pnl = -partial_pnl
             self.ledger.update_trade(t["id"], qty=remaining,
+                                     realized_pnl=round(float(t.get("realized_pnl") or 0) + partial_pnl, 2),
                                      notes=f"{t.get('notes') or ''} partial exit {fill.qty}@{fill.avg_price:.2f} pnl {partial_pnl:.2f}")
             self.ledger.log("WARN", f"Partial exit {t['symbol']}: {fill.qty}/{t['qty']} - retrying remainder")
+            if t["asset_class"] == "option":
+                self._protect_option(t["id"], t["symbol"], remaining, float(t.get("broker_stop_price") or t["stop_price"]))
             return
         pnl = self.ledger.close_trade(t["id"], fill.avg_price, reason, multiplier)
         self.ledger.update_trade(t["id"], exit_order_ids=fill.order_ids)
@@ -200,6 +212,62 @@ class TradingEngine:
 
     def flatten_all(self, reason: str = "MANUAL_FLATTEN") -> None:
         self.manage_exits(self.clock.now(), force_reason=reason)
+
+    # ------------------------------------------------- broker-held option stops
+    def _protect_option(self, trade_id: int, symbol: str, qty: float, stop_price: float) -> str | None:
+        """Place a resting sell-stop at the broker so the position is protected even if the engine stops."""
+        try:
+            sid = self.broker.submit_stop(symbol, qty, "sell", stop_price)
+        except Exception as exc:  # noqa: BLE001
+            self.ledger.update_trade(trade_id, broker_stop_id=None, broker_stop_price=None)
+            self.ledger.log("ERROR", f"Broker stop for {symbol} not placed: {exc}")
+            self.notifier.send(
+                f"⚠️ No broker-side stop on {symbol}",
+                f"<p>The broker rejected the protective stop at {stop_price:.2f}: {html.escape(str(exc))}</p>"
+                f"<p>The engine still enforces the stop every 30 s while it runs.</p>",
+                dedupe_key=f"nostop:{trade_id}",
+            )
+            return None
+        self.ledger.update_trade(trade_id, broker_stop_id=sid, broker_stop_price=round(stop_price, 2))
+        return sid
+
+    def _release_broker_stop(self, t: dict) -> bool:
+        """Cancel the resting stop before an engine exit. False if it already filled (position is gone)."""
+        sid = t.get("broker_stop_id")
+        if not sid:
+            return True
+        try:
+            self.broker.cancel(sid)
+        except Exception as exc:  # noqa: BLE001 - may already be filled/cancelled
+            log.info("Cancel stop %s: %s", sid, exc)
+        try:
+            if self.broker.get_order(sid).status == "filled":
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        self.ledger.update_trade(t["id"], broker_stop_id=None)
+        return True
+
+    def _sync_option_stop(self, t: dict, bid: float) -> None:
+        """Re-place a missing stop, and ratchet it up to the trailing level once the trail is active."""
+        entry = float(t["entry_price"])
+        hard = entry * (1 - self.s.option_stop_pct)
+        hw_pnl = (float(t.get("high_water") or entry) - entry) / entry if entry else 0.0
+        trail = entry * (1 + hw_pnl - self.s.trail_giveback_pct) if hw_pnl >= self.s.trail_activate_pct else 0.0
+        desired = round(max(hard, trail), 2)
+        if bid > 0 and desired >= bid:
+            return  # would trigger immediately; the engine's own exit check handles this case
+        sid, current = t.get("broker_stop_id"), float(t.get("broker_stop_price") or 0)
+        if not sid:
+            self._protect_option(t["id"], t["symbol"], t["qty"], desired)
+            return
+        if desired >= current + max(0.05, current * 0.02):
+            try:
+                new_id = self.broker.replace_stop(sid, t["qty"], t["symbol"], "sell", desired)
+                self.ledger.update_trade(t["id"], broker_stop_id=new_id, broker_stop_price=desired)
+                self.ledger.log("INFO", f"Raised broker stop on {t['symbol']} {current:.2f} -> {desired:.2f}")
+            except Exception as exc:  # noqa: BLE001 - keep the existing stop
+                log.warning("Could not raise stop on %s: %s", t["symbol"], exc)
 
     # ----------------------------------------------------------------- entries
     def gates(self, now: datetime) -> Gate:
@@ -292,9 +360,15 @@ class TradingEngine:
                     underlying_stop=sig.stop, underlying_target=sig.target, signal_score=sig.score,
                     entry_order_id=fill.order_ids[-1], notes=f"delta {contract.delta:.2f} exp {contract.expiry}",
                 )
+                trade_id = self.ledger.open_trades()[-1]["id"]
+                stop_px = round(fill.avg_price * (1 - self.s.option_stop_pct), 2)
+                sid = self._protect_option(trade_id, contract.symbol, fill.qty, stop_px)
                 self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                           sig.target, sig.components, "TRADED_OPTION", contract.symbol)
-                self._trade_opened_email(sig, contract.symbol, fill.qty, fill.avg_price, "0DTE option")
+                self._trade_opened_email(
+                    sig, contract.symbol, fill.qty, fill.avg_price, "0DTE option",
+                    stop_note=(f"Broker stop placed @ {stop_px:.2f}" if sid else "⚠️ Broker stop NOT placed - engine-managed only"),
+                    target_px=round(fill.avg_price * (1 + self.s.option_target_pct), 2), stop_px=stop_px)
                 return True
             self.ledger.log("WARN", f"Option entry for {contract.symbol} did not fill - trying stock fallback")
         why = "no 0DTE contract within delta/spread/price limits" if not contract else f"size {qty} < 1 contract"
@@ -333,7 +407,10 @@ class TradingEngine:
         )
         self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                   sig.target, sig.components, "TRADED_STOCK", why)
-        self._trade_opened_email(sig, sig.ticker, fill.qty, fill.avg_price, f"stock fallback ({why})")
+        self._trade_opened_email(sig, sig.ticker, fill.qty, fill.avg_price, f"stock fallback ({why})",
+                                 stop_note=f"Bracket at broker: stop {sig.stop:.2f}, target {sig.target:.2f}"
+                                 if legs else "⚠️ Bracket legs not confirmed - check the broker",
+                                 target_px=sig.target, stop_px=sig.stop)
         return True
 
     def _data_outage(self, now: datetime) -> None:
@@ -358,21 +435,39 @@ class TradingEngine:
             dedupe_key=f"signal:{sig.ticker}:{sig.direction}:{sig.bar_time}",
         )
 
-    def _trade_opened_email(self, sig, symbol: str, qty: float, price: float, kind: str) -> None:
+    def _trade_opened_email(self, sig, symbol: str, qty: float, price: float, kind: str, stop_note: str = "",
+                            target_px: float | None = None, stop_px: float | None = None) -> None:
         self.notifier.send(
             f"🚀 OPENED {symbol} x{qty:g} @ {price:.2f} ({kind})",
-            table([{
-                "Underlying": sig.ticker, "Instrument": symbol, "Kind": kind, "Qty": qty, "Fill": price,
-                "Signal score": sig.score, "Underlying stop": sig.stop, "Underlying target": sig.target,
+            f"<p><b>{html.escape(stop_note)}</b></p>" + table([{
+                "Underlying": sig.ticker, "Direction": sig.direction, "Instrument": symbol, "Qty": qty, "Fill": price,
+                "Stop": stop_px, "Target": target_px, "Signal score": sig.score,
+                "Underlying invalidation": sig.stop, "Underlying target": sig.target,
                 "Broker": f"{self.broker.name}{' (paper)' if self.broker.is_paper else ' (LIVE)'}",
-            }]),
+            }]) + f"<p>Exits: stop/target, trailing after +{self.s.trail_activate_pct:.0%}, momentum fade, "
+                  f"and every position closes {self.s.flatten_minutes_before_close} min before the bell.</p>",
         )
 
     def _trade_closed_email(self, t: dict, price: float, reason: str, pnl: float) -> None:
+        icon = "🛑" if reason.startswith("STOP_LOSS") else "✅" if pnl >= 0 else "🔻"
         self.notifier.send(
-            f"{'✅' if pnl >= 0 else '🔻'} CLOSED {t['symbol']} {reason} P&L {pnl:+,.2f}",
+            f"{icon} CLOSED {t['symbol']} {reason} P&L {pnl:+,.2f}",
             table([{"Instrument": t["symbol"], "Qty": t["qty"], "Entry": t["entry_price"], "Exit": price,
                     "Reason": reason, "P&L $": pnl}]),
+        )
+
+    def daily_summary(self, now: datetime) -> None:
+        trades = [t for t in self.ledger.trades_on(now.date())]
+        closed = [t for t in trades if t["status"] == "CLOSED"]
+        total = sum(float(t["realized_pnl"] or 0) for t in closed)
+        sigs = self.ledger.signals_on(now.date())
+        self.notifier.send(
+            f"📊 Day summary {now:%a %b %d}: {len(closed)} trades, P&L {total:+,.2f}",
+            table([{"Instrument": t["symbol"], "Side": t["direction"], "Qty": t["qty"], "Entry": t["entry_price"],
+                    "Exit": t["exit_price"], "Reason": t["exit_reason"], "P&L $": t["realized_pnl"]} for t in closed])
+            + f"<p>Signals today: {len(sigs)} (traded {sum(1 for s in sigs if s['action'].startswith('TRADED'))}, "
+              f"blocked {sum(1 for s in sigs if s['action'] == 'BLOCKED')}).</p>",
+            dedupe_key=f"summary:{now.date().isoformat()}",
         )
 
 

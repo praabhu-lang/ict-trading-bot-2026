@@ -192,6 +192,9 @@ class IBKRBroker(Broker):
     def submit_market(self, symbol: str, qty: float, side: str) -> str:
         return self._place([self._order(symbol, qty, side, "MKT")])[0]
 
+    def submit_stop(self, symbol: str, qty: float, side: str, stop_price: float) -> str:
+        return self._place([self._order(symbol, qty, side, "STP", stop_price)])[0]
+
     def submit_stock_bracket(self, symbol: str, qty: int, side: str, stop: float, target: float) -> OrderStatus:
         parent = self._order(symbol, qty, side, "MKT")
         exit_side = "sell" if side == "buy" else "buy"
@@ -206,7 +209,7 @@ class IBKRBroker(Broker):
         status = _STATUS.get(str(d.get("order_status", "")).lower().replace(" ", ""), "new")
         filled = _num(d.get("cum_fill") or d.get("filled_quantity"))
         avg = _num(d.get("average_price") or d.get("avg_price"))
-        return OrderStatus(str(order_id), status, filled, avg)
+        return OrderStatus(str(order_id), status, filled, avg, order_type=str(d.get("order_type", "")).lower())
 
     def cancel(self, order_id: str) -> None:
         self._ensure()

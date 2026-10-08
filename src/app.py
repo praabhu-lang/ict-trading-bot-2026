@@ -4,6 +4,7 @@
   python -m src.app run --minutes 14     # engine loop (scheduled every 15 min during the session)
   python -m src.app cycle                # one engine cycle (debugging)
   python -m src.app flatten              # close every bot-managed position now
+  python -m src.app test-email           # verify Resend email alerts
   python -m src.app backtest --tickers SPY,QQQ --start 2026-08-01 --end 2026-09-30
 """
 from __future__ import annotations
@@ -115,6 +116,19 @@ def _premarket_locked(store: Store, send_email: bool) -> int:
     return 0
 
 
+def cmd_test_email() -> int:
+    from datetime import datetime, timezone
+
+    n = Notifier.from_env()
+    ok = n.send("✅ ICT Trading Bot - test alert",
+                f"<p>Email alerts are working. Sent {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC.</p>"
+                "<p>You will receive: pre-market plan, high-convergence signals, trade opened (with stop), "
+                "stop-loss / target / exit alerts, broker-stop warnings, data-outage and engine-error alerts, "
+                "and an end-of-day summary.</p>")
+    print("sent" if ok else f"FAILED: {n.last_error}")
+    return 0 if ok else 1
+
+
 def cmd_backtest(tickers: list[str], start: date, end: date, capital: float) -> int:
     from .backtest.data import HistoricalData
     from .backtest.engine import Backtester
@@ -136,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--minutes", type=float, default=14)
     sub.add_parser("cycle")
     sub.add_parser("flatten")
+    sub.add_parser("test-email")
     pre = sub.add_parser("premarket")
     pre.add_argument("--no-email", action="store_true")
     bt = sub.add_parser("backtest")
@@ -151,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(1, single=True)
     if a.cmd == "flatten":
         return cmd_run(1, flatten=True)
+    if a.cmd == "test-email":
+        return cmd_test_email()
     if a.cmd == "premarket":
         return cmd_premarket(not a.no_email)
     return cmd_backtest([t.strip().upper() for t in a.tickers.split(",")], a.start, a.end, a.capital)

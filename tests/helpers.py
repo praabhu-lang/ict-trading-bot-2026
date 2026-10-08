@@ -153,6 +153,8 @@ class FakeBroker(Broker):
         self.submitted: list[dict] = []
         self._ids = itertools.count(1)
         self.fill_limits = True
+        self.reject_stops = False
+        self.stops: dict[str, dict] = {}
 
     def account(self):
         return Account(self.equity, self.equity * 2, self.equity, self.equity)
@@ -197,6 +199,19 @@ class FakeBroker(Broker):
         oid = self._fill(symbol, qty, side, ask if side == "buy" else bid)
         self.submitted[-1].update({"stop": stop, "target": target, "bracket": True})
         return OrderStatus(oid, "filled", qty, ask if side == "buy" else bid, legs=["leg-tp", "leg-sl"])
+
+    def submit_stop(self, symbol, qty, side, stop_price):
+        if self.reject_stops:
+            raise RuntimeError("stop orders not supported")
+        oid = f"stop-{next(self._ids)}"
+        self.orders[oid] = OrderStatus(oid, "new", order_type="stop")
+        self.stops[oid] = {"symbol": symbol, "qty": qty, "side": side, "stop": stop_price}
+        return oid
+
+    def trigger_stop(self, oid, price):
+        s = self.stops[oid]
+        self.pos.pop(s["symbol"], None)
+        self.orders[oid] = OrderStatus(oid, "filled", s["qty"], price, order_type="stop")
 
     def get_order(self, order_id):
         return self.orders.get(order_id, OrderStatus(order_id, "canceled"))

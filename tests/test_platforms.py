@@ -26,7 +26,7 @@ def test_credentials_saved_blank_keeps_value_and_env_fallback(store, monkeypatch
 
 
 def test_registry_guards(store):
-    with pytest.raises(BrokerUnavailable, match="no official API"):
+    with pytest.raises(BrokerUnavailable, match="cannot trade stocks/options"):
         make_broker("robinhood", store)
     with pytest.raises(BrokerUnavailable, match="not configured"):
         make_broker("alpaca_paper", store)
@@ -87,3 +87,20 @@ def test_ibkr_option_order_confirms_prompt_and_reads_fill():
     assert order["conid"] == 111 and order["side"] == "BUY" and order["orderType"] == "LMT" and order["price"] == 1.23
     st = b.get_order("987")
     assert st.status == "filled" and st.filled_qty == 3 and st.filled_avg_price == 1.23
+
+
+def test_robinhood_crypto_signing_matches_ed25519():
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+
+    from src.brokers.robinhood_crypto import RobinhoodCryptoClient
+
+    key = Ed25519PrivateKey.generate()
+    seed = key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    client = RobinhoodCryptoClient("rh-key", base64.b64encode(seed).decode())
+    h = client._headers("GET", "/api/v1/crypto/trading/accounts/")
+    msg = f"rh-key{h['x-timestamp']}/api/v1/crypto/trading/accounts/GET".encode()
+    key.public_key().verify(base64.b64decode(h["x-signature"]), msg)   # raises if wrong
+    assert h["x-api-key"] == "rh-key"

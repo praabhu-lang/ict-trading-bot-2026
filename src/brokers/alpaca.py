@@ -11,7 +11,9 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    ReplaceOrderRequest,
     StopLossRequest,
+    StopOrderRequest,
     TakeProfitRequest,
 )
 
@@ -80,11 +82,23 @@ class AlpacaBroker(Broker):
         ))
         return OrderStatus(str(order.id), order.status.value, legs=[str(leg.id) for leg in (order.legs or [])])
 
+    def submit_stop(self, symbol: str, qty: float, side: str, stop_price: float) -> str:
+        price = option_tick(stop_price, symbol) if is_option_symbol(symbol) else round(stop_price, 2)
+        order = self.trading.submit_order(StopOrderRequest(
+            symbol=symbol, qty=qty, side=OrderSide(side), time_in_force=TimeInForce.DAY, stop_price=price))
+        return str(order.id)
+
+    def replace_stop(self, order_id: str, qty: float, symbol: str, side: str, stop_price: float) -> str:
+        price = option_tick(stop_price, symbol) if is_option_symbol(symbol) else round(stop_price, 2)
+        order = self.trading.replace_order_by_id(order_id, ReplaceOrderRequest(stop_price=price))
+        return str(order.id)
+
     def get_order(self, order_id: str) -> OrderStatus:
         o = self.trading.get_order_by_id(order_id)
         return OrderStatus(
             str(o.id), o.status.value, float(o.filled_qty or 0), float(o.filled_avg_price or 0),
             legs=[str(leg.id) for leg in (o.legs or [])],
+            order_type=o.order_type.value if o.order_type else "",
         )
 
     def cancel(self, order_id: str) -> None:

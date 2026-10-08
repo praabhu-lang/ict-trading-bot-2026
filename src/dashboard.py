@@ -201,6 +201,14 @@ with st.sidebar:
                     st.success("Close orders sent. The engine will book exits on its next run.")
                 except Exception as exc:  # noqa: BLE001
                     st.error(str(exc))
+    if st.button("📧 Send test email", width="stretch"):
+        from src.alerts.notifier import Notifier
+
+        n = Notifier.from_env()
+        if n.send("✅ ICT Trading Bot - dashboard test alert", "<p>Email alerts are working.</p>"):
+            st.success(f"Sent to {n.to}")
+        else:
+            st.error(f"Email failed: {n.last_error}")
     st.divider()
     if st.button("Log out"):
         ss.auth_at = 0.0
@@ -419,7 +427,7 @@ with tab_set:
     with st.form("settings"):
         st.subheader("Trading platform")
         creds_store = CredentialStore(store)
-        names = [p for p in BROKERS if PLATFORMS[p].status != "unavailable"]
+        names = [p for p in BROKERS if PLATFORMS[p].status in ("supported", "experimental")]
 
         def _label(pid: str) -> str:
             p = PLATFORMS[pid]
@@ -515,7 +523,8 @@ with tab_plat:
     st.caption("Credentials are stored in the private state bucket (secrets/brokers.json) and never shown again. "
                "Leave a field blank to keep the saved value. Pick the active platform in Settings.")
     creds_store = CredentialStore(store)
-    badge = {"supported": "🟢 supported", "experimental": "🟡 experimental", "unavailable": "⛔ unavailable"}
+    badge = {"supported": "🟢 supported", "experimental": "🟡 experimental",
+             "crypto_only": "🔵 crypto only - not usable for this strategy", "unavailable": "⛔ unavailable"}
     for pid, p in PLATFORMS.items():
         configured = creds_store.is_configured(pid)
         active = pid == active_broker_name()
@@ -548,8 +557,16 @@ with tab_plat:
                     st.error("Invalid code")
             if test:
                 try:
-                    acct = make_broker(pid, store).account()
-                    st.success(f"Connected · equity {money(acct.equity)} · buying power {money(acct.buying_power)}")
+                    if p.status == "crypto_only":
+                        from src.brokers.robinhood_crypto import RobinhoodCryptoClient
+
+                        c = creds_store.get(pid)
+                        info = RobinhoodCryptoClient(c["api_key"], c["private_key"]).account()
+                        st.success(f"Connected · account status {info.get('status')} · "
+                                   f"buying power {info.get('buying_power')} {info.get('buying_power_currency', '')}")
+                    else:
+                        acct = make_broker(pid, store).account()
+                        st.success(f"Connected · equity {money(acct.equity)} · buying power {money(acct.buying_power)}")
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Connection failed: {exc}")
 

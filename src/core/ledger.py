@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS trades (
     signal_score REAL,
     entry_order_id TEXT,
     exit_order_ids TEXT,                -- JSON list (bracket legs or exit orders)
+    broker_stop_id TEXT,                -- resting stop order held at the broker (options)
+    broker_stop_price REAL,
     notes TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_trades_status ON trades(status);
@@ -80,7 +82,15 @@ class Ledger:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a ledger file was first created."""
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(trades)")}
+        for col, typ in (("broker_stop_id", "TEXT"), ("broker_stop_price", "REAL")):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         self.conn.close()
@@ -108,7 +118,8 @@ class Ledger:
     def close_trade(self, trade_id: int, exit_price: float, reason: str, multiplier: float) -> float:
         row = self.trade(trade_id)
         sign = 1.0 if (row["asset_class"] == "option" or row["direction"] == "bull") else -1.0
-        pnl = round((exit_price - row["entry_price"]) * row["qty"] * multiplier * sign, 2)
+        pnl = round((exit_price - row["entry_price"]) * row["qty"] * multiplier * sign
+                    + float(row.get("realized_pnl") or 0), 2)  # + any earlier partial exits
         self.update_trade(
             trade_id, status="CLOSED", closed_at=_now(), exit_price=exit_price,
             realized_pnl=pnl, exit_reason=reason,

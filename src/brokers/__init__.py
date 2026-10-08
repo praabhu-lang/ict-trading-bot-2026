@@ -15,8 +15,8 @@ def make_broker(name: str, store=None) -> Broker:
     platform = PLATFORMS.get(name)
     if platform is None:
         raise BrokerUnavailable(f"Unknown trading platform '{name}'")
-    if platform.status == "unavailable":
-        raise BrokerUnavailable(f"{platform.label}: {platform.note}")
+    if platform.status in ("unavailable", "crypto_only"):
+        raise BrokerUnavailable(f"{platform.label} cannot trade stocks/options: {platform.note}")
     creds = CredentialStore(store)
     if not creds.is_configured(name):
         raise BrokerUnavailable(f"{platform.label} is not configured - add its credentials in Dashboard → Platforms")

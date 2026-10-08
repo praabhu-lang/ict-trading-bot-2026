@@ -137,13 +137,13 @@ def test_reconcile_books_bracket_exit_done_at_broker(ledger):
     engine, broker, _ = make_engine(ledger, at(12, 0))
     from src.brokers.base import OrderStatus
 
-    broker.orders["leg-sl"] = OrderStatus("leg-sl", "filled", 10, 102.6)
+    broker.orders["leg-sl"] = OrderStatus("leg-sl", "filled", 10, 102.6, order_type="stop")
     tid = ledger.open_trade(trade_date=TODAY.isoformat(), broker="alpaca_paper", underlying="SPY", symbol="SPY",
                             asset_class="stock", direction="bear", qty=10, entry_price=101.6, stop_price=102.6,
                             target_price=99.5, exit_order_ids=["leg-tp", "leg-sl"])
     engine.run_cycle(scan=False)
     t = ledger.trade(tid)
-    assert t["status"] == "CLOSED" and t["exit_reason"] == "BRACKET_EXIT"
+    assert t["status"] == "CLOSED" and t["exit_reason"] == "STOP_LOSS (broker)"
     assert t["realized_pnl"] == pytest.approx(-10.0)
 
 
@@ -169,3 +169,66 @@ def test_profits_compound_into_trading_capital():
     assert s.trading_equity(99_000, 2_500) == 12_500
     assert s.trading_equity(11_000, 2_500) == 11_000                 # never above the real account
     assert Settings(starting_capital=0).trading_equity(99_000, 0) == 99_000
+
+
+def test_option_entry_places_broker_stop_and_email_says_so(ledger):
+    engine, broker, notifier = make_engine(ledger, at(11, 0, 30))
+    engine.run_cycle(scan=True)
+    t = ledger.open_trades()[0]
+    assert t["broker_stop_id"] in broker.stops
+    s = broker.stops[t["broker_stop_id"]]
+    assert s["side"] == "sell" and s["qty"] == t["qty"] and s["stop"] == pytest.approx(t["entry_price"] * 0.5, abs=0.01)
+    assert any("OPENED" in x for x in notifier.sent)
+
+
+def test_broker_rejecting_stop_sends_alert(ledger):
+    b = FakeBroker()
+    b.reject_stops = True
+    engine, broker, notifier = make_engine(ledger, at(11, 0, 30), broker=b)
+    engine.run_cycle(scan=True)
+    assert ledger.open_trades()[0]["broker_stop_id"] is None
+    assert any("No broker-side stop" in x for x in notifier.sent)
+
+
+def test_engine_exit_cancels_broker_stop_before_selling(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    sid = engine._protect_option(tid, "SPY261007P00102000", 4, 1.0)
+    broker.quotes["SPY261007P00102000"] = (3.05, 3.15)            # +55% -> target
+    engine.run_cycle(scan=False)
+    assert broker.orders[sid].status == "canceled"
+    assert ledger.trade(tid)["exit_reason"] == "TARGET"
+
+
+def test_broker_stop_fill_is_booked_by_reconcile(ledger):
+    engine, broker, notifier = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    sid = engine._protect_option(tid, "SPY261007P00102000", 4, 1.0)
+    broker.trigger_stop(sid, 0.98)                                   # engine was down; broker stop fired
+    engine.run_cycle(scan=False)
+    t = ledger.trade(tid)
+    assert t["exit_reason"] == "STOP_LOSS (broker)" and t["exit_price"] == 0.98
+    assert t["realized_pnl"] == pytest.approx((0.98 - 2.0) * 4 * 100)
+    assert any("🛑" in x for x in notifier.sent)
+
+
+def test_trailing_ratchets_broker_stop_up(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    engine._protect_option(tid, "SPY261007P00102000", 4, 1.0)
+    broker.quotes["SPY261007P00102000"] = (2.78, 2.82)            # +40%: trail active, below +50% target
+    engine.run_cycle(scan=False)
+    t = ledger.trade(tid)
+    assert t["status"] == "OPEN"
+    assert t["broker_stop_price"] == pytest.approx(2.0 * (1 + 0.40 - 0.15), abs=0.02)   # ~2.50, was 1.00
+    assert broker.stops[t["broker_stop_id"]]["stop"] == t["broker_stop_price"]
+
+
+def test_partial_exit_pnl_is_kept_in_final_total(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    from src.agents.execution_agent import Fill
+
+    engine._record_exit(ledger.trade(tid), Fill(1, 3.0, ["x"]), "TARGET", 100.0)       # sold 1 of 4 @ +1.00
+    engine._record_exit(ledger.trade(tid), Fill(3, 2.5, ["y"]), "TARGET", 100.0)       # rest @ +0.50
+    assert ledger.trade(tid)["realized_pnl"] == pytest.approx(100 + 150)
