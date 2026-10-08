@@ -97,7 +97,7 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
                                             n.reason if n.blocked else "") if x),
         })
         ledger.upsert_levels(
-            d, ticker, spot=last, prior_close=prior_close, gap_pct=round(gap, 2),
+            d, ticker, table="premarket_levels", spot=last, prior_close=prior_close, gap_pct=round(gap, 2),
             net_gex=gex.net_gex if gex else None, gamma_flip=gex.gamma_flip if gex else None,
             call_wall=gex.call_wall if gex else None, put_wall=gex.put_wall if gex else None,
             gex_regime=gex.regime if gex else None, zones=[z.as_dict() for z in zones], news=n.headlines[:3],
@@ -108,8 +108,9 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
                     f"signals need ≥{s.min_convergence}% convergence. "
                     f"Auto-trade: <b>{'ON' if s.auto_trade and not s.paused else 'OFF'}</b> · broker: <b>{s.broker}</b></p>")
 
-    report = {"token_ok": token_ok, "token_days_left": days_left, "events": [e.name for e in events],
-              "earnings": earn, "tickers": len(rows)}
+    report = {"ts": now.isoformat(timespec="seconds"), "token_ok": token_ok, "token_days_left": days_left,
+              "events": [f"{e.start:%H:%M} {e.name}" for e in events], "earnings": earn, "tickers": len(rows),
+              "market_shock": shock.reason if shock.blocked else ""}
     ledger.set_kv("premarket_report", report)
     if send_email:
         notifier.send(f"📋 Pre-market plan {d:%a %b %d}" + ("" if token_ok else " - ⚠️ SCHWAB LOGIN EXPIRED"),

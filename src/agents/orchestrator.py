@@ -288,29 +288,36 @@ class TradingEngine:
                             "buying_power": acct.buying_power, "bot_day_pnl": day_pnl})
         return Gate(not reasons, reasons)
 
-    def scan_and_trade(self, now: datetime) -> None:
+    def scan_and_trade(self, now: datetime, trade: bool = True) -> int:
+        """Scan the universe. trade=False is the dashboard's forced post-open scan: it refreshes levels and
+        records signals but never places orders, and works without Schwab chains (GEX shown as n/a).
+        Returns the number of tickers analysed."""
         if not is_trading_day(now.date()) or now < market_open_dt(now.date()) + timedelta(minutes=5):
             self.status["gates"] = ["Market not open"]
-            return
+            return 0
         if now > market_close_dt(now.date()):
             self.status["gates"] = ["Market closed"]
-            return
-        gate = self.gates(now)
-        self.status["gates"] = gate.reasons or ["OPEN - entries allowed"]
+            return 0
+        if trade:
+            gate = self.gates(now)
+            self.status["gates"] = gate.reasons or ["OPEN - entries allowed"]
+        else:
+            gate = Gate(True, [])
         earnings = set(self.ledger.get_kv(f"earnings:{now.date().isoformat()}", []) or [])
         held = {t["underlying"] for t in self.ledger.open_trades()}
 
         candidates = []
-        failures = 0
+        failures = analysed = 0
         for ticker in self.s.universe:
             try:
-                analysis, chain, news = self.analyst.analyze(ticker, now, self.s)
+                analysis, chain, news = self.analyst.analyze(ticker, now, self.s, require_chain=trade)
             except MarketDataUnavailable as exc:
                 failures += 1
                 self.market.health[f"scan:{ticker}"] = str(exc)[:200]
                 continue
             if not analysis:
                 continue
+            analysed += 1
             snap = analysis.snapshot
             sig = analysis.signal
             self.ledger.upsert_levels(
@@ -323,9 +330,18 @@ class TradingEngine:
             if sig and sig.score >= self.s.min_convergence:
                 candidates.append((sig, chain))
 
+        self.ledger.set_kv("last_scan", {"ts": now.isoformat(timespec="seconds"), "trade": trade,
+                                         "analysed": analysed, "failed": failures,
+                                         "schwab": self.market.health.get("chains:schwab", "")})
         if failures == len(self.s.universe):
-            self._data_outage(now)
-            return
+            if trade:
+                self._data_outage(now)
+            return 0
+        if not trade:
+            for sig, _chain in candidates:
+                self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
+                                          sig.target, sig.components, "SCAN_ONLY", "forced scan - no orders placed")
+            return analysed
 
         for sig, chain in sorted(candidates, key=lambda c: c[0].score, reverse=True):
             block = list(gate.reasons)
@@ -340,7 +356,8 @@ class TradingEngine:
                     self._signal_email(sig, "ALERT ONLY - " + "; ".join(block))
                 continue
             if self._enter(sig, chain, now):
-                return  # one new position per cycle
+                return analysed  # one new position per cycle
+        return analysed
 
     def _enter(self, sig, chain, now: datetime) -> bool:
         acct = self.broker.account()

@@ -232,3 +232,25 @@ def test_partial_exit_pnl_is_kept_in_final_total(ledger):
     engine._record_exit(ledger.trade(tid), Fill(1, 3.0, ["x"]), "TARGET", 100.0)       # sold 1 of 4 @ +1.00
     engine._record_exit(ledger.trade(tid), Fill(3, 2.5, ["y"]), "TARGET", 100.0)       # rest @ +0.50
     assert ledger.trade(tid)["realized_pnl"] == pytest.approx(100 + 150)
+
+
+def test_forced_scan_refreshes_levels_without_orders_or_schwab(ledger):
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30))
+    engine.market._chains.clear()                                   # Schwab chains unavailable
+    n = engine.scan_and_trade(at(11, 0, 30), trade=False)
+    assert n == 1 and broker.submitted == []
+    lv = ledger.levels_on(TODAY)
+    assert lv and lv[0]["gex_regime"] is None                       # shown as GEX n/a
+    assert ledger.signals_on(TODAY)[0]["action"] == "SCAN_ONLY"
+
+
+def test_forced_scan_works_with_no_broker(ledger):
+    engine, _, _ = make_engine(ledger, at(11, 0, 30))
+    engine.broker = None
+    assert engine.scan_and_trade(at(11, 0, 30), trade=False) == 1
+
+
+def test_premarket_levels_kept_separate(ledger):
+    ledger.upsert_levels(TODAY, "SPY", table="premarket_levels", spot=100.0)
+    assert ledger.levels_on(TODAY) == []
+    assert ledger.levels_on(TODAY, table="premarket_levels")[0]["spot"] == 100.0

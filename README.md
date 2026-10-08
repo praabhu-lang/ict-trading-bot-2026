@@ -22,7 +22,8 @@ New platforms: implement `src/brokers/base.py:Broker` and add an entry to `src/b
 
 | Time | What happens |
 |---|---|
-| 08:45 | `premarket` job: Schwab login health, today's FOMC/CPI/NFP + custom events, earnings, market-shock news, prior-day VRZ zones, gaps, GEX walls/flip → email + dashboard |
+| 08:45 | `premarket` job (automatic, once): Schwab login health, today's FOMC/CPI/NFP + custom events, earnings, market-shock news, prior-day VRZ zones, gaps, GEX walls/flip → email + Signals & levels (shown until the open) |
+| after 09:30 | Signals & levels shows post-open scans only; **Run post-open scan now** forces an immediate scan (refreshes levels/signals, never places orders) |
 | 09:30–16:00 | `engine` job every 15 min, each run loops 14 min: **exits every 30 s**, **entry scan at every 5-min bar close** |
 | 09:30–09:45 | no entries (first 15 min) |
 | event ±30 min | no entries (FOMC blackout = 13:30–15:00: decision 14:00 + press conference 14:30) |

@@ -50,7 +50,12 @@ class Store:
     # ---------- whole-file sync ----------
     def download(self, name: str, local_name: str | None = None) -> bool:
         if not self.remote:
-            return os.path.exists(self.local_path(name))
+            src = self.local_path(name)
+            if local_name and local_name != name and os.path.exists(src):
+                import shutil
+
+                shutil.copyfile(src, self.local_path(local_name))
+            return os.path.exists(src)
         blob = self._bucket.get_blob(name)
         if blob is None:
             return False
@@ -108,9 +113,18 @@ class Store:
 
     # ---------- exclusive lock (one engine process at a time) ----------
     @contextmanager
-    def lock(self, name: str, ttl_seconds: int):
+    def lock(self, name: str, ttl_seconds: int, wait_seconds: float = 0, poll_seconds: float = 5):
+        """Exclusive lock; waits up to `wait_seconds` for a short-lived holder to finish."""
         owner = f"{socket.gethostname()}:{os.getpid()}"
-        self._acquire(name, owner, ttl_seconds)
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                self._acquire(name, owner, ttl_seconds)
+                break
+            except LockHeld:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(poll_seconds)
         try:
             yield
         finally:

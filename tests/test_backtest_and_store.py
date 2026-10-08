@@ -88,3 +88,23 @@ def test_schwab_expired_token_raises_market_data_unavailable(monkeypatch):
 
     with pytest.raises(MarketDataUnavailable):
         _client(monkeypatch, _Session(token_status=400)).option_chain("SPY", date(2026, 10, 8), date(2026, 10, 8))
+
+
+def test_lock_waits_for_short_holder(tmp_path):
+    import threading
+    import time as _t
+
+    store = Store(str(tmp_path))
+    held = threading.Event()
+
+    def holder():
+        with store.lock("locks/engine.lock", ttl_seconds=60):
+            held.set()
+            _t.sleep(0.5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    held.wait()
+    with store.lock("locks/engine.lock", ttl_seconds=60, wait_seconds=5, poll_seconds=0.1):
+        pass
+    th.join()

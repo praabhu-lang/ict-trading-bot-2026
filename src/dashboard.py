@@ -281,38 +281,109 @@ with tab_live:
     live_panel()
 
 with tab_levels:
+    from src.core.clock import ET, is_trading_day, market_close_dt, market_open_dt
+
+    def et(ts) -> str:
+        try:
+            return datetime.fromisoformat(str(ts)).astimezone(ET).strftime("%H:%M:%S ET")
+        except ValueError:
+            return str(ts or "")
+
+    session_open = is_trading_day(today) and now >= market_open_dt(today)
     cal = EventCalendar(settings.custom_events, settings.event_buffer_minutes)
     evs = cal.events_on(today)
     if evs:
         st.warning(" · ".join(f"{e.name} {e.start:%H:%M} ET (no entries {e.blackout(settings.event_buffer_minutes)[0]:%H:%M}-"
                               f"{e.blackout(settings.event_buffer_minutes)[1]:%H:%M})" for e in evs))
+
+    # Schwab = the only source of option chains / GEX: say plainly when it is down.
+    health = engine_status.get("data_health") or {}
     pm = (led.get_kv("premarket_report") if led else None) or {}
-    if pm:
-        st.caption(f"Pre-market: earnings today {', '.join(pm.get('earnings') or []) or 'none'} · "
-                   f"Schwab {'OK' if pm.get('token_ok') else 'EXPIRED'}")
-    if st.button("Run pre-market scan now (no email)"):
-        with st.spinner("Scanning universe…"):
-            res = subprocess.run([sys.executable, "-m", "src.app", "premarket", "--no-email"],
-                                 capture_output=True, text=True, timeout=600)
-        st.code((res.stdout or res.stderr)[-3000:])
-        ledger_snapshot.clear()
-    levels = led.levels_on(today) if led else []
-    st.subheader("Today's levels")
-    if levels:
-        df = pd.DataFrame(levels)
-        cols = ["ticker", "spot", "gap_pct", "vwap", "poc", "vah", "val", "rvol", "gex_regime", "gamma_flip",
-                "call_wall", "put_wall", "best_score", "ts"]
-        st.dataframe(df[[c for c in cols if c in df]], hide_index=True, width="stretch")
-        pick = st.selectbox("VRZ zones for", df["ticker"].tolist())
+    last_scan = (led.get_kv("last_scan") if led else None) or {}
+    schwab_down = ("error" in str(health.get("chains:schwab", "")) or "error" in str(last_scan.get("schwab", ""))
+                   or bool(pm and not pm.get("token_ok") and str(pm.get("ts", "")).startswith(today.isoformat())))
+    if schwab_down:
+        st.error("Schwab login expired - no option chains or GEX, so the engine will not open trades. "
+                 "Fix: Settings → Schwab connection → Log in to Schwab.")
+
+    level_cols = {"ticker": "Ticker", "spot": "Spot", "gap_pct": "Gap %", "vwap": "VWAP", "poc": "POC", "vah": "VAH",
+                  "val": "VAL", "rvol": "RVOL", "gex_regime": "GEX", "gamma_flip": "Gamma flip",
+                  "call_wall": "Call wall", "put_wall": "Put wall", "best_score": "Signal %", "ts": "Updated"}
+
+    def show_levels(rows: list[dict], key: str) -> None:
+        df = pd.DataFrame(rows)
+        df["ts"] = df["ts"].map(et)
+        df["gex_regime"] = df["gex_regime"].fillna("n/a")
+        view = df[[c for c in level_cols if c in df]].rename(columns=level_cols)
+        st.dataframe(view, hide_index=True, width="stretch")
+        pick = st.selectbox("VRZ zones for", df["ticker"].tolist(), key=f"zones_{key}")
         zones = json.loads(df.set_index("ticker").loc[pick, "zones"] or "[]")
-        st.dataframe(pd.DataFrame(zones), hide_index=True, width="stretch")
+        if zones:
+            st.dataframe(pd.DataFrame(zones)[["kind", "low", "high", "source", "valid"]], hide_index=True, width="stretch")
+
+    if not session_open:
+        # ---------------- before the open: the 08:45 pre-market plan (read-only) ----------------
+        st.subheader("Pre-market plan")
+        if pm and str(pm.get("ts", "")).startswith(today.isoformat()):
+            c = st.columns(4)
+            c[0].metric("Scanned", pm.get("tickers", 0))
+            c[1].metric("Schwab", "OK" if pm.get("token_ok") else "EXPIRED")
+            c[2].metric("Events today", len(pm.get("events") or []))
+            c[3].metric("Earnings (blocked)", ", ".join(pm.get("earnings") or []) or "none")
+            for e in pm.get("events") or []:
+                st.caption(f"• {e}")
+            if pm.get("market_shock"):
+                st.error(pm["market_shock"])
+            pre = led.levels_on(today, table="premarket_levels") if led else []
+            if pre:
+                show_levels(pre, "pre")
+        else:
+            st.info("The pre-market scan runs automatically at 08:45 ET on trading days and emails the plan. "
+                    "Results appear here until the open; after 09:30 this tab shows the post-open scan.")
     else:
-        st.info("No levels yet today. They appear after the pre-market scan and each 5-minute engine scan.")
+        # ---------------- after the open: post-open scans only ----------------
+        top = st.columns([3, 1])
+        last = (led.get_kv("last_scan") if led else None) or {}
+        top[0].subheader("Post-open scan")
+        if last:
+            top[0].caption(f"Last scan {et(last.get('ts'))} · {last.get('analysed', 0)} tickers analysed"
+                           + (f" · {last.get('failed')} failed" if last.get("failed") else "")
+                           + ("" if last.get("trade", True) else " · forced (no orders)"))
+        if top[1].button("🔄 Run post-open scan now", type="primary", width="stretch",
+                         disabled=now >= market_close_dt(today)):
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            save_control({"scan_requested_at": stamp})
+            if running:
+                st.info("Queued - the running engine performs it within ~30 s (no orders are placed by a forced scan). "
+                        "Click Refresh data in a moment.")
+            else:
+                with st.spinner("Engine idle - scanning now…"):
+                    res = subprocess.run([sys.executable, "-m", "src.app", "scan"], capture_output=True,
+                                         text=True, timeout=600)
+                try:
+                    out = json.loads((res.stdout or "").strip().splitlines()[-1])
+                    st.success(out.get("message") or f"Scanned {out.get('analysed', 0)} tickers.")
+                except (ValueError, IndexError):
+                    st.error((res.stderr or res.stdout)[-1500:])
+                ledger_snapshot.clear()
+                st.rerun()
+        if st.button("Refresh data", key="refresh_levels"):
+            ledger_snapshot.clear()
+            st.rerun()
+        post = led.levels_on(today) if led else []
+        if post:
+            show_levels(post, "post")
+        else:
+            st.info("No post-open levels yet. The engine scans each 5-minute bar from 09:35 ET, "
+                    "or use Run post-open scan now.")
+
     st.subheader("Signals today")
     sigs = led.signals_on(today) if led else []
     if sigs:
-        st.dataframe(pd.DataFrame(sigs)[["ts", "ticker", "direction", "score", "entry", "stop", "target", "action",
-                                         "reason", "components"]], hide_index=True, width="stretch")
+        sdf = pd.DataFrame(sigs)
+        sdf["ts"] = sdf["ts"].map(et)
+        st.dataframe(sdf[["ts", "ticker", "direction", "score", "entry", "stop", "target", "action", "reason"]]
+                     .rename(columns={"ts": "Time", "score": "Score %"}), hide_index=True, width="stretch")
     else:
         st.info(f"No VRZ signals today (a signal needs ≥{settings.min_convergence}% convergence).")
 

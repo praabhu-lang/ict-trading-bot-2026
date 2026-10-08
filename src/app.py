@@ -5,6 +5,7 @@
   python -m src.app cycle                # one engine cycle (debugging)
   python -m src.app flatten              # close every bot-managed position now
   python -m src.app test-email           # verify Resend email alerts
+  python -m src.app scan                 # forced post-open scan: refresh levels/signals, no orders
   python -m src.app backtest --tickers SPY,QQQ --start 2026-08-01 --end 2026-09-30
 """
 from __future__ import annotations
@@ -51,7 +52,8 @@ def cmd_run(minutes: float, single: bool = False, flatten: bool = False) -> int:
     store = Store.from_env()
     clock = Clock()
     try:
-        with store.lock(LOCK, ttl_seconds=int(minutes * 60) + 180):
+        # Wait out a short holder (e.g. the pre-market job) instead of skipping a whole session block.
+        with store.lock(LOCK, ttl_seconds=int(minutes * 60) + 180, wait_seconds=180):
             store.download(LEDGER)
             ledger = Ledger(store.local_path(LEDGER))
             notifier = Notifier.from_env(ledger)
@@ -72,7 +74,13 @@ def cmd_run(minutes: float, single: bool = False, flatten: bool = False) -> int:
                 engine.s = fresh
                 engine.calendar.custom = fresh.custom_events
                 engine.calendar.buffer_minutes = fresh.event_buffer_minutes
-                request = (store.read_json(CONTROL, {}) or {}).get("flatten_requested_at")
+                ctl = store.read_json(CONTROL, {}) or {}
+                scan_req = ctl.get("scan_requested_at")
+                if scan_req and scan_req != ledger.get_kv("scan_handled_at"):
+                    ledger.set_kv("scan_handled_at", scan_req)
+                    n = engine.scan_and_trade(clock.now(), trade=False)
+                    ledger.log("INFO", f"Dashboard post-open scan {scan_req}: {n} tickers analysed")
+                request = ctl.get("flatten_requested_at")
                 if request and request != ledger.get_kv("flatten_handled_at"):
                     ledger.log("WARN", f"Dashboard flatten request {request}")
                     engine.flatten_all("MANUAL_FLATTEN")
@@ -103,8 +111,30 @@ def cmd_premarket(send_email: bool = True) -> int:
         return 0
 
 
+def cmd_scan() -> int:
+    """Forced post-open scan (no orders). Used by the dashboard when the engine is not running."""
+    store = Store.from_env()
+    try:
+        with store.lock(LOCK, ttl_seconds=600, wait_seconds=20):
+            store.download(LEDGER)
+            ledger = Ledger(store.local_path(LEDGER))
+            settings = load_settings(store)
+            # Display-only: no broker needed, no orders possible.
+            engine = TradingEngine(settings, ledger, None, MarketData.from_env(store), NewsAgent(),
+                                   Notifier.from_env(ledger), Clock())
+            n = engine.scan_and_trade(Clock().now(), trade=False)
+            last = ledger.get_kv("last_scan")
+            store.upload(LEDGER)
+            ledger.close()
+        print(json.dumps({"analysed": n, **(last or {})}, default=str))
+        return 0
+    except LockHeld:
+        print(json.dumps({"queued": True, "message": "Engine is running - it will run this scan within ~30 s"}))
+        return 0
+
+
 def _premarket_locked(store: Store, send_email: bool) -> int:
-    with store.lock(LOCK, ttl_seconds=900):
+    with store.lock(LOCK, ttl_seconds=900, wait_seconds=60):
         store.download(LEDGER)
         ledger = Ledger(store.local_path(LEDGER))
         settings = load_settings(store)
@@ -151,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("cycle")
     sub.add_parser("flatten")
     sub.add_parser("test-email")
+    sub.add_parser("scan")
     pre = sub.add_parser("premarket")
     pre.add_argument("--no-email", action="store_true")
     bt = sub.add_parser("backtest")
@@ -166,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(1, single=True)
     if a.cmd == "flatten":
         return cmd_run(1, flatten=True)
+    if a.cmd == "scan":
+        return cmd_scan()
     if a.cmd == "test-email":
         return cmd_test_email()
     if a.cmd == "premarket":

@@ -64,6 +64,20 @@ CREATE TABLE IF NOT EXISTS levels (
     PRIMARY KEY (trade_date, ticker)
 );
 
+-- Pre-market plan (08:45 ET), kept separate so post-open levels never mix with it.
+CREATE TABLE IF NOT EXISTS premarket_levels (
+    trade_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    spot REAL, prior_close REAL, gap_pct REAL,
+    vwap REAL, poc REAL, vah REAL, val REAL, rvol REAL,
+    net_gex REAL, gamma_flip REAL, call_wall REAL, put_wall REAL, gex_regime TEXT,
+    zones TEXT,
+    best_score REAL,
+    news TEXT,
+    PRIMARY KEY (trade_date, ticker)
+);
+
 CREATE TABLE IF NOT EXISTS alerts (key TEXT PRIMARY KEY, ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_log (
@@ -165,7 +179,8 @@ class Ledger:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM signals WHERE trade_date = ? ORDER BY id DESC", (d.isoformat(),))]
 
-    def upsert_levels(self, d: date, ticker: str, **fields) -> None:
+    def upsert_levels(self, d: date, ticker: str, table: str = "levels", **fields) -> None:
+        assert table in ("levels", "premarket_levels")
         if isinstance(fields.get("zones"), (list, dict)):
             fields["zones"] = json.dumps(fields["zones"], default=str)
         if isinstance(fields.get("news"), (list, dict)):
@@ -175,14 +190,15 @@ class Ledger:
         marks = ", ".join("?" for _ in fields)
         updates = ", ".join(f"{k} = excluded.{k}" for k in fields if k not in ("trade_date", "ticker"))
         self.conn.execute(
-            f"INSERT INTO levels ({cols}) VALUES ({marks}) ON CONFLICT(trade_date, ticker) DO UPDATE SET {updates}",
+            f"INSERT INTO {table} ({cols}) VALUES ({marks}) ON CONFLICT(trade_date, ticker) DO UPDATE SET {updates}",
             list(fields.values()),
         )
         self.conn.commit()
 
-    def levels_on(self, d: date) -> list[dict]:
+    def levels_on(self, d: date, table: str = "levels") -> list[dict]:
+        assert table in ("levels", "premarket_levels")
         return [dict(r) for r in self.conn.execute(
-            "SELECT * FROM levels WHERE trade_date = ? ORDER BY ticker", (d.isoformat(),))]
+            f"SELECT * FROM {table} WHERE trade_date = ? ORDER BY ticker", (d.isoformat(),))]
 
     # ---------- alerts / kv / log ----------
     def alert_once(self, key: str) -> bool:
