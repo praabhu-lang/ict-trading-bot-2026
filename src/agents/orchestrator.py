@@ -79,8 +79,12 @@ class TradingEngine:
 
     def run_cycle(self, scan: bool = True) -> dict:
         now = self.clock.now()
+        previous = self.status
         self.status = {"ts": now.isoformat(timespec="seconds"), "broker": self.broker.name,
                        "paper": self.broker.is_paper, "errors": []}
+        for key in ("gates", "account_equity", "trading_equity", "buying_power", "bot_day_pnl"):
+            if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
+                self.status[key] = previous[key]
         for step in (self.reconcile, lambda: self.manage_exits(now)):
             try:
                 step()
