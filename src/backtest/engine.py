@@ -20,13 +20,13 @@ import numpy as np
 import pandas as pd
 
 from ..agents.monitor_agent import momentum_against, option_exit_reason, stock_exit_reason
-from ..agents.risk_agent import account_gate, flatten_time, session_gate, size_option, size_stock
+from ..agents.risk_agent import account_gate, flatten_time, open_risk, session_gate, size_option, size_stock
 from ..core.clock import previous_trading_day
 from ..core.events import EventCalendar
 from ..core.settings import INDEX_0DTE, Settings
 from ..data.models import occ_symbol
 from ..strategy.analyzer import analyze
-from ..strategy.convergence import Signal
+from ..strategy.convergence import Signal, volume_ratio
 from ..strategy.indicators import day_slice, session_dates
 from .pricing import bs_price, realized_vol, years_to_close
 
@@ -34,7 +34,8 @@ BAR = timedelta(minutes=5)
 
 ASSUMPTIONS = [
     "Same VRZ/convergence, gates, sizing and exit code as the live engine.",
-    "GEX and news are not available historically: scores are rescaled over the remaining factors.",
+    "GEX and news are not available historically: they score 0 (no rescaling), so A+ in a backtest = core + gap-against.",
+    "SPY alignment uses SPY 5-min bars (always loaded); trend uses each ticker's daily closes.",
     "Entries fill at the next 5-minute bar open; option slippage 3% of premium each side + $0.65/contract.",
     "Stock slippage $0.01/share each side. Stop is assumed to hit first if stop and target share a bar.",
     "0DTE options: SPY/QQQ every day; single stocks only on Fridays (weekly expiry), otherwise stock fallback.",
@@ -76,10 +77,13 @@ def strike_increment(ticker: str, spot: float) -> float:
 
 class Backtester:
     def __init__(self, settings: Settings, capital: float, bars: dict[str, pd.DataFrame], option_bars_fn=None,
-                 option_slippage: float = 0.03, commission: float = 0.65, stock_slippage: float = 0.01):
+                 option_slippage: float = 0.03, commission: float = 0.65, stock_slippage: float = 0.01,
+                 spy_bars: pd.DataFrame | None = None):
         self.s = settings
         self.capital = capital
         self.bars = {t: df.sort_index() for t, df in bars.items() if not df.empty}
+        self.spy = self.bars.get("SPY") if spy_bars is None else spy_bars.sort_index()
+        self.daily = {t: df.groupby(df.index.date)["close"].last() for t, df in self.bars.items()}
         self.option_bars_fn = option_bars_fn
         self.opt_slip = option_slippage
         self.commission = commission
@@ -112,6 +116,7 @@ class Backtester:
             warm = previous_trading_day(warm)
         hist = {t: self.bars[t][self.bars[t].index.date >= warm] for t in day}
         timeline = sorted(set().union(*[set(df.index) for df in day.values()]))
+        spy_today = day_slice(self.spy, d) if self.spy is not None else None
         flatten_at = None
         open_trades: list[BTTrade] = []
         done: list[BTTrade] = []
@@ -145,13 +150,17 @@ class Backtester:
             if not (gate.ok and acct.ok) or now >= flatten_at:
                 continue
             held = {t.ticker for t in open_trades}
+            fast_skip = s.min_volume_spike > 0 and not s.momentum_setup
             best = None
             for ticker in day:
                 if ticker in held or ts not in day[ticker].index:
                     continue
+                if fast_skip and not self._volume_could_qualify(day[ticker], ts):
+                    continue  # speed: the required volume-spike filter cannot pass on this bar
                 window = hist[ticker][hist[ticker].index <= ts]
-                a = analyze(ticker, window, d, min_rvol=s.min_rvol, min_rr=s.min_reward_risk, require_trigger=True)
-                if a and a.signal and a.signal.score >= s.min_convergence and (best is None or a.signal.score > best.score):
+                a = analyze(ticker, window, d, s, spy_today=spy_today, daily_closes=self.daily[ticker],
+                            require_trigger=True)
+                if a and a.signal and (best is None or a.signal.score > best.score):
                     best = a.signal
             pending = best
 
@@ -163,6 +172,10 @@ class Backtester:
             done.append(tr)
             equity += tr.pnl
         return equity, done
+
+    def _volume_could_qualify(self, today: pd.DataFrame, ts) -> bool:
+        upto = today[today.index <= ts]
+        return self.s.min_volume_spike <= volume_ratio(upto) <= self.s.max_volume_spike
 
     # ------------------------------------------------------------- entries
     def _expiry_for(self, ticker: str, d: date) -> date | None:
@@ -178,7 +191,9 @@ class Backtester:
         bull = sig.direction == "bull"
         if (bull and open_px <= sig.stop) or (not bull and open_px >= sig.stop):
             return None  # gapped through the invalidation level before we could fill
-        expiry = self._expiry_for(sig.ticker, d)
+        expiry = self._expiry_for(sig.ticker, d) if sig.score >= s.option_min_score else None
+        risk_open = open_risk([{"asset_class": t.asset_class, "qty": t.qty, "entry_price": t.entry_price,
+                                "stop_price": t.stop_price} for t in open_trades], s)
         if expiry is not None:
             inc = strike_increment(sig.ticker, open_px)
             strike = (math.ceil if bull else math.floor)(open_px / inc) * inc
@@ -193,7 +208,7 @@ class Backtester:
                 real = None
             premium = round(premium * (1 + self.opt_slip), 2)
             open_cost = sum(t.entry_price * t.qty * 100 for t in open_trades if t.asset_class == "option")
-            qty = size_option(s, equity, premium, open_cost) if premium >= s.option_min_price else 0
+            qty = size_option(s, equity, premium, open_cost, risk_open) if premium >= s.option_min_price else 0
             if qty >= 1:
                 return BTTrade(
                     sig.ticker, occ, "option", sig.direction, qty, ts, premium,
@@ -203,7 +218,9 @@ class Backtester:
         if not bull and not s.allow_short_stock:
             return None
         px = open_px + (self.stock_slip if bull else -self.stock_slip)
-        shares = size_stock(s, equity, px, sig.stop, buying_power=equity)
+        stock_cost = sum(t.entry_price * t.qty for t in open_trades if t.asset_class == "stock")
+        shares = size_stock(s, equity, px, sig.stop, buying_power=equity, open_risk_usd=risk_open,
+                            open_stock_cost=stock_cost)
         if shares < 1:
             return None
         return BTTrade(sig.ticker, sig.ticker, "stock", sig.direction, shares, ts, px, sig.stop, sig.target,
@@ -248,7 +265,7 @@ class Backtester:
                 self._close(tr, max(tr.target_price, o_open), now, "TARGET")
                 return True
             trade = {"entry_price": tr.entry_price, "high_water": tr.high_water, "direction": tr.direction,
-                     "underlying_stop": tr.underlying_stop}
+                     "underlying_stop": tr.underlying_stop, "underlying_target": tr.underlying_target}
             reason = option_exit_reason(trade, o_close, self.s, now, flatten_at, float(bar["close"]), fading)
             tr.high_water = max(tr.high_water, o_close)
             if reason:

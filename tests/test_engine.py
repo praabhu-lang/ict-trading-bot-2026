@@ -11,6 +11,13 @@ from src.data.models import OptionChain
 from tests.helpers import TODAY, FakeBroker, FakeMarket, FakeNews, FakeNotifier, bear_setup_bars, make_chain
 
 
+def S(**kw):
+    """The bear fixture is SPY itself trading above its VWAP, so SPY alignment is off here (tested separately).
+    Its score is 75 (VRZ 30 + volume 20 + trend 15 + GEX call wall 10), so the tiers are set to 75."""
+    return Settings(**{"universe": ["SPY"], "require_spy_align": False, "min_convergence": 75,
+                       "option_min_score": 75, **kw})
+
+
 def at(hh, mm, ss=0, d=TODAY):
     return datetime.combine(d, time(hh, mm, ss), tzinfo=ET)
 
@@ -27,7 +34,7 @@ def make_engine(ledger, now, *, settings=None, chain=None, market_fail=False, br
     chains = {"SPY": chain if chain is not None else make_chain(101.6)}
     market = FakeMarket({"SPY": bars}, chains, fail=market_fail)
     broker = broker or FakeBroker()
-    s = settings or Settings(universe=["SPY"])
+    s = settings or S()
     notifier = FakeNotifier()
     engine = TradingEngine(s, ledger, broker, market, FakeNews(), notifier, FixedClock(now),
                            ExecutionAgent(broker, wait_seconds=0, poll_seconds=0, sleep=lambda _: None))
@@ -76,7 +83,7 @@ def test_stock_fallback_skipped_when_price_ran_away(ledger):
 
 
 def test_event_blackout_blocks_entry_but_records_signal(ledger):
-    s = Settings(universe=["SPY"], custom_events=[{"date": TODAY.isoformat(), "time": "11:15", "name": "Fed speech"}])
+    s = S(custom_events=[{"date": TODAY.isoformat(), "time": "11:15", "name": "Fed speech"}])
     engine, broker, _ = make_engine(ledger, at(11, 0, 30), settings=s)
     engine.run_cycle(scan=True)
     assert ledger.open_trades() == []
@@ -106,7 +113,7 @@ def _open_option(ledger, broker, symbol="SPY261007P00102000", entry=2.0, qty=4):
 
 
 def test_stop_loss_is_managed_even_when_paused(ledger):
-    engine, broker, notifier = make_engine(ledger, at(12, 0), settings=Settings(universe=["SPY"], paused=True))
+    engine, broker, notifier = make_engine(ledger, at(12, 0), settings=S(paused=True))
     tid = _open_option(ledger, broker)
     broker.quotes["SPY261007P00102000"] = (0.85, 0.95)        # -55%
     engine.run_cycle(scan=True)
@@ -125,7 +132,7 @@ def test_eod_flatten_closes_0dte(ledger):
 
 
 def test_trailing_stop_after_run_up(ledger):
-    engine, broker, _ = make_engine(ledger, at(12, 0))
+    engine, broker, _ = make_engine(ledger, at(12, 0), settings=S(trailing_stop=True))
     tid = _open_option(ledger, broker)
     ledger.update_trade(tid, high_water=2.8)                    # was +40%
     broker.quotes["SPY261007P00102000"] = (2.28, 2.32)          # now +15%
@@ -194,7 +201,7 @@ def test_engine_exit_cancels_broker_stop_before_selling(ledger):
     engine, broker, _ = make_engine(ledger, at(12, 0))
     tid = _open_option(ledger, broker)
     sid = engine._protect_option(tid, "SPY261007P00102000", 4, 1.0)
-    broker.quotes["SPY261007P00102000"] = (3.05, 3.15)            # +55% -> target
+    broker.quotes["SPY261007P00102000"] = (4.05, 4.15)            # +105% -> target
     engine.run_cycle(scan=False)
     assert broker.orders[sid].status == "canceled"
     assert ledger.trade(tid)["exit_reason"] == "TARGET"
@@ -213,10 +220,10 @@ def test_broker_stop_fill_is_booked_by_reconcile(ledger):
 
 
 def test_trailing_ratchets_broker_stop_up(ledger):
-    engine, broker, _ = make_engine(ledger, at(12, 0))
+    engine, broker, _ = make_engine(ledger, at(12, 0), settings=S(trailing_stop=True))
     tid = _open_option(ledger, broker)
     engine._protect_option(tid, "SPY261007P00102000", 4, 1.0)
-    broker.quotes["SPY261007P00102000"] = (2.78, 2.82)            # +40%: trail active, below +50% target
+    broker.quotes["SPY261007P00102000"] = (2.78, 2.82)            # +40%: trail active, below +100% target
     engine.run_cycle(scan=False)
     t = ledger.trade(tid)
     assert t["status"] == "OPEN"
@@ -235,7 +242,7 @@ def test_partial_exit_pnl_is_kept_in_final_total(ledger):
 
 
 def test_forced_scan_refreshes_levels_without_orders_or_schwab(ledger):
-    engine, broker, _ = make_engine(ledger, at(11, 0, 30))
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30), settings=S(min_convergence=65))   # no GEX -> 65
     engine.market._chains.clear()                                   # Schwab chains unavailable
     n = engine.scan_and_trade(at(11, 0, 30), trade=False)
     assert n == 1 and broker.submitted == []
@@ -254,3 +261,38 @@ def test_premarket_levels_kept_separate(ledger):
     ledger.upsert_levels(TODAY, "SPY", table="premarket_levels", spot=100.0)
     assert ledger.levels_on(TODAY) == []
     assert ledger.levels_on(TODAY, table="premarket_levels")[0]["spot"] == 100.0
+
+
+def test_trailing_stop_is_off_by_default(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    ledger.update_trade(tid, high_water=2.8)                    # was +40%
+    broker.quotes["SPY261007P00102000"] = (2.28, 2.32)          # now +15%: would have trailed out
+    engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["status"] == "OPEN"
+
+
+def test_below_options_tier_trades_stock_with_vrz_stop(ledger):
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30), settings=S(option_min_score=90))
+    broker.quotes["SPY"] = (101.58, 101.62)
+    engine.run_cycle(scan=True)
+    t = ledger.open_trades()[0]
+    assert t["asset_class"] == "stock" and t["stop_price"] > 102.5
+    assert "A+ options tier" in t["notes"]
+
+
+def test_spy_alignment_filter_blocks_signal(ledger):
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30), settings=S(require_spy_align=True))
+    engine.run_cycle(scan=True)
+    assert ledger.open_trades() == [] and broker.submitted == []
+
+
+def test_total_risk_cap_limits_new_position(ledger):
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30), settings=S(option_min_score=101, max_total_risk_pct=0.025))
+    ledger.open_trade(trade_date=TODAY.isoformat(), broker="fake", underlying="AAPL", symbol="AAPL", asset_class="stock",
+                      direction="bull", qty=100, entry_price=200.0, stop_price=198.0, target_price=204.0,
+                      underlying_stop=198.0, underlying_target=204.0, signal_score=80)   # $200 already at risk
+    broker.quotes["SPY"] = (101.58, 101.62)
+    engine.run_cycle(scan=True)
+    t = [x for x in ledger.open_trades() if x["underlying"] == "SPY"][0]
+    assert abs(t["entry_price"] - t["stop_price"]) * t["qty"] <= 10_000 * 0.025 - 200 + 1   # only $50 left

@@ -69,6 +69,19 @@ class Store:
         if os.path.exists(path):
             self._bucket.blob(name).upload_from_filename(path)
 
+    def exists(self, name: str) -> bool:
+        if not self.remote:
+            return os.path.exists(os.path.join(self.local_dir, name))
+        return self._bucket.blob(name).exists()
+
+    def put_bytes(self, name: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        """Write a whole object (archives); local mode writes under local_dir."""
+        if not self.remote:
+            with open(self.local_path(name), "wb") as f:
+                f.write(data)
+            return
+        self._bucket.blob(name).upload_from_string(data, content_type=content_type)
+
     # ---------- JSON documents ----------
     def read_json(self, name: str, default=None):
         if self.remote:

@@ -320,8 +320,11 @@ with tab_levels:
     relogged = bool(issued and checked and datetime.fromisoformat(issued) > max(checked))
     if schwab_down and relogged:
         st.info(f"Schwab re-connected at {et(issued)}. Waiting for the engine's next scan to confirm option chains.")
+    elif schwab_down and settings.option_min_score > 100 and ("token" in schwab_err.lower() or not schwab_err):
+        st.warning("Schwab login expired - no option chains. Stock trades continue (options are off; GEX comes "
+                   "from gexbot where covered). Fix: Settings → Schwab connection → Log in to Schwab.")
     elif schwab_down and ("token" in schwab_err.lower() or not schwab_err):
-        st.error("Schwab login expired - no option chains or GEX, so the engine will not open trades. "
+        st.error("Schwab login expired - no option chains, so the engine will not open trades while options are on. "
                  "Fix: Settings → Schwab connection → Log in to Schwab.")
     elif schwab_down:
         st.error(f"Schwab option-chain data failing - no GEX, so the engine will not open trades. {schwab_err[:200]}")
@@ -458,7 +461,8 @@ with tab_bt:
         with st.spinner("Loading bars and replaying…"):
             data = HistoricalData()
             bars = {t: data.stock_bars(t, bt_start, bt_end) for t in bt_tickers}
-            result = Backtester(bt_settings, bt_cap, bars, data.option_bars).run(bt_start, bt_end)
+            spy = bars["SPY"] if "SPY" in bars else data.stock_bars("SPY", bt_start, bt_end)
+            result = Backtester(bt_settings, bt_cap, bars, data.option_bars, spy_bars=spy).run(bt_start, bt_end)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:4]
         record = {"id": run_id, "params": {"tickers": bt_tickers, "start": str(bt_start), "end": str(bt_end),
                                            "capital": bt_cap, "min_convergence": bt_conv, "risk_pct": bt_risk,
@@ -539,18 +543,34 @@ with tab_set:
         c = st.columns(3)
         risk = c[0].number_input("Risk per trade %", 0.5, 10.0, settings.risk_per_trade_pct * 100, 0.5)
         pool = c[1].number_input("Max options exposure %", 5.0, 50.0, settings.options_allocation_pct * 100, 5.0)
-        stock_alloc = c[2].number_input("Max stock position %", 5.0, 100.0, settings.stock_allocation_pct * 100, 5.0)
-        c = st.columns(3)
+        stock_alloc = c[2].number_input("Max stock exposure % (all stock positions)", 5.0, 100.0,
+                                        settings.stock_allocation_pct * 100, 5.0)
+        c = st.columns(4)
         max_trades = c[0].number_input("Max trades/day", 0, 10, settings.max_trades_per_day)
         max_open = c[1].number_input("Max open positions", 0, 5, settings.max_open_positions)
         loss_lim = c[2].number_input("Daily loss limit %", 1.0, 25.0, settings.daily_loss_limit_pct * 100, 1.0)
+        total_risk = c[3].number_input("Max total risk at stops %", 0.5, 10.0, settings.max_total_risk_pct * 100, 0.5,
+                                       help="All open positions together lose at most this if every stop is hit.")
         st.subheader("Session & signal")
         c = st.columns(4)
         open_min = c[0].number_input("No trades first N min", 15, 120, settings.no_trade_open_minutes)
         last_min = c[1].number_input("Last entry N min before close", 15, 240, settings.last_entry_minutes_before_close)
         buffer = c[2].number_input("Event buffer ± min", 30, 120, settings.event_buffer_minutes)
-        conv = c[3].slider("Min convergence %", 50, 100, settings.min_convergence, 5)
+        conv = c[3].slider("Min convergence %", 50, 100, settings.min_convergence, 5,
+                           help="80 = VRZ + volume spike + SPY + daily trend. 90+ = A+ (options tier).")
+        c = st.columns(4)
+        opt_score = c[0].slider("Options only at score ≥", 50, 101, settings.option_min_score, 5,
+                                help="Below this, signals trade the stock with its VRZ stop. 101 = stocks only.")
+        vol_lo = c[1].number_input("Volume spike min ×", 0.0, 10.0, settings.min_volume_spike, 0.1)
+        vol_hi = c[2].number_input("Volume spike max ×", 1.0, 100.0, settings.max_volume_spike, 0.5)
+        target_r = c[3].number_input("Target (R multiple)", 1.0, 5.0, settings.target_r, 0.5)
+        c = st.columns(3)
+        req_spy = c[0].toggle("Require SPY alignment", settings.require_spy_align)
+        req_trend = c[1].toggle("Require daily trend alignment", settings.require_trend_align)
+        momentum_on = c[2].toggle("Momentum zone-break setup (live only in negative GEX)", settings.momentum_setup)
         st.subheader("Options & exits")
+        trailing = st.toggle("Trailing stop", settings.trailing_stop,
+                             help="Off by default: in backtests the trail closed winners before the 1:2 target.")
         c = st.columns(4)
         o_stop = c[0].number_input("Option stop %", 10.0, 90.0, settings.option_stop_pct * 100, 5.0)
         o_tgt = c[1].number_input("Option target %", 10.0, 500.0, settings.option_target_pct * 100, 10.0)
@@ -582,6 +602,10 @@ with tab_set:
                     "event_buffer_minutes": int(buffer), "min_convergence": int(conv),
                     "option_stop_pct": o_stop / 100, "option_target_pct": o_tgt / 100,
                     "trail_activate_pct": trail_a / 100, "trail_giveback_pct": trail_g / 100,
+                    "max_total_risk_pct": total_risk / 100, "option_min_score": int(opt_score),
+                    "min_volume_spike": float(vol_lo), "max_volume_spike": float(vol_hi), "target_r": float(target_r),
+                    "require_spy_align": req_spy, "require_trend_align": req_trend, "momentum_setup": momentum_on,
+                    "trailing_stop": trailing,
                     "allow_short_stock": allow_short, "momentum_exit": momentum, "option_max_dte": int(max_dte),
                     "custom_events": events,
                 })

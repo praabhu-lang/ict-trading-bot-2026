@@ -17,6 +17,7 @@ upsert() {  # name schedule job
 upsert ict-premarket   "45 8 * * 1-5"       ai-trading-premarket
 upsert ict-engine-open "30,45 9 * * 1-5"    ai-trading-engine
 upsert ict-engine-day  "*/15 10-15 * * 1-5" ai-trading-engine
+upsert ict-gex-archive "0 18 * * 1-5"       ai-trading-gexarchive
 
 for old in ai-trading-postopen-trigger ai-trading-premarket-trigger ai-trading-premarket-schedule \
            ai-trading-postopen-schedule ai-trading-cron; do

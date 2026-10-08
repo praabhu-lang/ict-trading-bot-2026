@@ -1,7 +1,8 @@
 """Monitor agent: exit rules for open trades. Pure logic - shared by live engine and backtest.
 
-Order of precedence: end-of-day flatten > hard stop > target > trailing stop >
-signal invalidation (underlying back through the VRZ stop) > momentum fade (only while green).
+Order of precedence: end-of-day flatten > hard stop > target > underlying target (2R on the stock) >
+trailing stop (off by default) > signal invalidation (underlying back through the VRZ stop) >
+momentum fade (only while green).
 """
 from __future__ import annotations
 
@@ -36,9 +37,13 @@ def option_exit_reason(trade: dict, mid: float, s: Settings, now: datetime, flat
         return "STOP_LOSS"
     if pnl >= s.option_target_pct:
         return "TARGET"
+    utarget = trade.get("underlying_target")
+    if underlying_price and utarget and s.option_exit_on_underlying_target:
+        if (underlying_price >= utarget) if trade["direction"] == "bull" else (underlying_price <= utarget):
+            return "TARGET"
     high_water = max(float(trade.get("high_water") or entry), mid)
     hw_pnl = (high_water - entry) / entry
-    if hw_pnl >= s.trail_activate_pct and pnl <= hw_pnl - s.trail_giveback_pct:
+    if s.trailing_stop and hw_pnl >= s.trail_activate_pct and pnl <= hw_pnl - s.trail_giveback_pct:
         return "TRAILING_STOP"
     ustop = trade.get("underlying_stop")
     if underlying_price and ustop:

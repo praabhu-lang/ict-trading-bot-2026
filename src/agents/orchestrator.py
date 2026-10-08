@@ -28,7 +28,7 @@ from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
 from .monitor_agent import momentum_against, option_exit_reason, stock_exit_reason
 from .news_agent import NewsAgent
-from .risk_agent import Gate, account_gate, flatten_time, session_gate, size_option, size_stock
+from .risk_agent import Gate, account_gate, flatten_time, open_risk, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
 URGENT_EXITS = {"STOP_LOSS", "EOD_FLATTEN", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}
@@ -253,11 +253,12 @@ class TradingEngine:
         return True
 
     def _sync_option_stop(self, t: dict, bid: float) -> None:
-        """Re-place a missing stop, and ratchet it up to the trailing level once the trail is active."""
+        """Re-place a missing stop, and (only with trailing_stop on) ratchet it up once the trail is active."""
         entry = float(t["entry_price"])
         hard = entry * (1 - self.s.option_stop_pct)
         hw_pnl = (float(t.get("high_water") or entry) - entry) / entry if entry else 0.0
-        trail = entry * (1 + hw_pnl - self.s.trail_giveback_pct) if hw_pnl >= self.s.trail_activate_pct else 0.0
+        trail = (entry * (1 + hw_pnl - self.s.trail_giveback_pct)
+                 if self.s.trailing_stop and hw_pnl >= self.s.trail_activate_pct else 0.0)
         desired = round(max(hard, trail), 2)
         if bid > 0 and desired >= bid:
             return  # would trigger immediately; the engine's own exit check handles this case
@@ -329,7 +330,7 @@ class TradingEngine:
                 vwap=snap["vwap"], poc=snap["poc"], vah=snap["vah"], val=snap["val"], rvol=snap["rvol"],
                 net_gex=snap.get("net_gex"), gamma_flip=snap.get("gamma_flip"), call_wall=snap.get("call_wall"),
                 put_wall=snap.get("put_wall"), gex_regime=snap.get("gex_regime"), zones=snap["zones"],
-                best_score=sig.score if sig else None, news=(news.headlines[:3] if news else None),
+                best_score=sig.score if sig else snap.get("candidate_score"), news=(news.headlines[:3] if news else None),
             )
             if sig and sig.score >= self.s.min_convergence:
                 candidates.append((sig, chain))
@@ -366,10 +367,14 @@ class TradingEngine:
     def _enter(self, sig, chain, now: datetime) -> bool:
         acct = self.broker.account()
         equity = self.s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
+        open_trades = self.ledger.open_trades()
         open_option_cost = sum(float(t["entry_price"]) * float(t["qty"]) * 100
-                               for t in self.ledger.open_trades() if t["asset_class"] == "option")
-        contract = choose_option(chain, sig.direction, self.s, now.date())
-        qty = size_option(self.s, equity, contract.ask, open_option_cost) if contract else 0
+                               for t in open_trades if t["asset_class"] == "option")
+        open_stock_cost = sum(float(t["entry_price"]) * float(t["qty"]) for t in open_trades if t["asset_class"] == "stock")
+        risk_open = open_risk(open_trades, self.s)
+        a_plus = sig.score >= self.s.option_min_score
+        contract = choose_option(chain, sig.direction, self.s, now.date()) if a_plus and chain else None
+        qty = size_option(self.s, equity, contract.ask, open_option_cost, risk_open) if contract else 0
         if contract and qty >= 1:
             fill = self.execution.buy_option(contract.symbol, qty, contract.bid, contract.ask)
             if fill.filled:
@@ -392,7 +397,9 @@ class TradingEngine:
                     target_px=round(fill.avg_price * (1 + self.s.option_target_pct), 2), stop_px=stop_px)
                 return True
             self.ledger.log("WARN", f"Option entry for {contract.symbol} did not fill - trying stock fallback")
-        why = "no 0DTE contract within delta/spread/price limits" if not contract else f"size {qty} < 1 contract"
+        why = (f"score {sig.score:.0f} below the A+ options tier ({self.s.option_min_score})" if not a_plus
+               else "no 0DTE contract within delta/spread/price limits" if not contract
+               else f"size {qty} < 1 contract (risk budget / 20% options pool)")
 
         if sig.direction == "bear" and not self.s.allow_short_stock:
             self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
@@ -410,7 +417,7 @@ class TradingEngine:
                                       sig.target, sig.components, "BLOCKED",
                                       f"{why}; live price {live:.2f} moved too far from signal {sig.entry:.2f}")
             return False
-        shares = size_stock(self.s, equity, live, sig.stop, acct.buying_power)
+        shares = size_stock(self.s, equity, live, sig.stop, acct.buying_power, risk_open, open_stock_cost)
         if shares < 1:
             self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                       sig.target, sig.components, "BLOCKED", f"{why}; stock size < 1 share")

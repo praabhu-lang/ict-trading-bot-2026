@@ -57,22 +57,44 @@ def account_gate(s: Settings, equity: float, trades_today: int, open_positions: 
     return Gate(not reasons, reasons)
 
 
-def size_option(s: Settings, equity: float, premium: float, open_option_cost: float) -> int:
-    """Contracts such that (a) loss at the premium stop <= risk_per_trade_pct of equity and
+def risk_budget(s: Settings, equity: float, open_risk: float) -> float:
+    """Dollars the next trade may lose at its stop: risk_per_trade_pct, but never so much that all open
+    positions together would lose more than max_total_risk_pct of equity if every stop hit."""
+    return max(0.0, min(equity * s.risk_per_trade_pct, equity * s.max_total_risk_pct - open_risk))
+
+
+def open_risk(trades: list[dict], s: Settings) -> float:
+    """Loss if every open position hit its stop (options: premium stop; stocks: price stop)."""
+    total = 0.0
+    for t in trades:
+        qty, entry = float(t["qty"]), float(t["entry_price"])
+        if t["asset_class"] == "option":
+            stop = float(t.get("stop_price") or entry * (1 - s.option_stop_pct))
+            total += max(entry - stop, 0.0) * qty * 100
+        elif t.get("stop_price"):
+            total += abs(entry - float(t["stop_price"])) * qty
+    return total
+
+
+def size_option(s: Settings, equity: float, premium: float, open_option_cost: float, open_risk_usd: float = 0.0) -> int:
+    """Contracts such that (a) loss at the premium stop fits the risk budget (per trade and total) and
     (b) total open option premium <= options_allocation_pct of equity. 0 = not feasible."""
     if premium <= 0 or equity <= 0:
         return 0
     contract_cost = premium * 100.0
-    by_risk = (equity * s.risk_per_trade_pct) / (contract_cost * s.option_stop_pct)
+    by_risk = risk_budget(s, equity, open_risk_usd) / (contract_cost * s.option_stop_pct)
     by_pool = (equity * s.options_allocation_pct - open_option_cost) / contract_cost
     return max(0, math.floor(min(by_risk, by_pool)))
 
 
-def size_stock(s: Settings, equity: float, entry: float, stop: float, buying_power: float) -> int:
+def size_stock(s: Settings, equity: float, entry: float, stop: float, buying_power: float,
+               open_risk_usd: float = 0.0, open_stock_cost: float = 0.0) -> int:
+    """Shares such that the loss at the stop fits the risk budget and total stock notional (including
+    positions already open) stays within stock_allocation_pct of equity."""
     per_share = abs(entry - stop)
     if per_share <= 0 or entry <= 0 or equity <= 0:
         return 0
-    by_risk = (equity * s.risk_per_trade_pct) / per_share
-    by_alloc = (equity * s.stock_allocation_pct) / entry
+    by_risk = risk_budget(s, equity, open_risk_usd) / per_share
+    by_alloc = (equity * s.stock_allocation_pct - open_stock_cost) / entry
     by_bp = max(buying_power, 0) / entry
     return max(0, math.floor(min(by_risk, by_alloc, by_bp)))

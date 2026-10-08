@@ -62,21 +62,24 @@ class AlpacaBars:
 
 
 class MarketData:
-    def __init__(self, schwab: SchwabClient | None, alpaca: AlpacaBars | None = None):
+    def __init__(self, schwab: SchwabClient | None, alpaca: AlpacaBars | None = None, gexbot=None):
         self.schwab = schwab
         self.alpaca = alpaca
+        self.gexbot = gexbot
         self._cache: dict[tuple, tuple[float, object]] = {}
         self.health: dict[str, str] = {}
 
     @classmethod
     def from_env(cls, store) -> "MarketData":
+        from .gexbot import GexbotClient
         from .schwab import SchwabTokenStore
 
         alpaca = None
         key, secret = env("APCA_API_KEY_ID"), env("APCA_API_SECRET_KEY")
         if key and secret:
             alpaca = AlpacaBars(key, secret, env("ALPACA_DATA_FEED", "iex"))
-        return cls(SchwabClient(SchwabTokenStore(store)), alpaca)
+        gexbot = GexbotClient()
+        return cls(SchwabClient(SchwabTokenStore(store)), alpaca, gexbot if gexbot.configured else None)
 
     def _cached(self, key: tuple, ttl: float, fn):
         hit = self._cache.get(key)
@@ -86,13 +89,25 @@ class MarketData:
         self._cache[key] = (time.time(), value)
         return value
 
+    def daily_closes(self, symbol: str, now: datetime, sessions: int = 30) -> pd.Series:
+        """Regular-session close of each of the last `sessions` completed days (cached for the day)."""
+        def fetch():
+            yesterday = previous_trading_day(now.date())
+            df = self._fetch_bars(symbol, yesterday, sessions, market_close_dt(yesterday))
+            return df.groupby(df.index.date)["close"].last()
+        return self._cached(("daily", symbol, now.date()), 86400, fetch)
+
     def bars(self, symbol: str, now: datetime, days: int = 6) -> pd.DataFrame:
         """Closed 5-minute regular-session bars for today and the prior `days` sessions."""
-        start_day = now.date()
+        bar_slot = int(now.timestamp() // (BAR_MINUTES * 60))
+        return self._cached(("bars", symbol, bar_slot), 300,
+                            lambda: self._fetch_bars(symbol, now.date(), days, min(now, market_close_dt(now.date()))))
+
+    def _fetch_bars(self, symbol: str, last_day, days: int, now: datetime) -> pd.DataFrame:
+        start_day = last_day
         for _ in range(days):
             start_day = previous_trading_day(start_day)
-        start, end = market_open_dt(start_day), min(now, market_close_dt(now.date()))
-        bar_slot = int(now.timestamp() // (BAR_MINUTES * 60))
+        start, end = market_open_dt(start_day), now
 
         def fetch():
             errors = []
@@ -114,7 +129,7 @@ class MarketData:
                     errors.append(f"{name}: {exc}")
             raise MarketDataUnavailable(f"No bars for {symbol}: {'; '.join(errors)[:300]}")
 
-        return self._cached(("bars", symbol, bar_slot), 300, fetch)
+        return fetch()
 
     def chain(self, symbol: str, today: date, max_dte: int = 7) -> OptionChain:
         if self.schwab is None:
@@ -130,3 +145,18 @@ class MarketData:
                 raise
 
         return self._cached(("chain", symbol, today, max_dte), 60, fetch)
+
+    def gexbot_levels(self, symbol: str, now: datetime):
+        """Live GEX from gexbot.com, or None when not configured / ticker not covered / request failed."""
+        if self.gexbot is None or not self.gexbot.supports(symbol):
+            return None
+
+        def fetch():
+            try:
+                g = self.gexbot.gex(symbol)
+                self.health["gex:gexbot"] = "ok"
+                return g
+            except MarketDataUnavailable as exc:
+                self.health["gex:gexbot"] = f"error: {exc}"[:200]
+                return None
+        return self._cached(("gexbot", symbol, int(now.timestamp() // 60)), 60, fetch)

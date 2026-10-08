@@ -89,7 +89,10 @@ def analyze_ticker(ticker: str) -> str:
     except MarketDataUnavailable as exc:
         return f"Market data unavailable: {exc}"
     gex = compute_gex(chain.options, chain.spot, now)
-    a = analyze(ticker.upper(), bars, now.date(), min_rvol=s.min_rvol, min_rr=s.min_reward_risk, gex=gex)
+    from src.agents.market_analyst import MarketAnalystAgent
+
+    a = analyze(ticker.upper(), bars, now.date(), s, gex=gex,
+                **MarketAnalystAgent(market, None).context(ticker.upper(), bars, now))
     if not a:
         return "Not enough bars yet today."
     out = {"snapshot": a.snapshot, "signal": a.signal.__dict__ if a.signal else None}

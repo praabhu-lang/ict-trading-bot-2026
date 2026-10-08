@@ -31,4 +31,9 @@ gcloud run jobs deploy ai-trading-engine --project "$PROJECT" --region "$REGION"
   --command python --args=-m,src.app,run,--minutes,14 --env-vars-file env.yaml \
   --memory 1Gi --task-timeout 16m --max-retries 0
 
+# gexbot EOD GEX archive (18:00 ET): builds the GEX history that future backtests replay.
+gcloud run jobs deploy ai-trading-gexarchive --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+  --command python --args=-m,src.app,gex-archive --env-vars-file env.yaml \
+  --memory 1Gi --task-timeout 30m --max-retries 1
+
 echo "Deployed $IMAGE. Run deploy/scheduler.sh once to (re)create the schedules."

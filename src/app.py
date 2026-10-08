@@ -7,6 +7,7 @@
   python -m src.app test-email           # verify Resend email alerts
   python -m src.app scan                 # forced post-open scan: refresh levels/signals, no orders
   python -m src.app backtest --tickers SPY,QQQ --start 2026-08-01 --end 2026-09-30
+  python -m src.app gex-archive          # 18:00 ET: save today's gexbot EOD GEX archive (for future GEX backtests)
 """
 from __future__ import annotations
 
@@ -159,6 +160,23 @@ def cmd_test_email() -> int:
     return 0 if ok else 1
 
 
+def cmd_gex_archive() -> int:
+    from .data.gexbot import GexbotClient, archive_eod
+
+    client = GexbotClient()
+    if not client.configured:
+        print("GEXBOT_API_KEY not set")
+        return 1
+    store = Store.from_env()
+    results = archive_eod(client, store, load_settings(store).universe)
+    print(json.dumps(results, indent=2))
+    failed = [t for t, r in results.items() if r.startswith("FAILED")]
+    if failed:
+        Notifier.from_env().send("⚠️ gexbot EOD archive failed", "<pre>" + json.dumps(results, indent=2) + "</pre>",
+                                 dedupe_key=f"gexarchive:{date.today().isoformat()}")
+    return 1 if failed and len(failed) == len(results) else 0
+
+
 def cmd_backtest(tickers: list[str], start: date, end: date, capital: float) -> int:
     from .backtest.data import HistoricalData
     from .backtest.engine import Backtester
@@ -167,7 +185,8 @@ def cmd_backtest(tickers: list[str], start: date, end: date, capital: float) -> 
     settings = load_settings(store)
     data = HistoricalData()
     bars = {t: data.stock_bars(t, start, end) for t in tickers}
-    result = Backtester(settings, capital, bars, data.option_bars).run(start, end)
+    spy = bars["SPY"] if "SPY" in bars else data.stock_bars("SPY", start, end)  # SPY-alignment filter
+    result = Backtester(settings, capital, bars, data.option_bars, spy_bars=spy).run(start, end)
     print(json.dumps({"stats": result["stats"], "data_sources": data.source_used}, default=str, indent=2))
     return 0
 
@@ -182,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("flatten")
     sub.add_parser("test-email")
     sub.add_parser("scan")
+    sub.add_parser("gex-archive")
     pre = sub.add_parser("premarket")
     pre.add_argument("--no-email", action="store_true")
     bt = sub.add_parser("backtest")
@@ -199,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(1, flatten=True)
     if a.cmd == "scan":
         return cmd_scan()
+    if a.cmd == "gex-archive":
+        return cmd_gex_archive()
     if a.cmd == "test-email":
         return cmd_test_email()
     if a.cmd == "premarket":

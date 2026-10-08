@@ -91,3 +91,19 @@ def detect_trigger(bar: pd.Series, ts: pd.Timestamp, zones: list[Zone]) -> Trigg
     if bull:
         return Trigger("bull", min(bull, key=lambda z: z.low))
     return None
+
+
+def detect_break(bar: pd.Series, prev_close: float, ts: pd.Timestamp, zones: list[Zone]) -> tuple[str, Zone] | None:
+    """Momentum: the bar closed through a still-valid zone's far edge for the first time
+    (bull = close above a supply zone, bear = close below a demand zone)."""
+    up = [z for z in zones if z.valid and z.kind == "supply" and z.created_at < ts
+          and bar["close"] > z.high >= prev_close]
+    down = [z for z in zones if z.valid and z.kind == "demand" and z.created_at < ts
+            and bar["close"] < z.low <= prev_close]
+    if up and down:
+        return None
+    if up:
+        return "bull", max(up, key=lambda z: z.high)
+    if down:
+        return "bear", min(down, key=lambda z: z.low)
+    return None

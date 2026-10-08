@@ -54,8 +54,17 @@ def today_bear_rejection(d: date, n_bars: int = 18) -> list[dict]:
         px = 100.8 + 1.2 * i / (n_bars - 2)
         rows.append(_bar(ts, px, px + 0.1, px - 0.1, px + 0.05, 2000))
     ts = datetime.combine(d, time(9, 30), tzinfo=ET) + timedelta(minutes=5 * (n_bars - 1))
-    rows.append(_bar(ts, 102.1, 102.3, 101.5, 101.6, 2500))
+    rows.append(_bar(ts, 102.1, 102.3, 101.5, 101.6, 4000))   # 2x volume spike on the rejection candle
     return rows
+
+
+def downtrend_closes(today: date, n: int = 25) -> pd.Series:
+    days, d = [], today
+    for _ in range(n):
+        d = previous_trading_day(d)
+        days.append(d)
+    days.sort()
+    return pd.Series([110.0 - 9.0 * i / (n - 1) for i in range(n)], index=days)
 
 
 def frame(rows: list[dict]) -> pd.DataFrame:
@@ -114,6 +123,12 @@ class FakeMarket:
             raise MarketDataUnavailable("simulated outage")
         df = self._bars[symbol]
         return df[df.index + pd.Timedelta(minutes=5) <= now]
+
+    def daily_closes(self, symbol, now, sessions=30):
+        """A falling 20-day trend (prior close below its 20-day average) - aligned with the bear fixture."""
+        if self.fail:
+            raise MarketDataUnavailable("simulated outage")
+        return downtrend_closes(now.date())
 
     def chain(self, symbol, today, max_dte=7):
         if self.fail or symbol not in self._chains:

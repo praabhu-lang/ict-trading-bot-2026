@@ -10,9 +10,13 @@ from src.data.schwab import SchwabClient, SchwabTokenStore
 from tests.helpers import TODAY, bear_setup_bars
 
 
+# The 6-session fixture has no 20-day trend and SPY trades above its VWAP: only VRZ + volume (50 pts) is known.
+LOOSE = dict(universe=["SPY"], require_spy_align=False, require_trend_align=False, min_convergence=50, option_min_score=50)
+
+
 def test_backtest_trades_the_bear_setup_and_reports_stats():
     bars = {"SPY": bear_setup_bars(follow_through=12)}
-    result = Backtester(Settings(universe=["SPY"]), 10_000, bars).run(TODAY, TODAY)
+    result = Backtester(Settings(**LOOSE), 10_000, bars).run(TODAY, TODAY)
     trades = result["trades"]
     assert len(trades) == 1
     t = trades.iloc[0]
@@ -26,7 +30,7 @@ def test_backtest_trades_the_bear_setup_and_reports_stats():
 
 def test_backtest_respects_entry_window():
     bars = {"SPY": bear_setup_bars(follow_through=12)}
-    s = Settings(universe=["SPY"], no_trade_open_minutes=120)  # signal at 11:00 is before 11:30
+    s = Settings(**LOOSE, no_trade_open_minutes=120)  # signal at 11:00 is before 11:30
     assert Backtester(s, 10_000, bars).run(TODAY, TODAY)["stats"]["trades"] == 0
 
 

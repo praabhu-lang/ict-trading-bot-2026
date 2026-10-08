@@ -26,7 +26,7 @@ class HistoricalData:
 
     def stock_bars(self, ticker: str, start: date, end: date) -> pd.DataFrame:
         first = start
-        for _ in range(6):  # warm-up sessions for prior-day zones and RVOL
+        for _ in range(30):  # warm-up sessions: prior-day zones, RVOL and the 20-day trend filter
             first = previous_trading_day(first)
         t0, t1 = market_open_dt(first), market_close_dt(end)
         if self.key and self.secret:

@@ -59,14 +59,25 @@ class Settings:
     # capped at the broker account's equity. 0 = use the full account equity.
     starting_capital: float = 10_000.0
     options_allocation_pct: float = 0.20
-    risk_per_trade_pct: float = 0.05
+    risk_per_trade_pct: float = 0.02
     stock_allocation_pct: float = 0.50
     max_trades_per_day: int = 3
     max_open_positions: int = 2
     daily_loss_limit_pct: float = 0.10
+    max_total_risk_pct: float = 0.05     # all open positions together lose <= 5% of equity if every stop hits
 
     # --- signal quality ---
-    min_convergence: int = 75
+    # Validated on 2025 (picked) and 2026 (unseen) data, 20 tickers - see docs/strategy_research.md.
+    min_convergence: int = 80            # 80 = all core confluences (VRZ + volume spike + SPY + daily trend)
+    # Options only at this score; below it the stock is traded with the VRZ stop. 101 = stocks only (default):
+    # in the 2025/2026 backtests 0DTE options lost money even on A+ setups, while stocks were profitable in both.
+    option_min_score: int = 101
+    min_volume_spike: float = 1.5        # rejection candle volume vs the average of the previous 20 bars
+    max_volume_spike: float = 2.5        # above this (news-driven bars) the edge disappeared
+    require_spy_align: bool = True       # SPY on the trade side of its VWAP
+    require_trend_align: bool = True     # prior close vs 20-day average agrees with the trade
+    target_r: float = 2.0                # underlying target = 2x the risk to the VRZ stop (1:2)
+    momentum_setup: bool = False         # zone-break continuation; live only when GEX regime is NEGATIVE
     min_rvol: float = 1.2
     min_reward_risk: float = 1.5
 
@@ -77,7 +88,9 @@ class Settings:
     option_delta_min: float = 0.35
     option_delta_max: float = 0.60
     option_stop_pct: float = 0.50
-    option_target_pct: float = 0.50
+    option_target_pct: float = 1.00  # 1:2 risk:reward against the 50% premium stop
+    trailing_stop: bool = False          # backtests: the trail cut winners before the 1:2 target
+    option_exit_on_underlying_target: bool = True  # take option profit when the stock reaches its 2R target
     trail_activate_pct: float = 0.30
     trail_giveback_pct: float = 0.15
     momentum_exit: bool = True
@@ -99,6 +112,11 @@ class Settings:
         "max_open_positions": (0, 5),
         "daily_loss_limit_pct": (0.0, 0.25),
         "min_convergence": (50, 100),
+        "option_min_score": (50, 101),
+        "min_volume_spike": (0.0, 10.0),
+        "max_volume_spike": (1.0, 100.0),
+        "target_r": (1.0, 5.0),
+        "max_total_risk_pct": (0.005, 0.10),
         "min_rvol": (0.0, 5.0),
         "min_reward_risk": (0.5, 5.0),
         "no_trade_open_minutes": (15, 120),

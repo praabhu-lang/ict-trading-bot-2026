@@ -43,17 +43,17 @@ def test_holiday_and_early_close():
     assert flatten_time(at(date(2026, 11, 27), 10, 0), S) == at(date(2026, 11, 27), 12, 45)
 
 
-def test_option_sizing_5pct_risk_20pct_pool_and_compounding():
-    assert size_option(S, 10_000, 2.00, 0) == 5          # 5 x $100 risk at -50% = $500 = 5%
-    assert size_option(S, 20_000, 2.00, 0) == 10         # profits reinvested -> size grows
-    assert size_option(S, 10_000, 2.00, 1_500) == 2      # only $500 of the 20% pool left
-    assert size_option(S, 10_000, 12.00, 0) == 0         # one contract would risk > 5% -> not feasible
+def test_option_sizing_2pct_risk_20pct_pool_and_compounding():
+    assert size_option(S, 10_000, 2.00, 0) == 2          # 2 x $100 risk at -50% = $200 = 2%
+    assert size_option(S, 20_000, 2.00, 0) == 4          # profits reinvested -> size grows
+    assert size_option(S, 10_000, 0.50, 1_800) == 4      # only $200 of the 20% pool left (risk would allow 8)
+    assert size_option(S, 10_000, 5.00, 0) == 0          # one contract would risk > 2% -> not feasible
 
 
 def test_stock_sizing_risk_and_caps():
     assert size_stock(S, 10_000, 100.0, 99.0, 50_000) == 50      # by allocation cap 50% = $5k
-    assert size_stock(S, 10_000, 100.0, 95.0, 50_000) == 50      # by allocation (risk would allow 100)
-    assert size_stock(S, 10_000, 100.0, 80.0, 50_000) == 25      # by risk: $500 / $20
+    assert size_stock(S, 10_000, 100.0, 95.0, 50_000) == 40      # by risk: $200 / $5
+    assert size_stock(S, 10_000, 100.0, 80.0, 50_000) == 10      # by risk: $200 / $20
     assert size_stock(S, 10_000, 100.0, 99.0, 1_000) == 10       # by buying power
 
 
@@ -69,9 +69,13 @@ def test_option_exit_rules():
     now, eod = at(WED, 12, 0), at(WED, 15, 45)
     t = {"entry_price": 2.0, "high_water": 2.0, "direction": "bull", "underlying_stop": 99.0}
     assert option_exit_reason(t, 1.0, S, now, eod) == "STOP_LOSS"
-    assert option_exit_reason(t, 3.0, S, now, eod) == "TARGET"
+    assert option_exit_reason(t, 3.0, S, now, eod) is None        # +50%: below the +100% target
+    assert option_exit_reason(t, 4.0, S, now, eod) == "TARGET"
     assert option_exit_reason(t, 2.2, S, at(WED, 15, 45), eod) == "EOD_FLATTEN"
-    assert option_exit_reason({**t, "high_water": 2.7}, 2.35, S, now, eod) == "TRAILING_STOP"
+    assert option_exit_reason({**t, "high_water": 2.7}, 2.35, S, now, eod) is None       # trailing off by default
+    trail = Settings(trailing_stop=True)
+    assert option_exit_reason({**t, "high_water": 2.7}, 2.35, trail, now, eod) == "TRAILING_STOP"
+    assert option_exit_reason({**t, "underlying_target": 104.0}, 2.5, S, now, eod, underlying_price=104.1) == "TARGET"
     assert option_exit_reason(t, 2.1, S, now, eod, underlying_price=98.9) == "SIGNAL_INVALIDATED"
     assert option_exit_reason(t, 2.1, S, now, eod, underlying_price=100, fading=True) == "MOMENTUM_FADE"
     assert option_exit_reason(t, 1.9, S, now, eod, underlying_price=100, fading=True) is None

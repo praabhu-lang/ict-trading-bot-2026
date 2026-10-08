@@ -33,16 +33,23 @@ New platforms: implement `src/brokers/base.py:Broker` and add an entry to `src/b
 ## Rules (all editable in Dashboard → Settings, bounded to safe ranges)
 
 - **Universe**: SPY, QQQ + 18 liquid S&P 500 / Nasdaq-100 leaders.
-- **Signal**: a VRZ sweep-and-reject on a closed 5-min bar is required; convergence score ≥ 75%
-  (VWAP side, GEX flip/wall alignment, RVOL ≥ 1.2, gap bias, value-area edge, clean news). Reward:risk ≥ 1.5.
+- **Signal** (rebuilt from a 21-month study - see [docs/strategy_research.md](docs/strategy_research.md)):
+  a VRZ sweep-and-reject on a closed 5-min bar, and all core confluences = score 80:
+  rejection-candle **volume 1.5–2.5×** the prior 20 bars, **SPY on the trade side of its VWAP**, and the
+  **daily trend** (prior close vs 20-day average) agreeing. +10 if the reversal fades the opening gap,
+  +10 if GEX agrees (gamma flip side, or the zone at the put/call wall). Target = **2R** on the stock (1:2).
+- **Momentum setup** (off by default): first close through a VRZ zone before 11:30 with SPY aligned and
+  RVOL ≥ 1.2; live it only trades when the GEX regime is **negative** (dealers short gamma).
 - **Capital**: sizing base = trading capital ($10,000 default) + the bot's realized P&L (profits
   reinvested), capped at real account equity.
-- **Options**: 0DTE, |delta| 0.35–0.60, spread ≤ 10%, premium ≥ $0.50. Contracts sized so the −50% stop
-  loses ≤ **5%** of capital and total option premium ≤ **20%** of capital.
-- **Stock fallback** (no feasible option): bracket order (stop at VRZ invalidation, target at the
-  next level), ≤ 5% risk, ≤ 50% notional; skipped if price already moved > ½R from the signal.
-- **Exits**: −50% stop, +50% target, trailing (after +30%, give back 15 pts), underlying back through
-  the VRZ stop, momentum fade while green, 15:45 flatten. Exits run even when paused.
+- **Instrument**: **stocks by default** (bracket order: stop at the VRZ invalidation, target 2R), all stock
+  positions together ≤ **50%** of capital. Options (0DTE, |delta| 0.35–0.60, spread ≤ 10%, total premium
+  ≤ **20%** of capital) only for signals scoring ≥ "Options only at score ≥" (101 = never; backtested
+  0DTE options lost money even on A+ setups).
+- **Risk**: ≤ **2%** per trade, and ≤ **5%** for all open positions together if every stop is hit.
+- **Exits**: stock bracket stop/target; options −50% stop, +100% target or the stock reaching its 2R
+  target, underlying back through the VRZ stop. Trailing stop **off** by default (it cut winners before
+  the target). Momentum fade while green, 15:45 flatten. Exits run even when paused.
 - **Guards**: max 3 trades/day, 2 open positions, 10% daily loss limit, one position per underlying,
   earnings-day and negative-news blocks, **fail closed** if market data (Schwab) is down,
   live money needs both the dashboard choice and `ALLOW_LIVE_TRADING=true` on the job.
