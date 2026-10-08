@@ -1,11 +1,17 @@
+# Secrets
 .env
 env.yaml
 *.env
-data/
+# Local state and logs (root only - src/data is source code)
+/data/
+/logs/
 *.log
+# Python / tooling
 __pycache__/
 *.pyc
 .venv/
-venv/
-.DS_Store
+/venv/
 .pytest_cache/
+.DS_Store
+# SQLite runtime data
+*.db

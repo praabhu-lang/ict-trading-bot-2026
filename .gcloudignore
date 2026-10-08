@@ -1,0 +1,15 @@
+# Cloud Build upload: only what the Dockerfile needs
+.env
+env.yaml
+*.env
+/data/
+/logs/
+*.log
+/venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+/legacy/
+/docs/
+/grafana/

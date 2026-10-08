@@ -1,0 +1,132 @@
+"""Market data facade used by the live engine.
+
+Bars: Schwab price history first, Alpaca (IEX feed) as fallback.
+Option chains / greeks / open interest: Schwab only (needed for GEX).
+Any failure raises MarketDataUnavailable so the engine blocks new entries (fails closed).
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+
+from ..core.clock import ET, market_close_dt, market_open_dt, previous_trading_day
+from ..core.settings import env
+from .models import MarketDataUnavailable, OptionChain
+from .schwab import SchwabClient
+
+log = logging.getLogger(__name__)
+BAR_MINUTES = 5
+
+
+def regular_session(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    t = df.index.time
+    keep = (t >= datetime.strptime("09:30", "%H:%M").time()) & (t < datetime.strptime("16:00", "%H:%M").time())
+    return df[keep]
+
+
+def closed_bars(df: pd.DataFrame, now: datetime, minutes: int = BAR_MINUTES) -> pd.DataFrame:
+    """Drop the bar that is still forming (bar start + length > now)."""
+    if df.empty:
+        return df
+    return df[df.index + pd.Timedelta(minutes=minutes) <= now]
+
+
+class AlpacaBars:
+    def __init__(self, api_key: str, secret: str, feed: str = "iex"):
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+
+        self.client = StockHistoricalDataClient(api_key, secret)
+        self.feed = feed
+
+    def bars(self, symbol: str, start: datetime, end: datetime, minutes: int = BAR_MINUTES) -> pd.DataFrame:
+        from alpaca.data.enums import Adjustment, DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol, timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
+            start=start, end=end, feed=DataFeed(self.feed), adjustment=Adjustment.RAW,
+        )
+        df = self.client.get_stock_bars(req).df
+        if df.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert(ET)
+        return df[["open", "high", "low", "close", "volume"]].astype(float)
+
+
+class MarketData:
+    def __init__(self, schwab: SchwabClient | None, alpaca: AlpacaBars | None = None):
+        self.schwab = schwab
+        self.alpaca = alpaca
+        self._cache: dict[tuple, tuple[float, object]] = {}
+        self.health: dict[str, str] = {}
+
+    @classmethod
+    def from_env(cls, store) -> "MarketData":
+        from .schwab import SchwabTokenStore
+
+        alpaca = None
+        key, secret = env("APCA_API_KEY_ID"), env("APCA_API_SECRET_KEY")
+        if key and secret:
+            alpaca = AlpacaBars(key, secret, env("ALPACA_DATA_FEED", "iex"))
+        return cls(SchwabClient(SchwabTokenStore(store)), alpaca)
+
+    def _cached(self, key: tuple, ttl: float, fn):
+        hit = self._cache.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        value = fn()
+        self._cache[key] = (time.time(), value)
+        return value
+
+    def bars(self, symbol: str, now: datetime, days: int = 6) -> pd.DataFrame:
+        """Closed 5-minute regular-session bars for today and the prior `days` sessions."""
+        start_day = now.date()
+        for _ in range(days):
+            start_day = previous_trading_day(start_day)
+        start, end = market_open_dt(start_day), min(now, market_close_dt(now.date()))
+        bar_slot = int(now.timestamp() // (BAR_MINUTES * 60))
+
+        def fetch():
+            errors = []
+            for name, source in (("schwab", self.schwab), ("alpaca", self.alpaca)):
+                if source is None:
+                    continue
+                try:
+                    if name == "schwab":
+                        df = source.price_history(symbol, start - timedelta(minutes=1), end)
+                    else:
+                        df = source.bars(symbol, start, end)
+                    df = closed_bars(regular_session(df), now)
+                    if not df.empty:
+                        self.health[f"bars:{name}"] = "ok"
+                        return df
+                    errors.append(f"{name}: empty")
+                except Exception as exc:  # noqa: BLE001 - try next source
+                    self.health[f"bars:{name}"] = f"error: {exc}"[:200]
+                    errors.append(f"{name}: {exc}")
+            raise MarketDataUnavailable(f"No bars for {symbol}: {'; '.join(errors)[:300]}")
+
+        return self._cached(("bars", symbol, bar_slot), 300, fetch)
+
+    def chain(self, symbol: str, today: date, max_dte: int = 7) -> OptionChain:
+        if self.schwab is None:
+            raise MarketDataUnavailable("Schwab client not configured")
+
+        def fetch():
+            try:
+                chain = self.schwab.option_chain(symbol, today, today + timedelta(days=max_dte))
+                self.health["chains:schwab"] = "ok"
+                return chain
+            except MarketDataUnavailable as exc:
+                self.health["chains:schwab"] = f"error: {exc}"[:200]
+                raise
+
+        return self._cached(("chain", symbol, today, max_dte), 60, fetch)

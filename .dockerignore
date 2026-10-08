@@ -2,10 +2,10 @@
 .env
 env.yaml
 *.env
-data/
-logs/
+/data/
+/logs/
 *.log
-venv/
+/venv/
 .venv/
 __pycache__/
 .pytest_cache/

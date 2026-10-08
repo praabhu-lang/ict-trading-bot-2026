@@ -9,6 +9,11 @@ IMAGE="$REGION-docker.pkg.dev/$PROJECT/cloud-run-source-deploy/ict-trading-bot:$
 cd "$(dirname "$0")/.."
 [ -f env.yaml ] || { echo "env.yaml missing (copy deploy/env.example.yaml)"; exit 1; }
 
+# Refuse to ship code that is not in git (an over-broad ignore rule once dropped src/data/).
+missing="$(git ls-files --others --ignored --exclude-standard -- src | grep '\.py$' || true)"
+missing="$missing$(git ls-files --others --exclude-standard -- src | grep '\.py$' || true)"
+if [ -n "$missing" ]; then echo "Source files not committed:"; echo "$missing"; exit 1; fi
+
 gcloud builds submit --project "$PROJECT" --tag "$IMAGE" .
 
 # Dashboard: one instance (Streamlit sessions), long timeout for backtests over websockets.
