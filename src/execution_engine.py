@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 import requests
+import subprocess
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -54,18 +55,18 @@ class MasterHighQualityExecutionEngine:
         self.MIN_RVOL = 1.20                   # Relative Volume filter for strong momentum
         self.POLL_TIMEOUT_SEC = 30
         
-        # $10k Capital Pool Sizing
+        # Capital Allocation & Sizing
         self.TOTAL_CAPITAL = 10000.0
         self.OPTION_CAPITAL_POOL = 2000.0       # 20% pool for 0DTE options
         self.MAX_OPTION_RISK_PER_TRADE = 1000.0 # Allocates up to $1,000 per option trade
-        self.STOCK_CAPITAL_POOL = self.TOTAL_CAPITAL * 0.50 # 50% ($5,000) for stock rotation
+        self.STOCK_CAPITAL_POOL = 5000.0        # Hard $5,000 pool for stock trades
         self.OPTION_STOP_LOSS_PCT = 0.50        # -50% Hard Stop
         self.OPTION_PROFIT_TARGET_PCT = 0.50    # +50% Take Profit
         
         self.schwab_client = schwab_client if schwab_client else SchwabMarketDataClient()
         
-        api_key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
-        api_secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
+        api_key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or os.getenv("APO_API_KEY")
+        api_secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or os.getenv("APO_API_SECRET")
         
         if not api_key or not api_secret or not os.getenv("TAVILY_API_KEY"):
             for fname in [".env", "env.yaml"]:
@@ -82,9 +83,9 @@ class MasterHighQualityExecutionEngine:
                             k, v = clean_line.split(delimiter, 1)
                             k, v = k.strip(), v.strip().strip('"').strip("'")
                             os.environ[k] = v
-                            if k in ["APCA_API_KEY_ID", "ALPACA_API_KEY"]:
+                            if k in ["APCA_API_KEY_ID", "ALPACA_API_KEY", "APO_API_KEY"]:
                                 api_key = v
-                            elif k in ["APCA_API_SECRET_KEY", "ALPACA_SECRET_KEY"]:
+                            elif k in ["APCA_API_SECRET_KEY", "ALPACA_SECRET_KEY", "APO_API_SECRET"]:
                                 api_secret = v
 
         if api_key and api_secret:
@@ -170,6 +171,27 @@ class MasterHighQualityExecutionEngine:
         except Exception as e:
             logging.error(f"Failed to send email via Resend: {e}")
 
+    def run_postopen_scanner_and_alert(self):
+        """Triggers postopen_alert.py to scan Top 20 levels and update SQLite/GCS."""
+        logging.info("⚡ Executing Post-Open High-Conviction Schwab Scanner...")
+        try:
+            env = dict(os.environ, PYTHONPATH=".")
+            res = subprocess.run(
+                ["python3", "src/postopen_alert.py"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90
+            )
+            if res.returncode == 0:
+                logging.info("✅ Post-Open scan finished successfully.")
+            else:
+                logging.error(f"Post-Open Scanner Error Output: {res.stderr[:300]}")
+        except subprocess.TimeoutExpired:
+            logging.warning("⚠️ Post-Open scanner timed out after 90 seconds.")
+        except Exception as e:
+            logging.error(f"Failed to execute postopen_alert.py: {e}")
+
     def is_bot_paused(self) -> bool:
         if os.path.exists(self.status_path):
             try:
@@ -216,10 +238,6 @@ class MasterHighQualityExecutionEngine:
         return False
 
     def query_tavily_macro_events(self, ticker: str) -> dict:
-        """
-        Queries Tavily for macro events and enforces a 30-minute post-event cooldown.
-        Re-activates trading 30 minutes after scheduled releases (e.g., after 2:30 PM ET for 2:00 PM FOMC).
-        """
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
             return {"safe_to_trade": True, "score": 15.0}
@@ -227,8 +245,6 @@ class MasterHighQualityExecutionEngine:
         et_tz = pytz.timezone("US/Eastern")
         now_et = datetime.now(et_tz)
         current_time = now_et.time()
-
-        # Cooldown end time for 2:00 PM ET FOMC releases
         cooldown_end_time = dtime(14, 30)
 
         if current_time >= cooldown_end_time:
@@ -345,7 +361,6 @@ class MasterHighQualityExecutionEngine:
             return {}
 
     def calculate_vrz_zones(self, df: pd.DataFrame) -> dict:
-        """Computes Bullish & Bearish VRZ (Valuable Reversal Zones) from recent swing origin candles."""
         if df.empty or len(df) < 10:
             return {"bearish_vrz": (0.0, 0.0), "bullish_vrz": (0.0, 0.0)}
 
@@ -366,7 +381,6 @@ class MasterHighQualityExecutionEngine:
         }
 
     def check_vrz_reversal_signal(self, df: pd.DataFrame, vrz_zones: dict, vwap: float) -> dict:
-        """Validates if price swept a VRZ zone with volume expansion and closed back in direction."""
         if df.empty or len(df) < 2:
             return {"is_vrz_trade": False, "is_call": False, "score_boost": 0.0}
 
@@ -438,7 +452,6 @@ class MasterHighQualityExecutionEngine:
             return None, 0.0, 0.0
 
     def manage_active_positions_and_exits(self):
-        """Monitors open option trades in SQLite using Schwab API quotes with OCC strike matching."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT trade_id, order_id, ticker, entry_price, stop_loss, position_size FROM trades WHERE UPPER(status) = 'OPEN'")
@@ -463,7 +476,6 @@ class MasterHighQualityExecutionEngine:
             is_call = "C" in contract_symbol
             map_key = "callExpDateMap" if is_call else "putExpDateMap"
             
-            # Extract target strike from OCC symbol (last 8 digits divided by 1000)
             try:
                 target_strike = float(contract_symbol[-8:]) / 1000.0
             except Exception:
@@ -503,7 +515,6 @@ class MasterHighQualityExecutionEngine:
         self.upload_db_to_gcs()
 
     def execute_limit_order_with_polling(self, symbol: str, limit_price: float, side: OrderSide = OrderSide.BUY, qty: int = 1) -> tuple:
-        """Submits limit order with clean 2-decimal price rounding to prevent Alpaca 422 errors."""
         if not self.alpaca_client or not symbol or limit_price <= 0:
             return None, 0.0
 
@@ -532,27 +543,72 @@ class MasterHighQualityExecutionEngine:
             logging.error(f"Execution error for {symbol}: {e}")
             return None, 0.0
 
-    def execute_stock_intraday_trade(self, symbol: str, current_spot: float):
-        if not self.alpaca_client:
+    def evaluate_stock_trade_gatekeeper(
+        self, symbol: str, current_spot: float, vwap: float, 
+        rvol: float, convergence_score: int, is_bearish: bool, vrz_signal: dict
+    ) -> bool:
+        """
+        Gatekeeper to validate VRZ, momentum, GEX regime, and convergence before entering stock trades.
+        """
+        # 1. Convergence & Chop Floor
+        if convergence_score < 75:
+            logging.info(f"🛑 [STOCK GATEKEEPER BLOCKED] {symbol} Convergence score {convergence_score}% < 75%. Market in CHOP.")
+            return False
+
+        # 2. RVOL Momentum Check
+        if rvol < self.MIN_RVOL:
+            logging.info(f"🛑 [STOCK GATEKEEPER BLOCKED] {symbol} RVOL {rvol:.2f} < Min {self.MIN_RVOL}. Insufficient momentum.")
+            return False
+
+        # 3. Directional VWAP Alignment
+        if not is_bearish and current_spot <= vwap:
+            logging.info(f"🛑 [STOCK GATEKEEPER BLOCKED] Long stock attempt on {symbol} below VWAP (${current_spot:.2f} <= ${vwap:.2f}).")
+            return False
+        elif is_bearish and current_spot >= vwap:
+            logging.info(f"🛑 [STOCK GATEKEEPER BLOCKED] Short stock attempt on {symbol} above VWAP (${current_spot:.2f} >= ${vwap:.2f}).")
+            return False
+
+        logging.info(f"🟢 [STOCK GATEKEEPER PASSED] {symbol} verified across VRZ, VWAP, RVOL ({rvol:.2f}), and Convergence ({convergence_score}%).")
+        return True
+
+    def execute_stock_intraday_trade(self, symbol: str, current_spot: float, is_bearish: bool = False):
+        """
+        Executes verified stock trades strictly capped at $5,000 max capital pool (~6 shares for SPY).
+        - Longs when Bullish (Buy at Market, Limit Sell at +4% Target)
+        - Shorts when Bearish (Sell Short at Market, Buy Cover at -4% Target)
+        """
+        if not self.alpaca_client or current_spot <= 0:
             return
+
+        # Hard $5,000 Capital Cap
+        qty = max(1, int(self.STOCK_CAPITAL_POOL / current_spot))
+        order_cost = qty * current_spot
+
+        logging.info(f"💰 [CAPITAL SIZING] Allocating ${order_cost:,.2f} ({qty} shares of {symbol} @ ${current_spot:.2f}) from $5,000 pool.")
+
         try:
-            qty = int(self.STOCK_CAPITAL_POOL / current_spot)
-            if qty < 1:
-                qty = 1
-                
-            stop_loss_price = round(current_spot * 0.98, 2)
-            take_profit_price = round(current_spot * 1.04, 2)
-            
-            order_req = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                stop_loss=StopLossRequest(stop_price=stop_loss_price)
-            )
+            if is_bearish:
+                take_profit_price = round(current_spot * 0.96, 2)
+                order_req = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,  # Short Sale in Alpaca
+                    time_in_force=TimeInForce.DAY,
+                    take_profit=TakeProfitRequest(limit_price=take_profit_price)
+                )
+                logging.info(f"📉 [SHORT STOCK ORDER] Shorting {qty} shares of {symbol} @ ~${current_spot:.2f} | Target: ${take_profit_price}")
+            else:
+                take_profit_price = round(current_spot * 1.04, 2)
+                order_req = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    take_profit=TakeProfitRequest(limit_price=take_profit_price)
+                )
+                logging.info(f"📈 [LONG STOCK ORDER] Buying {qty} shares of {symbol} @ ~${current_spot:.2f} | Target: ${take_profit_price}")
+
             order = self.alpaca_client.submit_order(order_req)
-            logging.info(f"✅ [STOCK BRACKET ORDER] Bought {qty} shares of {symbol} @ ~${current_spot:.2f}")
             
         except Exception as e:
             logging.error(f"Stock intraday execution error for {symbol}: {e}")
@@ -576,6 +632,9 @@ class MasterHighQualityExecutionEngine:
         
         # 1. Manage Active Positions & Execute Exits
         self.manage_active_positions_and_exits()
+
+        # 2. Trigger Post-Open Scanner & Update Key Levels Table
+        self.run_postopen_scanner_and_alert()
 
         spy_gex_data = self.get_net_gex("SPY")
         is_negative_gex = spy_gex_data["net_gex"] < 0
@@ -613,17 +672,26 @@ class MasterHighQualityExecutionEngine:
             return
 
         vrz_signal = self.check_vrz_reversal_signal(intraday_df, vrz_zones, vwap)
+        is_bearish = (selected_ticker in self.INDEX_0DTE_TICKERS and is_negative_gex) or (current_spot < vwap)
 
-        if rvol < self.MIN_RVOL:
-            logging.info(f"ℹ️ RVOL {rvol:.2f} < Min {self.MIN_RVOL}. Insufficient volume momentum. Skipping execution.")
-            return
+        # Read Convergence Score from daily_levels database table
+        convergence_score = 0
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT convergence_score FROM daily_levels WHERE ticker = ?", (selected_ticker,))
+            res = cursor.fetchone()
+            if res:
+                convergence_score = int(res[0])
+            conn.close()
+        except Exception as e:
+            logging.warning(f"Could not read convergence_score for {selected_ticker}: {e}")
 
         if selected_ticker in self.INDEX_0DTE_TICKERS and is_negative_gex:
-            is_call = vrz_signal["is_call"] if vrz_signal["is_vrz_trade"] else (current_spot > vwap)
             contract_symbol, limit_ask, delta = self.get_0dte_contract_with_schwab_pricing(
-                selected_ticker, current_spot, is_call=is_call
+                selected_ticker, current_spot, is_call=not is_bearish
             )
-            if contract_symbol and limit_ask >= self.MIN_OPTION_PRICE:
+            if contract_symbol and limit_ask >= self.MIN_OPTION_PRICE and rvol >= self.MIN_RVOL and convergence_score >= 75:
                 # Dynamic Option Sizing ($1,000 max risk per trade)
                 contract_cost = limit_ask * 100.0
                 opt_qty = max(1, int(self.MAX_OPTION_RISK_PER_TRADE / contract_cost))
@@ -639,7 +707,7 @@ class MasterHighQualityExecutionEngine:
                     cursor.execute("""
                         INSERT INTO trades (trade_id, order_id, timestamp, ticker, strategy_type, status, entry_price, position_size, stop_loss, realized_pnl, call_contract, put_contract)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (f"TRD-{int(time.time())}-{selected_ticker}", order_id, datetime.now(timezone.utc).isoformat(), contract_symbol, "VRZ_0DTE_CALL" if is_call else "VRZ_0DTE_PUT", "OPEN", fill_price, float(opt_qty), stop_option_price, 0.0, contract_symbol if is_call else None, contract_symbol if not is_call else None))
+                    """, (f"TRD-{int(time.time())}-{selected_ticker}", order_id, datetime.now(timezone.utc).isoformat(), contract_symbol, "VRZ_0DTE_CALL" if not is_bearish else "VRZ_0DTE_PUT", "OPEN", fill_price, float(opt_qty), stop_option_price, 0.0, contract_symbol if not is_bearish else None, contract_symbol if is_bearish else None))
                     conn.commit()
                     conn.close()
 
@@ -657,12 +725,24 @@ class MasterHighQualityExecutionEngine:
                     """
                     self.send_resend_email_alert(f"🚀 HIGH CONVICTION TRADE FILLED: {contract_symbol} @ ${fill_price:.2f}", trade_html)
                     self.upload_db_to_gcs()
-            else:
-                logging.info(f"ℹ️ No clean 0DTE option setup >= $0.80. Falling back to stock intraday trading for {selected_ticker}...")
-                self.execute_stock_intraday_trade(selected_ticker, current_spot)
+                    return
+
+        # Stock Fallback Path through Multi-Variable Gatekeeper
+        is_safe_stock = self.evaluate_stock_trade_gatekeeper(
+            symbol=selected_ticker,
+            current_spot=current_spot,
+            vwap=vwap,
+            rvol=rvol,
+            convergence_score=convergence_score,
+            is_bearish=is_bearish,
+            vrz_signal=vrz_signal
+        )
+
+        if is_safe_stock:
+            logging.info(f"ℹ️ Executing Intraday Stock Rotation (Bearish={is_bearish})...")
+            self.execute_stock_intraday_trade(selected_ticker, current_spot, is_bearish=is_bearish)
         else:
-            logging.info(f"ℹ️ Allocating 50% capital pool (${self.STOCK_CAPITAL_POOL:,.0f}) to S&P 100 stock intraday trading ({selected_ticker})...")
-            self.execute_stock_intraday_trade(selected_ticker, current_spot)
+            logging.info(f"🛑 [NO EXECUTION] Trade for {selected_ticker} suppressed by Multi-Variable Gatekeeper.")
 
 if __name__ == "__main__":
     engine = MasterHighQualityExecutionEngine()
