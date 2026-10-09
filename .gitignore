@@ -1,10 +1,17 @@
-# Sensitive keys and environment variables
+# Secrets
 .env
-data/
+env.yaml
+*.env
+# Local state and logs (root only - src/data is source code)
+/data/
+/logs/
 *.log
+# Python / tooling
 __pycache__/
 *.pyc
 .venv/
-venv/
+/venv/
+.pytest_cache/
 .DS_Store
-env.yaml
+# SQLite runtime data
+*.db
