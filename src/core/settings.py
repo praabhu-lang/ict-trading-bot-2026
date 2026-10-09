@@ -82,7 +82,7 @@ class Settings:
     require_spy_align: bool = True       # SPY on the trade side of its VWAP
     require_trend_align: bool = True     # prior close vs 20-day average agrees with the trade
     target_r: float = 2.0                # underlying target = 2x the risk to the VRZ stop (1:2)
-    momentum_setup: bool = False         # zone-break continuation; live only when GEX regime is NEGATIVE
+    momentum_setup: bool = False         # zone-break continuation; only at a GEX key level (wall or flip)
     min_rvol: float = 1.2
     min_reward_risk: float = 1.5
 

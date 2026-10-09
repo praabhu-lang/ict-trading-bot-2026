@@ -567,7 +567,7 @@ with tab_set:
         c = st.columns(3)
         req_spy = c[0].toggle("Require SPY alignment", settings.require_spy_align)
         req_trend = c[1].toggle("Require daily trend alignment", settings.require_trend_align)
-        momentum_on = c[2].toggle("Momentum zone-break setup (live only in negative GEX)", settings.momentum_setup)
+        momentum_on = c[2].toggle("Momentum zone-break setup (only at a GEX wall or flip)", settings.momentum_setup)
         st.subheader("Options & exits")
         trailing = st.toggle("Trailing stop", settings.trailing_stop,
                              help="Off by default: in backtests the trail closed winners before the 1:2 target.")

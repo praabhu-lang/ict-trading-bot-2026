@@ -77,3 +77,17 @@ def test_gex_alignment_adds_points():
     a = analyze("SPY", bars, TODAY, NO_SPY, gex=g, daily_closes=downtrend_closes(TODAY))
     assert a.signal.components.get("gex") == 10   # supply zone sits at the 102 call wall
     assert a.signal.score == 75
+
+
+def test_momentum_needs_zone_at_a_gex_key_level_in_either_regime():
+    from src.strategy.convergence import near_key_level
+    from src.strategy.gex import GexResult
+
+    for regime in ("POSITIVE", "NEGATIVE"):
+        g = GexResult(1.0, regime, call_wall=105.0, put_wall=95.0, gamma_flip=100.0)
+        assert near_key_level(g, 104.80, 104.90)          # call wall 0.1% above the zone
+        assert near_key_level(g, 99.50, 100.50)           # gamma flip inside the zone
+        assert near_key_level(g, 95.10, 95.40)            # put wall 0.1% below the zone
+        assert not near_key_level(g, 102.00, 102.50)      # 2% from every level
+    assert not near_key_level(None, 99.5, 100.5)         # no GEX: the level cannot be checked
+    assert not near_key_level(GexResult(1.0, "POSITIVE", None, None, None), 99.5, 100.5)

@@ -39,7 +39,8 @@ New platforms: implement `src/brokers/base.py:Broker` and add an entry to `src/b
   **daily trend** (prior close vs 20-day average) agreeing. +10 if the reversal fades the opening gap,
   +10 if GEX agrees (gamma flip side, or the zone at the put/call wall). Target = **2R** on the stock (1:2).
 - **Momentum setup** (off by default): first close through a VRZ zone before 11:30 with SPY aligned and
-  RVOL ≥ 1.2; live it only trades when the GEX regime is **negative** (dealers short gamma).
+  RVOL ≥ 1.2; it only trades when the broken zone sits at a **GEX key level** (call wall, put wall or
+  gamma flip within 0.3%), in either gamma regime.
 - **Capital**: sizing base = trading capital ($10,000 default) + the bot's realized P&L (profits
   reinvested), capped at real account equity.
 - **Instrument**: **stocks by default** (bracket order: stop at the VRZ invalidation, target 2R), all stock

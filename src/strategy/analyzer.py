@@ -8,7 +8,7 @@ from datetime import date
 import pandas as pd
 
 from ..core.settings import Settings
-from .convergence import MarketContext, Signal, score_break, score_signal, volume_ratio
+from .convergence import MarketContext, Signal, near_key_level, score_break, score_signal, volume_ratio
 from .gex import GexResult
 from .indicators import atr, day_slice, session_dates, time_of_day_rvol, volume_profile, vwap_series
 from .vrz import build_zones, detect_break, detect_trigger, invalidate
@@ -110,8 +110,9 @@ def analyze(ticker: str, bars: pd.DataFrame, d: date, s: Settings, *, gex: GexRe
     else:
         direction, zone = brk
         signal = score_break(ctx, direction, zone.low, zone.high, zone.as_dict())
-        # Momentum trades with dealers short gamma; in a positive-gamma regime breaks tend to get pinned back.
-        if signal and gex is not None and gex.regime != "NEGATIVE":
+        # Momentum only where dealer hedging concentrates: the broken zone sits at a GEX key level (call wall,
+        # put wall or gamma flip), in either regime. Without GEX the level cannot be checked, so no trade.
+        if signal and not near_key_level(gex, zone.low, zone.high):
             snapshot["candidate_score"] = signal.score
             return Analysis(ticker, snapshot, None)
     snapshot["candidate_score"] = signal.score if signal else None

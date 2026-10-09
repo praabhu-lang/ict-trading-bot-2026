@@ -87,6 +87,19 @@ def gex_supports(g: GexResult | None, bull: bool, close: float, zone_low: float,
     return near_wall or flip_ok
 
 
+def near_key_level(g: GexResult | None, zone_low: float, zone_high: float) -> bool:
+    """The zone sits at a GEX key level: call wall, put wall or gamma flip inside it or within WALL_PROXIMITY
+    of its nearer edge. False without GEX (the level cannot be checked)."""
+    if g is None:
+        return False
+    for level in (g.call_wall, g.put_wall, g.gamma_flip):
+        if not level:
+            continue
+        if zone_low <= level <= zone_high or min(abs(zone_low - level), abs(zone_high - level)) / level <= WALL_PROXIMITY:
+            return True
+    return False
+
+
 def components_for(ctx: MarketContext, bull: bool, close: float, zone_low: float, zone_high: float) -> dict:
     sign = 1 if bull else -1
     day_open = float(ctx.today["open"].iloc[0])
