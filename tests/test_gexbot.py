@@ -103,3 +103,31 @@ def test_schwab_gex_used_when_gexbot_fails():
     market = GexMarket({"SPY": bear_setup_bars()}, {"SPY": make_chain(101.6)}, gexbot=FakeGexbot(fail=("SPY",)))
     analysis, chain, _ = MarketAnalystAgent(market, FakeNews()).analyze("SPY", now, Settings(), require_chain=True)
     assert chain is not None and analysis.snapshot["call_wall"] == 102.0          # computed from the chain
+
+
+def test_xsp_uses_spx_levels_scaled_by_a_tenth():
+    from src.data.market import MarketData
+
+    gb = FakeGexbot(covered=("SPX",))
+    market = MarketData(None, None, gexbot=gb)
+    g = market.gexbot_levels("XSP", datetime.combine(TODAY, time(11, 0), tzinfo=ET))
+    spx = parse_gex(SAMPLE)
+    assert g.call_wall == round(spx.call_wall / 10, 2) and g.put_wall == round(spx.put_wall / 10, 2)
+    assert g.gamma_flip == round(spx.gamma_flip / 10, 2) and g.regime == spx.regime
+    assert market.gexbot_levels("SPY", datetime.combine(TODAY, time(11, 0), tzinfo=ET)) is None  # not covered
+
+
+def test_xsp_bars_take_spy_volume():
+    from src.data.market import MarketData
+
+    class FakeSchwab:
+        def price_history(self, symbol, start, end):
+            df = bear_setup_bars()
+            if symbol == "$XSP":  # index bars: prices but no volume
+                df = df.assign(volume=0.0)
+            return df
+
+    now = datetime.combine(TODAY, time(15, 0), tzinfo=ET)
+    market = MarketData(FakeSchwab(), None)
+    xsp, spy = market.bars("XSP", now), market.bars("SPY", now)
+    assert xsp["volume"].sum() > 0 and (xsp["volume"] == spy["volume"].reindex(xsp.index)).all()

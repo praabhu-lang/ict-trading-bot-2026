@@ -315,3 +315,15 @@ def test_choose_option_falls_back_to_next_expiry_and_prefers_45_50_delta():
     o.delta = -0.47                                                # one inside the band wins outright
     chain.options.append(replace(o, strike=100.5, delta=-0.52, symbol="X"))
     assert choose_option(chain, "bear", S(), TODAY).strike == 101.0
+
+
+def test_options_only_index_never_falls_back_to_stock(ledger, monkeypatch):
+    import src.agents.orchestrator as orch
+    monkeypatch.setattr(orch, "OPTIONS_ONLY", ("SPY",))       # treat the SPY fixture as an index like XSP
+    chain = make_chain(101.6, dtes=(0, 14))
+    for o in chain.options:                                  # nothing tradable -> would normally buy stock
+        o.bid, o.ask = 0.50, 1.50
+    engine, broker, _ = make_engine(ledger, at(11, 0, 30), chain=chain)
+    engine.run_cycle(scan=True)
+    assert ledger.open_trades() == [] and broker.submitted == []
+    assert "index options only" in ledger.signals_on(TODAY)[0]["reason"]

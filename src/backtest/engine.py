@@ -25,7 +25,7 @@ from ..agents.execution_agent import FALLBACK_DAYS, PREFERRED_DELTA, TARGET_DELT
 from ..agents.risk_agent import account_gate, flatten_time, open_risk, session_gate, size_option, size_stock
 from ..core.clock import is_trading_day, previous_trading_day
 from ..core.events import EventCalendar
-from ..core.settings import INDEX_0DTE, Settings
+from ..core.settings import INDEX_0DTE, OPTIONS_ONLY, Settings
 from ..data.models import occ_symbol
 from ..strategy.analyzer import analyze
 from ..strategy.convergence import Signal, volume_ratio
@@ -254,6 +254,8 @@ class Backtester:
                     round(premium * (1 - s.option_stop_pct), 2), round(premium * (1 + s.option_target_pct), 2),
                     sig.stop, sig.target, premium, sig.score, pricing, strike, expiry, pc, sigma,
                 )
+        if sig.ticker in OPTIONS_ONLY:  # index (XSP): no shares to fall back to
+            return None
         if not bull and not s.allow_short_stock:
             return None
         px = open_px + (self.stock_slip if bull else -self.stock_slip)

@@ -20,7 +20,7 @@ from ..brokers.base import Broker
 from ..core.clock import Clock, is_trading_day, market_close_dt, market_open_dt
 from ..core.events import EventCalendar
 from ..core.ledger import Ledger
-from ..core.settings import Settings
+from ..core.settings import OPTIONS_ONLY, Settings
 from ..data.market import BAR_MINUTES, MarketData
 from ..data.models import MarketDataUnavailable
 from ..strategy.indicators import day_slice
@@ -401,6 +401,10 @@ class TradingEngine:
                else "no contract in the DTE window within delta/spread/price limits" if not contract
                else f"size {qty} < 1 contract (risk budget / 20% options pool)")
 
+        if sig.ticker in OPTIONS_ONLY:  # index (XSP): no shares to fall back to
+            self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
+                                      sig.target, sig.components, "BLOCKED", f"{why}; index options only, no stock fallback")
+            return False
         if sig.direction == "bear" and not self.s.allow_short_stock:
             self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                       sig.target, sig.components, "BLOCKED", f"{why}; short stock disabled")

@@ -12,11 +12,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INDEX_0DTE = ("SPY", "QQQ")
+INDEX_0DTE = ("SPY", "QQQ", "XSP")   # daily expiries, $1 strikes
+# Cash-settled index options (Mini-SPX = SPX / 10): there are no shares, so no stock fallback.
+OPTIONS_ONLY = ("XSP",)
+DATA_SYMBOL = {"XSP": "$XSP"}           # Schwab market-data symbol for the index
+GEX_PROXY = {"XSP": ("SPX", 0.1)}       # gexbot covers SPX, not XSP: same levels / 10
+VOLUME_PROXY = {"XSP": "SPY"}            # index bars have no volume: SPY trades the same market
 
-# Index ETFs for 0DTE plus 18 liquid, high-quality S&P 500 / Nasdaq-100 leaders.
+# Index ETFs + Mini-SPX plus 18 liquid, high-quality S&P 500 / Nasdaq-100 leaders.
 DEFAULT_UNIVERSE = [
-    "SPY", "QQQ",
+    "SPY", "QQQ", "XSP",
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA",
     "JPM", "LLY", "V", "MA", "COST", "NFLX", "AMD", "ORCL", "WMT", "XOM",
 ]
