@@ -177,16 +177,22 @@ def cmd_gex_archive() -> int:
     return 1 if failed and len(failed) == len(results) else 0
 
 
-def cmd_backtest(tickers: list[str], start: date, end: date, capital: float) -> int:
+def cmd_backtest(tickers: list[str], start: date, end: date, capital: float, gex: str = "none") -> int:
     from .backtest.data import HistoricalData
     from .backtest.engine import Backtester
+    from .backtest.gex_history import VolumeGexHistory
 
     store = Store.from_env()
     settings = load_settings(store)
     data = HistoricalData()
     bars = {t: data.stock_bars(t, start, end) for t in tickers}
     spy = bars["SPY"] if "SPY" in bars else data.stock_bars("SPY", start, end)  # SPY-alignment filter
-    result = Backtester(settings, capital, bars, data.option_bars, spy_bars=spy).run(start, end)
+    gex_fn = None
+    if gex == "volume":  # GEX rebuilt from real option volume (no open-interest history exists)
+        gex_fn = VolumeGexHistory()
+        for t, df in bars.items():
+            gex_fn.prepare(t, start, end, df.groupby(df.index.date)["close"].last())
+    result = Backtester(settings, capital, bars, data.option_bars, spy_bars=spy, gex_fn=gex_fn).run(start, end)
     print(json.dumps({"stats": result["stats"], "data_sources": data.source_used}, default=str, indent=2))
     return 0
 
@@ -209,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--start", type=date.fromisoformat, required=True)
     bt.add_argument("--end", type=date.fromisoformat, required=True)
     bt.add_argument("--capital", type=float, default=10_000)
+    bt.add_argument("--gex", choices=("none", "volume"), default="none",
+                    help="volume = GEX rebuilt from historical option volume (approximation)")
     a = p.parse_args(argv)
 
     if a.cmd == "run":
@@ -225,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_test_email()
     if a.cmd == "premarket":
         return cmd_premarket(not a.no_email)
-    return cmd_backtest([t.strip().upper() for t in a.tickers.split(",")], a.start, a.end, a.capital)
+    return cmd_backtest([t.strip().upper() for t in a.tickers.split(",")], a.start, a.end, a.capital, a.gex)
 
 
 if __name__ == "__main__":

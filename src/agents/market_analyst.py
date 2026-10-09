@@ -8,6 +8,7 @@ from ..data.market import MarketData
 from ..data.models import MarketDataUnavailable, OptionChain
 from ..strategy.analyzer import Analysis, analyze
 from ..strategy.gex import compute_gex
+from .execution_agent import FALLBACK_DAYS
 from .news_agent import NewsAgent, NewsResult
 
 GEX_MAX_DTE = 7
@@ -26,7 +27,7 @@ class MarketAnalystAgent:
         bars = self.market.bars(ticker, now)
         options_on = s.option_min_score <= 100
         try:
-            chain = self.market.chain(ticker, now.date(), max_dte=max(GEX_MAX_DTE, s.option_max_dte))
+            chain = self.market.chain(ticker, now.date(), max_dte=max(GEX_MAX_DTE, s.option_max_dte + FALLBACK_DAYS))
         except MarketDataUnavailable:
             if require_chain and options_on:
                 raise

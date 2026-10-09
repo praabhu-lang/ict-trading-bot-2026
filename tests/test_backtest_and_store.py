@@ -11,7 +11,8 @@ from tests.helpers import TODAY, bear_setup_bars
 
 
 # The 6-session fixture has no 20-day trend and SPY trades above its VWAP: only VRZ + volume (50 pts) is known.
-LOOSE = dict(universe=["SPY"], require_spy_align=False, require_trend_align=False, min_convergence=50, option_min_score=50)
+LOOSE = dict(universe=["SPY"], require_spy_align=False, require_trend_align=False, min_convergence=50, option_min_score=50,
+             option_min_dte=0, option_max_dte=0)  # 0DTE: the $100 fixture's 2-week premium is too big to size
 
 
 def test_backtest_trades_the_bear_setup_and_reports_stats():
@@ -129,3 +130,18 @@ def test_schwab_relogin_is_pending_until_authenticator_confirms(tmp_path, monkey
     assert tokens.activate_pending()
     assert tokens.load()["refresh_token"] == "fresh" and not tokens.has_pending()
     assert 6.9 < tokens.days_left() <= 7
+
+
+def test_backtest_expiry_follows_dte_window():
+    bt = Backtester(Settings(), 10_000, {"SPY": bear_setup_bars()})
+    assert bt._expiry_for("SPY", date(2026, 10, 7)) == date(2026, 10, 21)    # daily expiries: exactly 14 days
+    assert bt._expiry_for("AAPL", date(2026, 10, 7)) == date(2026, 10, 23)   # weeklies: first Friday >= 14 days
+    assert bt._expiry_for("AAPL", date(2026, 3, 19)) == date(2026, 4, 2)     # Good Friday Apr 3 -> Thursday
+    assert bt._expiry_for("AAPL", date(2026, 3, 20)) == date(2026, 4, 10)    # Thursday Apr 2 is only 13 days out
+
+
+def test_pick_strike_targets_45_50_delta():
+    from src.backtest.engine import pick_strike
+    from src.backtest.pricing import bs_delta
+    k = pick_strike("SPY", 700.0, 14 / 252, 0.18, "C")
+    assert 0.45 <= bs_delta(700.0, k, 14 / 252, 0.18, "C") <= 0.50

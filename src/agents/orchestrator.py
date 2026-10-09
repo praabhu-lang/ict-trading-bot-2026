@@ -4,7 +4,7 @@ Each cycle (every ~30 s):
   1. reconcile ledger with broker positions
   2. MonitorAgent: manage exits for every open trade (ALWAYS - even when paused/blocked)
   3. at each new 5-minute bar: MarketAnalystAgent scans the universe, RiskAgent gates,
-     ExecutionAgent enters the single best signal (0DTE option, or stock fallback)
+     ExecutionAgent enters the single best signal (option ~2 weeks out, or stock fallback)
   4. heartbeat/status written for the dashboard
 """
 from __future__ import annotations
@@ -392,13 +392,13 @@ class TradingEngine:
                 self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                           sig.target, sig.components, "TRADED_OPTION", contract.symbol)
                 self._trade_opened_email(
-                    sig, contract.symbol, fill.qty, fill.avg_price, "0DTE option",
+                    sig, contract.symbol, fill.qty, fill.avg_price, f"option exp {contract.expiry}",
                     stop_note=(f"Broker stop placed @ {stop_px:.2f}" if sid else "⚠️ Broker stop NOT placed - engine-managed only"),
                     target_px=round(fill.avg_price * (1 + self.s.option_target_pct), 2), stop_px=stop_px)
                 return True
             self.ledger.log("WARN", f"Option entry for {contract.symbol} did not fill - trying stock fallback")
         why = (f"score {sig.score:.0f} below the A+ options tier ({self.s.option_min_score})" if not a_plus
-               else "no 0DTE contract within delta/spread/price limits" if not contract
+               else "no contract in the DTE window within delta/spread/price limits" if not contract
                else f"size {qty} < 1 contract (risk budget / 20% options pool)")
 
         if sig.direction == "bear" and not self.s.allow_short_stock:

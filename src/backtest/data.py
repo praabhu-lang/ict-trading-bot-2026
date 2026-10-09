@@ -1,7 +1,7 @@
 """Historical data for backtests: 5-minute stock bars and 0DTE option bars.
 
 Stock bars: Alpaca (SIP if your plan allows, else IEX) -> yfinance (last ~60 days only).
-Option bars: Alpaca historical option bars (available from Feb 2024). When a contract has
+Option bars: Alpaca historical 5-minute option bars (available from Feb 2024). When a contract has
 no data the backtester falls back to a Black-Scholes model price and labels the trade.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ class HistoricalData:
     def __init__(self):
         self.key, self.secret = env("APCA_API_KEY_ID"), env("APCA_API_SECRET_KEY")
         self.source_used: dict[str, str] = {}
-        self._option_cache: dict[str, pd.DataFrame | None] = {}
+        self._option_cache: dict[tuple[str, date], pd.DataFrame | None] = {}
 
     def stock_bars(self, ticker: str, start: date, end: date) -> pd.DataFrame:
         first = start
@@ -76,8 +76,8 @@ class HistoricalData:
         return df[["open", "high", "low", "close", "volume"]].astype(float)
 
     def option_bars(self, occ: str, d: date) -> pd.DataFrame | None:
-        if occ in self._option_cache:
-            return self._option_cache[occ]
+        if (occ, d) in self._option_cache:  # a multi-day contract can be traded on several days
+            return self._option_cache[(occ, d)]
         result = None
         if self.key and self.secret and d >= date(2024, 2, 1):
             try:
@@ -97,5 +97,5 @@ class HistoricalData:
                     result = df[["open", "high", "low", "close", "volume"]].astype(float)
             except Exception as exc:  # noqa: BLE001
                 log.info("Option bars unavailable for %s: %s", occ, exc)
-        self._option_cache[occ] = result
+        self._option_cache[(occ, d)] = result
         return result

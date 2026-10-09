@@ -82,7 +82,9 @@ class Settings:
     min_reward_risk: float = 1.5
 
     # --- option selection & exits ---
-    option_max_dte: int = 0
+    # ~2-week expiry: intraday holds lose little to theta (0DTE decay ate the edge in the backtests).
+    option_min_dte: int = 14            # earliest expiry at least this many calendar days out is used
+    option_max_dte: int = 21
     option_min_price: float = 0.50
     option_max_spread_pct: float = 0.10
     option_delta_min: float = 0.35
@@ -123,7 +125,8 @@ class Settings:
         "last_entry_minutes_before_close": (15, 240),
         "flatten_minutes_before_close": (5, 60),
         "event_buffer_minutes": (30, 120),
-        "option_max_dte": (0, 7),
+        "option_min_dte": (0, 45),
+        "option_max_dte": (0, 60),
         "option_min_price": (0.05, 20.0),
         "option_max_spread_pct": (0.01, 0.50),
         "option_delta_min": (0.05, 0.95),

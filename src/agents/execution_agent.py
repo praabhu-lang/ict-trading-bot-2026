@@ -11,7 +11,9 @@ from ..core.settings import Settings
 from ..data.models import OptionChain, OptionQuote
 
 log = logging.getLogger(__name__)
-TARGET_DELTA = 0.45
+PREFERRED_DELTA = (0.45, 0.50)   # strike pick: inside this band, else the nearest within the delta limits
+TARGET_DELTA = sum(PREFERRED_DELTA) / 2
+FALLBACK_DAYS = 30               # no expiry in the DTE window -> next listed expiry up to this much later
 
 
 @dataclass
@@ -27,16 +29,20 @@ class Fill:
 
 def choose_option(chain: OptionChain, direction: str, s: Settings, today: date) -> OptionQuote | None:
     pc = "C" if direction == "bull" else "P"
-    last_expiry = today + timedelta(days=s.option_max_dte)
+    first_expiry = today + timedelta(days=min(s.option_min_dte, s.option_max_dte))
+    last_expiry = today + timedelta(days=s.option_max_dte + FALLBACK_DAYS)
     candidates = [
         o for o in chain.options
-        if o.put_call == pc and today <= o.expiry <= last_expiry
+        if o.put_call == pc and first_expiry <= o.expiry <= last_expiry
         and s.option_delta_min <= abs(o.delta) <= s.option_delta_max
         and o.bid > 0 and o.ask >= s.option_min_price and o.spread_pct <= s.option_max_spread_pct
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda o: (o.expiry, abs(abs(o.delta) - TARGET_DELTA)))
+    expiry = min(o.expiry for o in candidates)  # earliest tradable expiry >= option_min_dte (~2 weeks)
+    lo, hi = PREFERRED_DELTA
+    return min((o for o in candidates if o.expiry == expiry),
+               key=lambda o: (max(lo - abs(o.delta), abs(o.delta) - hi, 0.0), abs(abs(o.delta) - TARGET_DELTA)))
 
 
 class ExecutionAgent:

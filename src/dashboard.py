@@ -579,7 +579,8 @@ with tab_set:
         c = st.columns(3)
         allow_short = c[0].toggle("Allow short stock fallback", settings.allow_short_stock)
         momentum = c[1].toggle("Momentum-fade exit", settings.momentum_exit)
-        max_dte = c[2].number_input("Option max DTE (0 = 0DTE only)", 0, 7, settings.option_max_dte)
+        min_dte = c[2].number_input("Option min DTE (0 = allow 0DTE)", 0, 45, settings.option_min_dte)
+        max_dte = c[2].number_input("Option max DTE", 0, 60, settings.option_max_dte)
         st.subheader("Extra no-trade events (FOMC & CPI are built in)")
         ev_df = st.data_editor(pd.DataFrame(settings.custom_events or [], columns=["date", "time", "duration_min", "name"]),
                                num_rows="dynamic", width="stretch", key="events_editor")
@@ -606,7 +607,7 @@ with tab_set:
                     "min_volume_spike": float(vol_lo), "max_volume_spike": float(vol_hi), "target_r": float(target_r),
                     "require_spy_align": req_spy, "require_trend_align": req_trend, "momentum_setup": momentum_on,
                     "trailing_stop": trailing,
-                    "allow_short_stock": allow_short, "momentum_exit": momentum, "option_max_dte": int(max_dte),
+                    "allow_short_stock": allow_short, "momentum_exit": momentum, "option_min_dte": int(min_dte), "option_max_dte": int(max_dte),
                     "custom_events": events,
                 })
                 broker_for.clear()

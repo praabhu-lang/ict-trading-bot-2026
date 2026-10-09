@@ -93,7 +93,14 @@ def bear_setup_bars(today: date = TODAY, follow_through: int = 0) -> pd.DataFram
     return frame(rows)
 
 
-def make_chain(spot: float, today: date = TODAY, underlying: str = "SPY") -> OptionChain:
+def make_chain(spot: float, today: date = TODAY, underlying: str = "SPY", dtes=(0,)) -> OptionChain:
+    opts = []
+    for dte in dtes:
+        opts += _chain_expiry(spot, today + timedelta(days=dte), underlying)
+    return OptionChain(underlying, spot, opts)
+
+
+def _chain_expiry(spot: float, expiry: date, underlying: str) -> list[OptionQuote]:
     opts = []
     for k in range(97, 106):
         for pc in ("C", "P"):
@@ -105,9 +112,9 @@ def make_chain(spot: float, today: date = TODAY, underlying: str = "SPY") -> Opt
                 oi = 20000
             if pc == "P" and k == 100:
                 oi = 20000
-            opts.append(OptionQuote(occ_symbol(underlying, today, pc, k), underlying, today, float(k), pc,
+            opts.append(OptionQuote(occ_symbol(underlying, expiry, pc, k), underlying, expiry, float(k), pc,
                                     round(price - 0.02, 2), round(price + 0.02, 2), delta, 0.08, oi, 1000, 0.20))
-    return OptionChain(underlying, spot, opts)
+    return opts
 
 
 class FakeMarket:

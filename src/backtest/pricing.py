@@ -27,6 +27,14 @@ def bs_price(spot: float, strike: float, t_years: float, sigma: float, put_call:
     return strike * math.exp(-r * t_years) * _ncdf(-d2) - spot * _ncdf(-d1)
 
 
+def bs_delta(spot: float, strike: float, t_years: float, sigma: float, put_call: str, r: float = 0.04) -> float:
+    if t_years <= 0 or sigma <= 0:
+        itm = spot > strike if put_call == "C" else spot < strike
+        return (1.0 if itm else 0.0) * (1 if put_call == "C" else -1)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * t_years) / (sigma * math.sqrt(t_years))
+    return _ncdf(d1) if put_call == "C" else _ncdf(d1) - 1.0
+
+
 def years_to_close(now: datetime, expiry: date) -> float:
     """Trading-time to the expiry close (consistent with a trading-time volatility)."""
     if expiry == now.date():

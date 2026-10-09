@@ -1,8 +1,9 @@
-from datetime import datetime, time
+from dataclasses import replace
+from datetime import datetime, time, timedelta
 
 import pytest
 
-from src.agents.execution_agent import ExecutionAgent
+from src.agents.execution_agent import ExecutionAgent, choose_option
 from src.agents.orchestrator import TradingEngine
 from src.core.clock import ET, FixedClock
 from src.core.ledger import Ledger
@@ -31,7 +32,7 @@ def ledger(tmp_path):
 
 def make_engine(ledger, now, *, settings=None, chain=None, market_fail=False, broker=None):
     bars = bear_setup_bars()
-    chains = {"SPY": chain if chain is not None else make_chain(101.6)}
+    chains = {"SPY": chain if chain is not None else make_chain(101.6, dtes=(0, 14))}
     market = FakeMarket({"SPY": bars}, chains, fail=market_fail)
     broker = broker or FakeBroker()
     s = settings or S()
@@ -41,13 +42,14 @@ def make_engine(ledger, now, *, settings=None, chain=None, market_fail=False, br
     return engine, broker, notifier
 
 
-def test_high_convergence_signal_buys_0dte_put_sized_to_risk(ledger):
+def test_high_convergence_signal_buys_two_week_put_sized_to_risk(ledger):
     engine, broker, notifier = make_engine(ledger, at(11, 0, 30))
     engine.run_cycle(scan=True)
     trades = ledger.open_trades()
     assert len(trades) == 1, engine.status
     t = trades[0]
     assert t["asset_class"] == "option" and t["direction"] == "bear" and "P" in t["symbol"][-9:]
+    assert t["symbol"].startswith("SPY261021")                      # 14 days out, not the 0DTE contract
     premium = t["entry_price"]
     assert t["qty"] * premium * 100 * 0.5 <= 10_000 * 0.05 + 1e-6   # <= 5% at the -50% stop
     assert t["qty"] * premium * 100 <= 10_000 * 0.20 + 1e-6         # <= 20% options pool
@@ -296,3 +298,20 @@ def test_total_risk_cap_limits_new_position(ledger):
     engine.run_cycle(scan=True)
     t = [x for x in ledger.open_trades() if x["underlying"] == "SPY"][0]
     assert abs(t["entry_price"] - t["stop_price"]) * t["qty"] <= 10_000 * 0.025 - 200 + 1   # only $50 left
+
+
+def test_choose_option_uses_dte_window():
+    chain = make_chain(101.6, dtes=(0, 7, 14, 21))
+    assert choose_option(chain, "bear", S(), TODAY).expiry == TODAY + timedelta(days=14)
+    assert choose_option(chain, "bear", S(option_min_dte=0, option_max_dte=0), TODAY).expiry == TODAY
+    assert choose_option(make_chain(101.6), "bear", S(), TODAY) is None      # only 0DTE listed -> no contract
+
+
+def test_choose_option_falls_back_to_next_expiry_and_prefers_45_50_delta():
+    chain = make_chain(101.6, dtes=(0, 28))                       # nothing 14-21 days out
+    o = choose_option(chain, "bear", S(), TODAY)
+    assert o.expiry == TODAY + timedelta(days=28)
+    assert o.strike == 101.0                                       # |delta| 0.43: nearest to 0.45-0.50 (0.55 is farther)
+    o.delta = -0.47                                                # one inside the band wins outright
+    chain.options.append(replace(o, strike=100.5, delta=-0.52, symbol="X"))
+    assert choose_option(chain, "bear", S(), TODAY).strike == 101.0

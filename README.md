@@ -28,7 +28,7 @@ New platforms: implement `src/brokers/base.py:Broker` and add an entry to `src/b
 | 09:30–09:45 | no entries (first 15 min) |
 | event ±30 min | no entries (FOMC blackout = 13:30–15:00: decision 14:00 + press conference 14:30) |
 | 15:00 | last new entry |
-| 15:45 | every bot position is closed (0DTE never goes to expiry); 12:45 on half days |
+| 15:45 | every bot position is closed (options are never held overnight); 12:45 on half days |
 
 ## Rules (all editable in Dashboard → Settings, bounded to safe ranges)
 
@@ -43,7 +43,8 @@ New platforms: implement `src/brokers/base.py:Broker` and add an entry to `src/b
 - **Capital**: sizing base = trading capital ($10,000 default) + the bot's realized P&L (profits
   reinvested), capped at real account equity.
 - **Instrument**: **stocks by default** (bracket order: stop at the VRZ invalidation, target 2R), all stock
-  positions together ≤ **50%** of capital. Options (0DTE, |delta| 0.35–0.60, spread ≤ 10%, total premium
+  positions together ≤ **50%** of capital. Options (earliest expiry **14–21 days out** so an intraday hold
+  loses little to theta, |delta| 0.35–0.60, spread ≤ 10%, total premium
   ≤ **20%** of capital) only for signals scoring ≥ "Options only at score ≥" (101 = never; backtested
   0DTE options lost money even on A+ setups).
 - **Risk**: ≤ **2%** per trade, and ≤ **5%** for all open positions together if every stop is hit.
