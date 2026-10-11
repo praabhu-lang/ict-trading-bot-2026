@@ -15,7 +15,7 @@ import pandas as pd
 from ..core.clock import ET, market_close_dt, market_open_dt, previous_trading_day
 from ..core.settings import DATA_SYMBOL, GEX_PROXY, OPTIONS_ONLY, VOLUME_PROXY, env
 from ..strategy.gex import GexResult
-from .models import MarketDataUnavailable, OptionChain
+from .models import MarketDataUnavailable, OptionChain, to_schwab_symbol
 from .schwab import SchwabClient
 
 log = logging.getLogger(__name__)
@@ -161,6 +161,22 @@ class MarketData:
                 raise
 
         return self._cached(("chain", symbol, today, max_dte), 60, fetch)
+
+    def option_quote(self, symbol: str) -> tuple[float, float]:
+        """Live Schwab (bid, ask) for one option contract (OCC symbol). Not cached: used to price orders."""
+        if self.schwab is None:
+            raise MarketDataUnavailable("Schwab client not configured")
+        try:
+            data = self.schwab.quotes([to_schwab_symbol(symbol)])
+            q = next(iter(data.values()), {}) if data else {}
+            bid, ask = float(q.get("bidPrice") or 0), float(q.get("askPrice") or 0)
+        except Exception as exc:  # noqa: BLE001 - caller falls back to the broker quote
+            self.health["quotes:schwab"] = f"error: {exc}"[:200]
+            raise MarketDataUnavailable(f"Schwab quote for {symbol}: {exc}") from exc
+        if bid <= 0 and ask <= 0:
+            raise MarketDataUnavailable(f"Schwab quote for {symbol} has no bid/ask")
+        self.health["quotes:schwab"] = "ok"
+        return bid, ask
 
     def gexbot_levels(self, symbol: str, now: datetime):
         """Live GEX from gexbot.com, or None when not configured / ticker not covered / request failed.

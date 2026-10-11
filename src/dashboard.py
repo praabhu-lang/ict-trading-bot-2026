@@ -26,7 +26,7 @@ from src.brokers.platforms import PLATFORMS, CredentialStore  # noqa: E402
 from src.core.clock import Clock  # noqa: E402
 from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
-from src.core.settings import BROKERS, DEFAULT_UNIVERSE, LIVE_BROKERS, Settings, env, live_trading_allowed  # noqa: E402
+from src.core.settings import BROKERS, DEFAULT_UNIVERSE, LIVE_BROKERS, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -537,6 +537,17 @@ with tab_set:
         auto_trade = st.toggle("Auto-trade (off = email alerts only)", settings.auto_trade)
         universe = st.multiselect("Universe", sorted(set(DEFAULT_UNIVERSE) | set(settings.universe)),
                                   default=settings.universe)
+        st.subheader("Strategy")
+        strat = st.selectbox("Strategy", list(STRATEGIES), index=list(STRATEGIES).index(settings.strategy),
+                             format_func=STRATEGIES.get)
+        c = st.columns(4)
+        fc_prem = c[0].number_input("First-candle premium % of capital", 0.5, 20.0, settings.fc_premium_pct * 100, 0.5,
+                                    help="Premium per trade (= the most it can lose; no stop). Profits compound.")
+        fc_delta = c[1].number_input("First-candle delta", 0.10, 0.80, settings.fc_delta, 0.05)
+        fc_fri = c[2].toggle("Friday: next-day expiry (1DTE)", settings.fc_friday_dte > 0)
+        fc_dd = c[3].number_input("Kill switch: % below peak", 5.0, 50.0, settings.fc_kill_drawdown * 100, 1.0)
+        st.caption("First-candle: SPY/QQQ, trend + first 5-min candle colour, breakout by 8:50 CT, target 3x the "
+                   "candle range, break-even after +1x, no-progress exit 10:00 CT, skips FOMC/CPI days.")
         st.subheader("Capital & risk")
         start_cap = st.number_input("Trading capital $ (sizing base; bot profits are added back; 0 = whole account)",
                                     0.0, 10_000_000.0, float(settings.starting_capital), 1_000.0)
@@ -609,6 +620,8 @@ with tab_set:
                     "trailing_stop": trailing,
                     "allow_short_stock": allow_short, "momentum_exit": momentum, "option_min_dte": int(min_dte), "option_max_dte": int(max_dte),
                     "custom_events": events,
+                    "strategy": strat, "fc_premium_pct": fc_prem / 100, "fc_delta": float(fc_delta),
+                    "fc_friday_dte": 1 if fc_fri else 0, "fc_kill_drawdown": fc_dd / 100,
                 })
                 broker_for.clear()
                 st.success("Saved.")

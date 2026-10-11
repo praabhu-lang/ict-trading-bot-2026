@@ -34,6 +34,8 @@ BROKERS = {
 }
 LIVE_BROKERS = {"alpaca_live", "ibkr"}
 
+STRATEGIES = {"vrz": "VRZ sweep-and-reject (universe)", "first_candle": "First 5-min candle breakout (SPY/QQQ options)"}
+
 
 def env(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
@@ -105,6 +107,23 @@ class Settings:
     # --- stock fallback ---
     allow_short_stock: bool = True
 
+    # --- strategy ---
+    # vrz: VRZ sweep-and-reject on the universe (above). first_candle: SPY/QQQ first 5-minute candle breakout
+    # with one short-dated option (src/strategy/first_candle.py; backtest src/backtest_orb5.py).
+    strategy: str = "vrz"
+    fc_tickers: list[str] = field(default_factory=lambda: ["SPY", "QQQ"])
+    fc_premium_pct: float = 0.10         # premium per trade, share of trading equity (profits compound)
+    fc_delta: float = 0.30
+    fc_friday_dte: int = 1               # Friday: next trading day's expiry (Mon-Thu: 0DTE)
+    fc_target_mult: float = 3.0          # target = 3x the first candle's range on the underlying
+    fc_breakeven_after: float = 1.0      # after 1x range our way, exit if it comes back to the entry
+    fc_no_progress_frac: float = 0.5     # at 11:00 ET, exit if it has not moved 0.5x range our way
+    fc_last_break_bar: int = 3           # breakout must close on the 09:35-09:45 bars
+    fc_skip_fomc_cpi: bool = True        # no trades at all on FOMC decision / CPI days
+    fc_kill_lookback: int = 20
+    fc_kill_min_winrate: float = 0.25
+    fc_kill_drawdown: float = 0.15
+
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
     custom_events: list[dict] = field(default_factory=list)
@@ -140,6 +159,16 @@ class Settings:
         "option_target_pct": (0.10, 5.0),
         "trail_activate_pct": (0.05, 5.0),
         "trail_giveback_pct": (0.02, 1.0),
+        "fc_premium_pct": (0.005, 0.20),
+        "fc_delta": (0.10, 0.80),
+        "fc_friday_dte": (0, 3),
+        "fc_target_mult": (0.5, 10.0),
+        "fc_breakeven_after": (0.0, 5.0),
+        "fc_no_progress_frac": (0.0, 3.0),
+        "fc_last_break_bar": (1, 12),
+        "fc_kill_lookback": (5, 100),
+        "fc_kill_min_winrate": (0.0, 0.9),
+        "fc_kill_drawdown": (0.05, 0.50),
     }
 
     @classmethod
@@ -169,6 +198,8 @@ class Settings:
                 lo, hi = cls._BOUNDS[key]
                 value = type(current)(min(max(value, lo), hi))
             setattr(s, key, value)
+        if s.strategy not in STRATEGIES:
+            s.strategy = "vrz"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

@@ -142,6 +142,13 @@ class FakeMarket:
             raise MarketDataUnavailable("no chain")
         return self._chains[symbol]
 
+    def option_quote(self, symbol):
+        """Live Schwab quote stand-in: set FakeMarket.option_quotes[symbol] = (bid, ask)."""
+        q = getattr(self, "option_quotes", {}).get(symbol)
+        if q is None:
+            raise MarketDataUnavailable("no Schwab quote")
+        return q
+
 
 class FakeNews:
     def __init__(self, ok=True):

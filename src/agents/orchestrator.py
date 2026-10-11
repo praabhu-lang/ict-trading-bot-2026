@@ -18,11 +18,12 @@ from datetime import datetime, timedelta
 from ..alerts.notifier import Notifier, table
 from ..brokers.base import Broker
 from ..core.clock import Clock, is_trading_day, market_close_dt, market_open_dt
-from ..core.events import EventCalendar
+from ..core.events import CPI_RELEASE_DAYS, FOMC_DECISION_DAYS, EventCalendar
 from ..core.ledger import Ledger
 from ..core.settings import OPTIONS_ONLY, Settings
 from ..data.market import BAR_MINUTES, MarketData
 from ..data.models import MarketDataUnavailable
+from ..strategy import first_candle as fc
 from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
@@ -162,19 +163,27 @@ class TradingEngine:
             underlying_px = float(today_bars["close"].iloc[-1]) if today_bars is not None and len(today_bars) else None
 
             if t["asset_class"] == "option":
-                try:
-                    bid, ask = self.broker.quote(t["symbol"])
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("Quote failed for %s: %s", t["symbol"], exc)
-                    bid = ask = 0.0
+                if (t.get("notes") or "").startswith(fc.STRATEGY_TAG):
+                    bid, ask = self._option_bid_ask(t["symbol"])
+                else:
+                    try:
+                        bid, ask = self.broker.quote(t["symbol"])
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Quote failed for %s: %s", t["symbol"], exc)
+                        bid = ask = 0.0
                 mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else bid or ask
                 if mid > float(t.get("high_water") or 0):
                     self.ledger.update_trade(t["id"], high_water=mid)
                     t["high_water"] = mid
-                reason = force_reason or option_exit_reason(t, mid, self.s, now, flatten_at, underlying_px, fading)
-                if not reason:
-                    self._sync_option_stop(t, bid)
-                    continue
+                if (t.get("notes") or "").startswith(fc.STRATEGY_TAG):
+                    reason = force_reason or self._first_candle_exit(t, today_bars, now, flatten_at)
+                    if not reason:
+                        continue                     # no stop loss in this strategy: no broker stop to sync
+                else:
+                    reason = force_reason or option_exit_reason(t, mid, self.s, now, flatten_at, underlying_px, fading)
+                    if not reason:
+                        self._sync_option_stop(t, bid)
+                        continue
                 if not self._release_broker_stop(t):
                     continue  # the broker stop already filled; reconcile() books it next cycle
                 fill = self.execution.sell_option(t["symbol"], t["qty"], bid, ask, urgent=reason in URGENT_EXITS)
@@ -303,6 +312,8 @@ class TradingEngine:
         if now > market_close_dt(now.date()):
             self.status["gates"] = ["Market closed"]
             return 0
+        if self.s.strategy == fc.STRATEGY_TAG:
+            return self.first_candle_scan(now, trade)
         if trade:
             gate = self.gates(now)
             self.status["gates"] = gate.reasons or ["OPEN - entries allowed"]
@@ -443,6 +454,157 @@ class TradingEngine:
                                  stop_note=f"Bracket at broker: stop {sig.stop:.2f}, target {sig.target:.2f}"
                                  if legs else "⚠️ Bracket legs not confirmed - check the broker",
                                  target_px=sig.target, stop_px=sig.stop)
+        return True
+
+    # ------------------------------------------------ first 5-minute candle strategy
+    def _option_bid_ask(self, symbol: str) -> tuple[float, float]:
+        """Live Schwab bid/ask for an option; the broker's quote only if Schwab has none."""
+        try:
+            return self.market.option_quote(symbol)
+        except Exception as exc:  # noqa: BLE001 - MarketDataUnavailable, or a market without option_quote
+            log.warning("Schwab quote for %s unavailable (%s) - using the broker quote", symbol, exc)
+        try:
+            return self.broker.quote(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Quote failed for %s: %s", symbol, exc)
+            return 0.0, 0.0
+
+    def _first_candle_exit(self, t: dict, today_bars, now: datetime, flatten_at: datetime) -> str | None:
+        if now >= flatten_at:
+            return "EOD_FLATTEN"
+        meta = self.ledger.get_kv(f"fc_trade:{t['id']}") or {}
+        if not meta or today_bars is None or not len(today_bars):
+            return None
+        since = today_bars[today_bars.index > datetime.fromisoformat(meta["break_bar"])]
+        reason = fc.exit_reason(meta, since, now, self.s)
+        if not reason and not meta.get("progress_ok") and now.time() >= fc.NO_PROGRESS_AT:
+            meta["progress_ok"] = True                  # passed the 11:00 check once; never re-check
+            self.ledger.set_kv(f"fc_trade:{t['id']}", meta)
+        return reason
+
+    def first_candle_scan(self, now: datetime, trade: bool = True) -> int:
+        """One decision per day: pick SPY/QQQ, wait for the first close beyond the 09:30 candle, then buy one
+        short-dated option (or stand aside). Returns the number of tickers analysed."""
+        d, s = now.date(), self.s
+        done_key = f"fc_done:{d.isoformat()}"
+        if not trade:
+            return 0
+        if self.ledger.get_kv(done_key):
+            self.status["gates"] = [f"First-candle: done for today ({self.ledger.get_kv(done_key)})"]
+            return 0
+        acct = self.broker.account()
+        equity = s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
+        peak = max(float(self.ledger.get_kv("fc_peak_equity", 0) or 0), equity)
+        self.ledger.set_kv("fc_peak_equity", peak)
+        self.status.update({"account_equity": acct.equity, "trading_equity": equity, "buying_power": acct.buying_power,
+                            "bot_day_pnl": self.ledger.realized_pnl_on(d)})
+        reasons = []
+        if s.fc_skip_fomc_cpi and (d in FOMC_DECISION_DAYS or d in CPI_RELEASE_DAYS):
+            reasons.append("FOMC/CPI day - no first-candle trade")
+        event = self.calendar.active_blackout(now)
+        if event:
+            reasons.append(f"Event blackout: {event.name}")
+        reasons += account_gate(s, equity, len(self.ledger.trades_on(d)), len(self.ledger.open_trades()),
+                                self.ledger.realized_pnl_on(d)).reasons
+        if not s.auto_trade:
+            reasons.append("Auto-trade off (alerts only)")
+        shock = self.news.market_shock()
+        if shock.blocked:
+            reasons.append(shock.reason)
+        closed = [t for t in reversed(self.ledger.trades()) if t["status"] == "CLOSED"
+                  and (t.get("notes") or "").startswith(fc.STRATEGY_TAG)]
+        kill = fc.kill_switch(closed, equity, peak, s)
+        if kill:
+            reasons.append(kill)
+            self.notifier.send("🛑 First-candle kill switch", f"<p>{html.escape(kill)}</p><p>No new first-candle trades while this holds. "
+                               f"Open trades are still managed. Review on paper, then adjust the fc_kill_* settings "
+                               f"to resume.</p>",
+                               dedupe_key=f"fc_kill:{d.isoformat()}")
+        self.status["gates"] = reasons or ["OPEN - first-candle entries allowed"]
+        if reasons:
+            return 0
+
+        pick = self.ledger.get_kv(f"fc_pick:{d.isoformat()}")
+        if not pick:
+            scores = {}
+            for t in s.fc_tickers:
+                try:
+                    bars = self.market.bars(t, now, days=21)
+                    score = fc.scan_score(bars, self.market.daily_closes(t, now, sessions=25), d)
+                except MarketDataUnavailable as exc:
+                    self.market.health[f"scan:{t}"] = str(exc)[:200]
+                    continue
+                if score is not None:
+                    scores[t] = score
+            if not scores:
+                return 0
+            pick = max(scores, key=scores.get)
+            self.ledger.set_kv(f"fc_pick:{d.isoformat()}", pick)
+            self.ledger.log("INFO", f"First-candle pick {pick}: " + ", ".join(f"{k} {v:.4f}" for k, v in scores.items()))
+        try:
+            bars = self.market.bars(pick, now)
+            closes = self.market.daily_closes(pick, now, sessions=25)
+        except MarketDataUnavailable as exc:
+            self._data_outage(now)
+            self.market.health[f"scan:{pick}"] = str(exc)[:200]
+            return 0
+        verdict, x = fc.find_setup(pick, bars, closes, d, s.fc_last_break_bar)
+        if verdict == "wait":
+            self.status["gates"] = [f"First-candle: {pick} {x}"]
+            return 1
+        if verdict == "reject":
+            self.ledger.set_kv(done_key, f"{pick}: {x}")
+            self.ledger.record_signal(d, pick, "-", 0, 0, 0, 0, {}, "BLOCKED", f"first candle: {x}")
+            return 1
+        self.ledger.set_kv(done_key, f"{pick} {x.direction} breakout")
+        self._first_candle_enter(x, now, equity)
+        return 1
+
+    def _first_candle_enter(self, setup, now: datetime, equity: float) -> bool:
+        s, d = self.s, now.date()
+        sign = 1 if setup.direction == "bull" else -1
+        target = round(setup.entry_ref + sign * s.fc_target_mult * setup.range, 2)
+        try:
+            chain = self.market.chain(setup.ticker, d, max_dte=7)
+        except MarketDataUnavailable as exc:
+            self._error("first-candle option chain unavailable", exc)
+            return False
+        contract = fc.choose_contract(chain, setup.direction, setup.entry_ref, fc.expiry_for(d, s.fc_friday_dte), s.fc_delta)
+        if contract:                                 # chain may be up to 60 s old: price the order on a live quote
+            bid, ask = self._option_bid_ask(contract.symbol)
+            if bid > 0 and ask > 0:
+                contract.bid, contract.ask = bid, ask
+        qty = fc.contracts_for(equity, contract.ask, s.fc_premium_pct) if contract else 0
+        comps = {"or_high": setup.or_high, "or_low": setup.or_low, "range": round(setup.range, 2)}
+        if not contract or qty < 1:
+            why = "no contract near the target delta" if not contract else f"1 contract ({contract.ask * 100:,.0f}) > 20% of equity"
+            self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps, "BLOCKED", why)
+            return False
+        fill = self.execution.buy_option(contract.symbol, qty, contract.bid, contract.ask)   # Schwab bid/ask
+        if not fill.filled:
+            self._error(f"first-candle entry {contract.symbol} did not fill", RuntimeError("no fill"))
+            return False
+        tid = self.ledger.open_trade(
+            trade_date=d.isoformat(), broker=self.broker.name, underlying=setup.ticker, symbol=contract.symbol,
+            asset_class="option", direction=setup.direction, qty=fill.qty, entry_price=fill.avg_price,
+            underlying_target=target, signal_score=100, entry_order_id=fill.order_ids[-1],
+            notes=f"{fc.STRATEGY_TAG}|delta {contract.delta:.2f}|exp {contract.expiry}|range {setup.range:.2f}",
+        )
+        self.ledger.set_kv(f"fc_trade:{tid}", {"direction": setup.direction, "entry_ref": setup.entry_ref,
+                                               "range": setup.range, "break_bar": setup.break_bar.isoformat(),
+                                               "target": target, "progress_ok": False})
+        self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps,
+                                  "TRADED_OPTION", contract.symbol)
+        self.notifier.send(
+            f"🚀 OPENED {contract.symbol} x{fill.qty:g} @ {fill.avg_price:.2f} (first-candle {setup.direction})",
+            table([{"Underlying": setup.ticker, "Direction": setup.direction, "Contract": contract.symbol,
+                    "Delta": round(contract.delta, 2), "Qty": fill.qty, "Fill": fill.avg_price,
+                    "Premium $": round(fill.avg_price * fill.qty * 100, 2), "Candle range": round(setup.range, 2),
+                    "Underlying target": target,
+                    "Broker": f"{self.broker.name}{' (paper)' if self.broker.is_paper else ' (LIVE)'}"}])
+            + f"<p>No stop loss (premium is the risk). Exits: target, back at entry after +{s.fc_breakeven_after:g}x range, "
+              f"no progress by 10:00 CT, or {s.flatten_minutes_before_close} min before the close.</p>",
+        )
         return True
 
     def _data_outage(self, now: datetime) -> None:

@@ -14,3 +14,10 @@ legacy/
 docs/
 grafana/
 tests/
+
+# local secrets / scratch output (never ship)
+schwab_token.json
+*token*.json
+/results/
+/trades_*.csv
+.claude/

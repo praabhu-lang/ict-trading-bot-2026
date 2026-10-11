@@ -13,3 +13,10 @@ __pycache__/
 /legacy/
 /docs/
 /grafana/
+
+# local secrets / scratch output (never ship)
+schwab_token.json
+*token*.json
+/results/
+/trades_*.csv
+.claude/

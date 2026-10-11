@@ -22,6 +22,8 @@ FOMC_DECISION_DAYS = [
 ]
 
 CPI_RELEASE_DAYS = [
+    date(2026, 1, 13), date(2026, 2, 11), date(2026, 3, 11), date(2026, 4, 10), date(2026, 5, 12),
+    date(2026, 6, 10), date(2026, 7, 14), date(2026, 8, 12), date(2026, 9, 11),
     date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10),
 ]
 
