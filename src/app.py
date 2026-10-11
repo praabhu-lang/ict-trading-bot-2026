@@ -8,6 +8,7 @@
   python -m src.app scan                 # forced post-open scan: refresh levels/signals, no orders
   python -m src.app backtest --tickers SPY,QQQ --start 2026-08-01 --end 2026-09-30
   python -m src.app gex-archive          # 18:00 ET: save today's gexbot EOD GEX archive (for future GEX backtests)
+  python -m src.app nightly              # 18:15 ET: update the backtest database + greeks, re-run the smart-rule backtest
 """
 from __future__ import annotations
 
@@ -177,6 +178,33 @@ def cmd_gex_archive() -> int:
     return 1 if failed and len(failed) == len(results) else 0
 
 
+def cmd_nightly() -> int:
+    from .core.clock import previous_trading_day
+    from .nightly import run_nightly
+
+    store = Store.from_env()
+    now = Clock().now()
+    today = now.date() if now.hour >= 16 else previous_trading_day(now.date())
+
+    def with_ledger(fn):
+        with store.lock(LOCK, ttl_seconds=600, wait_seconds=300):
+            store.download(LEDGER)
+            ledger = Ledger(store.local_path(LEDGER))
+            fn(ledger)
+            ledger.log("INFO", "Nightly: smart-rule shadow list updated")
+            store.upload(LEDGER)
+            ledger.close()
+
+    report = run_nightly(store, MarketData.from_env(store), with_ledger, today)
+    print(json.dumps(report, default=str, indent=2))
+    failed = {k: v for k, v in (report.get("updates") or {}).items() if str(v).startswith("FAILED")}
+    if failed or "research" in report:
+        Notifier.from_env().send("⚠️ Nightly database update had failures",
+                                 "<pre>" + json.dumps(report, default=str, indent=2) + "</pre>",
+                                 dedupe_key=f"nightly:{today.isoformat()}")
+    return 0
+
+
 def cmd_backtest(tickers: list[str], start: date, end: date, capital: float, gex: str = "none") -> int:
     from .backtest.data import HistoricalData
     from .backtest.engine import Backtester
@@ -208,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("test-email")
     sub.add_parser("scan")
     sub.add_parser("gex-archive")
+    sub.add_parser("nightly")
     pre = sub.add_parser("premarket")
     pre.add_argument("--no-email", action="store_true")
     bt = sub.add_parser("backtest")
@@ -229,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_scan()
     if a.cmd == "gex-archive":
         return cmd_gex_archive()
+    if a.cmd == "nightly":
+        return cmd_nightly()
     if a.cmd == "test-email":
         return cmd_test_email()
     if a.cmd == "premarket":

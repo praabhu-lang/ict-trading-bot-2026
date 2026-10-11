@@ -1,8 +1,10 @@
 """Scheduled macro events and the +/- buffer blackout around them.
 
-Built-in: FOMC rate decisions (14:00 ET, press conference 14:30 ET) and CPI (08:30 ET).
-NFP is generated as the first Friday of each month (08:30 ET) - verify against the BLS
-calendar, and add anything else (Fed chair speeches, PCE, FOMC minutes) from the dashboard.
+Built-in: FOMC rate decisions (14:00 ET, press conference 14:30 ET), CPI, PPI and the jobs report (NFP)
+(08:30 ET). CPI / PPI / NFP dates are the official BLS release dates (bls.gov archive + schedule, pulled
+into data/marketdb/market_data.db by `python src/market_db.py events` on Oct 11, 2026). FOMC 2027 is not published
+in this file yet - `calendar_warning()` says so in the pre-market email once the list runs short.
+Add anything else (Fed chair speeches, PCE, FOMC minutes) from the dashboard.
 """
 from __future__ import annotations
 
@@ -22,10 +24,57 @@ FOMC_DECISION_DAYS = [
 ]
 
 CPI_RELEASE_DAYS = [
-    date(2026, 1, 13), date(2026, 2, 11), date(2026, 3, 11), date(2026, 4, 10), date(2026, 5, 12),
+    date(2026, 1, 13), date(2026, 2, 13), date(2026, 3, 11), date(2026, 4, 10), date(2026, 5, 12),
     date(2026, 6, 10), date(2026, 7, 14), date(2026, 8, 12), date(2026, 9, 11),
     date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10),
+    date(2027, 1, 13), date(2027, 2, 11), date(2027, 3, 10), date(2027, 4, 13), date(2027, 5, 12),
+    date(2027, 6, 10), date(2027, 7, 14), date(2027, 8, 11), date(2027, 9, 14), date(2027, 10, 14),
+    date(2027, 11, 10), date(2027, 12, 10),
 ]
+
+NFP_RELEASE_DAYS = [
+    date(2026, 1, 9), date(2026, 2, 11), date(2026, 3, 6), date(2026, 4, 3), date(2026, 5, 8), date(2026, 6, 5),
+    date(2026, 7, 2), date(2026, 8, 7), date(2026, 9, 4), date(2026, 10, 2), date(2026, 11, 6), date(2026, 12, 4),
+    date(2027, 1, 8), date(2027, 2, 5), date(2027, 3, 5), date(2027, 4, 2), date(2027, 5, 7), date(2027, 6, 4),
+    date(2027, 7, 2), date(2027, 8, 6), date(2027, 9, 3), date(2027, 10, 8), date(2027, 11, 5), date(2027, 12, 3),
+]
+
+PPI_RELEASE_DAYS = [
+    date(2026, 1, 14), date(2026, 1, 30), date(2026, 2, 27), date(2026, 3, 18), date(2026, 4, 14), date(2026, 5, 13),
+    date(2026, 6, 11), date(2026, 7, 15), date(2026, 8, 13), date(2026, 9, 10), date(2026, 11, 13), date(2026, 12, 15),
+    date(2027, 1, 14), date(2027, 2, 12), date(2027, 3, 12), date(2027, 4, 14), date(2027, 5, 13), date(2027, 6, 11),
+    date(2027, 7, 15), date(2027, 8, 10), date(2027, 9, 10), date(2027, 10, 15), date(2027, 11, 12), date(2027, 12, 15),
+]
+
+
+def _neighbour_sessions(d: date) -> tuple[date, date]:
+    from .clock import is_trading_day
+    prev, nxt = d - timedelta(days=1), d + timedelta(days=1)
+    while not is_trading_day(prev):
+        prev -= timedelta(days=1)
+    while not is_trading_day(nxt):
+        nxt += timedelta(days=1)
+    return prev, nxt
+
+
+def fomc_adjacent(d: date) -> str | None:
+    """'day before FOMC' / 'day after FOMC' when d is the session next to a decision day, else None.
+    All 9 first-candle trades on these days lost in 2024-2026 (src/analyze_losers.py)."""
+    for f in FOMC_DECISION_DAYS:
+        before, after = _neighbour_sessions(f)
+        if d == before:
+            return "day before FOMC"
+        if d == after:
+            return "day after FOMC"
+    return None
+
+
+def calendar_warning(d: date, horizon_days: int = 45) -> str | None:
+    """Warn when a built-in list ends within `horizon_days` (dates must be added before it runs out)."""
+    for name, days in (("FOMC", FOMC_DECISION_DAYS), ("CPI", CPI_RELEASE_DAYS)):
+        if max(days) < d + timedelta(days=horizon_days):
+            return f"{name} calendar ends {max(days)} - add the next dates in src/core/events.py"
+    return None
 
 
 @dataclass(frozen=True)
@@ -57,8 +106,10 @@ def builtin_events(d: date) -> list[MarketEvent]:
         events.append(MarketEvent("FOMC rate decision + press conference", _at(d, 14, 0), _at(d, 14, 30)))
     if d in CPI_RELEASE_DAYS:
         events.append(MarketEvent("CPI release", _at(d, 8, 30), _at(d, 8, 30)))
-    if d == _first_friday(d.year, d.month):
-        events.append(MarketEvent("Nonfarm payrolls (first Friday, verify)", _at(d, 8, 30), _at(d, 8, 30)))
+    if d in PPI_RELEASE_DAYS:
+        events.append(MarketEvent("PPI release", _at(d, 8, 30), _at(d, 8, 30)))
+    if d in NFP_RELEASE_DAYS or (d > max(NFP_RELEASE_DAYS) and d == _first_friday(d.year, d.month)):
+        events.append(MarketEvent("Jobs report (NFP)", _at(d, 8, 30), _at(d, 8, 30)))
     return events
 
 

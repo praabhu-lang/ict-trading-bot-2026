@@ -35,6 +35,7 @@ BROKERS = {
 LIVE_BROKERS = {"alpaca_live", "ibkr"}
 
 STRATEGIES = {"vrz": "VRZ sweep-and-reject (universe)", "first_candle": "First 5-min candle breakout (SPY/QQQ options)"}
+FC_MODES = {"smart": "Smart rule (gap-graded 0DTE/1DTE, phases, monitor)", "classic": "Classic (one size, fixed delta)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -123,6 +124,24 @@ class Settings:
     fc_kill_lookback: int = 20
     fc_kill_min_winrate: float = 0.25
     fc_kill_drawdown: float = 0.15
+    # "smart": the gap-graded rule from src/backtest_selector.py (spy_gap + gap0dte + grade). "classic": the
+    # original one-size first-candle rule above (fc_premium_pct, fc_delta, fc_friday_dte, kill switch).
+    fc_mode: str = "smart"
+    fc_gap_delta: float = 0.30           # gap agrees with the break: 0DTE at this delta
+    fc_nogap_delta: float = 0.40         # gap against (QQQ only): next-day expiry at this delta
+    fc_prem_qqq_gap: float = 0.07        # base premium % of trading equity per grade (x fc_size_scale)
+    fc_prem_spy_gap: float = 0.05
+    fc_prem_nogap: float = 0.05
+    fc_defensive_pct: float = 0.02       # defensive profile: fixed premium %, not scaled
+    fc_size_scale: float = 2.0           # phase 1 ($10k -> $50k): 2x the grades = 10-14% premium per trade
+    fc_phase2_equity: float = 50_000.0   # once trading equity first reaches this ...
+    fc_phase2_scale: float = 0.5         # ... size is cut to this x the phase-1 size (5-7%)
+    fc_floor_equity: float = 5_000.0     # phase 1 hard floor: no new trades below it
+    fc_phase2_floor: float = 35_000.0    # floor once phase 2 has been reached
+    fc_halfsize_lookback: int = 10       # half size while the last N trades average a loss (option return)
+    fc_monitor: bool = True              # monitor C: profile from the last fc_monitor_lookback smart-rule signals
+    fc_monitor_lookback: int = 50
+    fc_skip_fomc_adjacent: bool = True   # also skip the session before and after an FOMC decision
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -169,6 +188,19 @@ class Settings:
         "fc_kill_lookback": (5, 100),
         "fc_kill_min_winrate": (0.0, 0.9),
         "fc_kill_drawdown": (0.05, 0.50),
+        "fc_gap_delta": (0.10, 0.80),
+        "fc_nogap_delta": (0.10, 0.80),
+        "fc_prem_qqq_gap": (0.005, 0.15),
+        "fc_prem_spy_gap": (0.005, 0.15),
+        "fc_prem_nogap": (0.005, 0.15),
+        "fc_defensive_pct": (0.0, 0.10),
+        "fc_size_scale": (0.25, 3.0),
+        "fc_phase2_equity": (1_000.0, 10_000_000.0),
+        "fc_phase2_scale": (0.1, 1.0),
+        "fc_floor_equity": (0.0, 10_000_000.0),
+        "fc_phase2_floor": (0.0, 10_000_000.0),
+        "fc_halfsize_lookback": (3, 50),
+        "fc_monitor_lookback": (10, 200),
     }
 
     @classmethod
@@ -200,6 +232,8 @@ class Settings:
             setattr(s, key, value)
         if s.strategy not in STRATEGIES:
             s.strategy = "vrz"
+        if s.fc_mode not in FC_MODES:
+            s.fc_mode = "smart"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

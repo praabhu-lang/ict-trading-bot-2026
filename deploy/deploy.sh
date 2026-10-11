@@ -36,4 +36,10 @@ gcloud run jobs deploy ai-trading-gexarchive --project "$PROJECT" --region "$REG
   --command python --args=-m,src.app,gex-archive --env-vars-file env.yaml \
   --memory 1Gi --task-timeout 30m --max-retries 1
 
+# Nightly (18:15 ET): backtest database update (bars, options, events, end-of-day greeks) + smart-rule backtest
+# that feeds the live monitor. Holds data/marketdb/market_data.db (~650 MB) in memory: 4 GiB.
+gcloud run jobs deploy ai-trading-nightly --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+  --command python --args=-m,src.app,nightly --env-vars-file env.yaml \
+  --memory 4Gi --cpu 2 --task-timeout 60m --max-retries 1
+
 echo "Deployed $IMAGE. Run deploy/scheduler.sh once to (re)create the schedules."

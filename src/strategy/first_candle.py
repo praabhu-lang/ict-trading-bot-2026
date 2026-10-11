@@ -13,6 +13,18 @@ Exits (underlying, 5-minute closes): target = entry +/- `fc_target_mult` x candl
   our way; otherwise the normal end-of-day flatten (15 min before the close).
 Kill switch: no new trades when the last `fc_kill_lookback` trades are net negative or win < `fc_kill_min_winrate`,
   or trading equity is `fc_kill_drawdown` below its peak.
+
+Smart mode (fc_mode = "smart", the default; studied in src/backtest_selector.py / backtest_health.py):
+  ticker      the pick above, but SPY only when its opening gap agrees with the break
+  grade       gap agrees -> 0DTE at fc_gap_delta, premium 7% (QQQ) / 5% (SPY); gap against (QQQ) -> next-day
+              expiry at fc_nogap_delta, 5%. Premium % x fc_size_scale (phase 1), x fc_phase2_scale once trading
+              equity has reached fc_phase2_equity.
+  half size   while the last fc_halfsize_lookback smart-rule signals average a loss (option return)
+  profile     monitor C - average option return of the last fc_monitor_lookback smart-rule signals (the nightly
+              backtest's shadow list): > +10% smart | > 0 safer (always next-day expiry) | else defensive
+              (QQQ only with the gap, next-day expiry, fc_defensive_pct)
+  floors      no new trades below fc_floor_equity (fc_phase2_floor after phase 2 was reached)
+  events      FOMC / CPI days and (fc_skip_fomc_adjacent) the session before and after an FOMC decision
 """
 from __future__ import annotations
 
@@ -160,3 +172,92 @@ def kill_switch(closed: list[dict], equity: float, peak: float, s) -> str | None
         if wins < s.fc_kill_min_winrate:
             return f"Kill switch: last {len(recent)} trades won {wins:.0%} (< {s.fc_kill_min_winrate:.0%})"
     return None
+
+
+# ------------------------------------------------------------------ smart mode
+@dataclass
+class Plan:
+    """What to buy for an accepted setup: expiry offset (0 = today, 1 = next trading day), delta, premium %."""
+    dte: int
+    delta: float
+    premium_pct: float
+    label: str
+
+
+def gap_agrees(bars: pd.DataFrame, daily_closes: pd.Series, d: date, direction: str) -> bool:
+    """Today's 09:30 open vs the prior close points the same way as the break."""
+    t = today_bars(bars, d)
+    if t.empty or len(daily_closes) == 0:
+        return False
+    gap = float(t["open"].iloc[0]) - float(daily_closes.iloc[-1])
+    return gap * (1 if direction == "bull" else -1) > 0
+
+
+def option_returns(rows: list[dict]) -> list[float]:
+    """Option return per $ of premium of closed first-candle trades (oldest first)."""
+    out = []
+    for t in rows:
+        cost = float(t.get("entry_price") or 0) * float(t.get("qty") or 0) * 100
+        if cost > 0:
+            out.append(float(t.get("realized_pnl") or 0) / cost)
+    return out
+
+
+def profile_for(returns: list[float], s) -> tuple[str, str]:
+    """Monitor C: (profile, reason) from the average option return of the last fc_monitor_lookback signals."""
+    if not s.fc_monitor:
+        return "smart", "monitor off"
+    recent = returns[-s.fc_monitor_lookback:]
+    if len(recent) < 15:
+        return "smart", f"only {len(recent)} signals of history - default profile"
+    avg = sum(recent) / len(recent)
+    why = f"last {len(recent)} signals average {avg:+.0%} per trade"
+    if avg > 0.10:
+        return "smart", why
+    if avg > 0:
+        return "safer", why + " (0 to +10%: next-day expiries only)"
+    return "defensive", why + " (losing: QQQ gap days only, small size)"
+
+
+def size_multiplier(returns: list[float], phase2: bool, s) -> tuple[float, list[str]]:
+    """Phase scale x half-size kill switch. Notes explain each factor."""
+    mult, notes = s.fc_size_scale, [f"phase {'2' if phase2 else '1'} size x{s.fc_size_scale:g}"]
+    if phase2:
+        mult *= s.fc_phase2_scale
+        notes.append(f"phase 2 cut x{s.fc_phase2_scale:g}")
+    recent = returns[-s.fc_halfsize_lookback:]
+    if len(recent) >= s.fc_halfsize_lookback and sum(recent) / len(recent) < 0:
+        mult *= 0.5
+        notes.append(f"half size: last {len(recent)} signals average {sum(recent) / len(recent):+.0%}")
+    return mult, notes
+
+
+def floor_reason(equity: float, phase2: bool, s) -> str | None:
+    floor = s.fc_phase2_floor if phase2 else s.fc_floor_equity
+    if floor > 0 and equity < floor:
+        return (f"Account floor: trading equity {equity:,.0f} is below {floor:,.0f} - no new trades. "
+                f"Review before lowering the floor in Settings.")
+    return None
+
+
+def plan_for(ticker: str, gap_ok: bool, profile: str, mult: float, s) -> tuple[Plan | None, str]:
+    """(Plan, label) for an accepted breakout, or (None, reason to skip)."""
+    if profile == "defensive":
+        if ticker != "QQQ" or not gap_ok:
+            return None, "defensive profile: QQQ with the gap only"
+        return Plan(1, s.fc_nogap_delta, s.fc_defensive_pct, "defensive: QQQ next-day"), ""
+    if ticker == "SPY" and not gap_ok:
+        return None, "SPY breaks need the opening gap to agree"
+    pct = (s.fc_prem_qqq_gap if ticker == "QQQ" else s.fc_prem_spy_gap) if gap_ok else s.fc_prem_nogap
+    if gap_ok and profile == "smart":
+        return Plan(0, s.fc_gap_delta, pct * mult, f"gap agrees: 0DTE {s.fc_gap_delta:.2f} delta"), ""
+    return Plan(1, s.fc_nogap_delta, pct * mult,
+                f"{'gap agrees' if gap_ok else 'gap against'}: next-day expiry {s.fc_nogap_delta:.2f} delta"
+                + (" (safer profile)" if profile == "safer" and gap_ok else "")), ""
+
+
+def next_trading_day(d: date) -> date:
+    x = d + timedelta(days=1)
+    while not is_trading_day(x):
+        x += timedelta(days=1)
+    return x

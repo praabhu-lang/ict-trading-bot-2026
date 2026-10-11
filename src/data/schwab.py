@@ -178,6 +178,7 @@ class SchwabClient:
                             open_interest=int(c.get("openInterest") or 0),
                             volume=int(c.get("totalVolume") or 0),
                             iv=_num(iv) / 100.0 if _num(iv) > 0 else 0.0,
+                            theta=_num(c.get("theta")), vega=_num(c.get("vega")), last=_num(c.get("last")),
                         ))
         if spot <= 0 or not options:
             raise MarketDataUnavailable(f"Empty Schwab option chain for {symbol}")

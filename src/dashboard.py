@@ -26,7 +26,8 @@ from src.brokers.platforms import PLATFORMS, CredentialStore  # noqa: E402
 from src.core.clock import Clock  # noqa: E402
 from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
-from src.core.settings import BROKERS, DEFAULT_UNIVERSE, LIVE_BROKERS, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
+from src import dashboard_pages as pages  # noqa: E402
+from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, LIVE_BROKERS, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -225,70 +226,48 @@ with st.sidebar:
         st.rerun()
 
 # ------------------------------------------------------------------ tabs
-st.title("ICT 0DTE Trading Bot")
-tab_live, tab_levels, tab_hist, tab_bt, tab_set, tab_plat, tab_log = st.tabs(
-    ["Active trades", "Signals & levels", "History", "Backtest", "Settings", "Platforms", "Logs"])
+st.title("📈 ICT Trading Bot")
+st.caption("First 5-minute candle on SPY/QQQ options · " + ("🧪 paper" if settings.broker == "alpaca_paper" else "💵 live")
+           + f" · {settings.strategy} / {settings.fc_mode}")
+(tab_today, tab_perf, tab_trades, tab_levels, tab_how, tab_research, tab_bt, tab_set, tab_plat, tab_log) = st.tabs(
+    ["🏠 Today", "📈 Performance", "🧾 Trades", "📡 Signals & levels", "📘 How it works", "🔬 Research",
+     "🧪 Backtest (VRZ)", "⚙️ Settings", "🔌 Platforms", "🪵 Logs"])
 
 
 def money(x) -> str:
     return "" if x is None else f"${x:,.2f}"
 
 
-with tab_live:
-    @st.fragment(run_every="20s")
-    def live_panel():
-        if broker is None:
-            st.error(f"Broker unavailable: {broker_error}")
-            return
-        try:
-            acct = broker.account()
-            positions = broker.positions()
-            orders = broker.open_orders()
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Broker error: {exc}")
-            return
-        lv = get_ledger()
-        open_trades = lv.open_trades() if lv else []
-        m = st.columns(4)
-        realized = lv.total_realized_pnl() if lv else 0.0
-        m[0].metric("Trading capital", money(settings.trading_equity(acct.equity, realized)),
-                    help=f"Account equity {money(acct.equity)}")
-        m[1].metric("Bot P&L today", money(lv.realized_pnl_on(today) if lv else 0.0))
-        m[2].metric("Open bot trades", len(open_trades))
-        m[3].metric("Mode", "PAPER" if broker.is_paper else "LIVE MONEY")
-        by_symbol = {p.symbol: p for p in positions}
-        rows = []
-        for t in open_trades:
-            p = by_symbol.get(t["symbol"])
-            mult = 100 if t["asset_class"] == "option" else 1
-            px = p.current_price if p else None
-            sign = 1 if (t["asset_class"] == "option" or t["direction"] == "bull") else -1
-            pnl = (px - t["entry_price"]) * t["qty"] * mult * sign if px else None
-            rows.append({
-                "Instrument": t["symbol"], "Type": t["asset_class"], "Side": t["direction"], "Qty": t["qty"],
-                "Entry": t["entry_price"], "Now": px, "P&L $": pnl,
-                "P&L %": (pnl / (t["entry_price"] * t["qty"] * mult) * 100) if pnl is not None else None,
-                "Stop": t["stop_price"], "Target": t["target_price"], "Underlying stop": t["underlying_stop"],
-                "Opened (UTC)": t["opened_at"], "Score": t["signal_score"],
-            })
-        st.subheader("Bot-managed trades")
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                         column_config={"P&L %": st.column_config.NumberColumn(format="%.1f%%"),
-                                        "P&L $": st.column_config.NumberColumn(format="$%.2f")})
-        else:
-            st.info("No open bot trades.")
-        managed = {t["symbol"] for t in open_trades}
-        other = [p for p in positions if p.symbol not in managed]
-        if other:
-            st.subheader("Other broker positions (not managed by the bot)")
-            st.dataframe(pd.DataFrame([p.__dict__ for p in other]), hide_index=True, width="stretch")
-        if orders:
-            st.subheader("Working orders")
-            st.dataframe(pd.DataFrame(orders), hide_index=True, width="stretch")
-        st.caption(f"Refreshed {datetime.now().strftime('%H:%M:%S')} · auto-refresh every 20 s")
+@st.cache_data(ttl=300, show_spinner=False)
+def research_summary() -> dict:
+    return store.read_json("research/smart_rule.json", {}) or {}
 
-    live_panel()
+
+with tab_today:
+    @st.fragment(run_every="15s")
+    def today_live():
+        lv = get_ledger()
+        status = (lv.get_kv("engine_status") if lv else None) or {}
+        pages.today_page(lv, settings, status, Clock().now(), broker, broker_error, ss)
+        st.caption(f"Live · refreshes every 15 s (new trades and closes pop up here) · {datetime.now():%H:%M:%S}")
+
+    today_live()
+
+with tab_perf:
+    @st.fragment(run_every="60s")
+    def perf_live():
+        pages.performance_page(get_ledger(), settings, Clock().now().date())
+
+    perf_live()
+
+with tab_trades:
+    pages.trades_page(led)
+
+with tab_how:
+    pages.how_page(settings, research_summary())
+
+with tab_research:
+    pages.research_page(research_summary())
 
 with tab_levels:
     from src.core.clock import ET, is_trading_day, market_close_dt, market_open_dt
@@ -410,31 +389,6 @@ with tab_levels:
     else:
         st.info(f"No VRZ signals today (a signal needs ≥{settings.min_convergence}% convergence).")
 
-with tab_hist:
-    trades = pd.DataFrame(led.trades(limit=2000)) if led else pd.DataFrame()
-    closed = trades[trades.status == "CLOSED"].copy() if not trades.empty else trades
-    if closed.empty:
-        st.info("No closed trades yet.")
-    else:
-        closed = closed.sort_values("closed_at")
-        wins = (closed.realized_pnl > 0).sum()
-        m = st.columns(4)
-        m[0].metric("Closed trades", len(closed))
-        m[1].metric("Win rate", f"{wins / len(closed) * 100:.0f}%")
-        m[2].metric("Total P&L", money(closed.realized_pnl.sum()))
-        m[3].metric("Avg trade", money(closed.realized_pnl.mean()))
-        closed["cum_pnl"] = closed.realized_pnl.cumsum()
-        fig = go.Figure(go.Scatter(x=pd.to_datetime(closed.closed_at), y=closed.cum_pnl, mode="lines",
-                                   line=dict(color=SERIES, width=2),
-                                   hovertemplate="%{x|%b %d %H:%M}<br>Cumulative P&L $%{y:,.2f}<extra></extra>"))
-        fig.add_hline(y=0, line=dict(color=MUTED, width=1, dash="dot"))
-        fig.update_layout(title="Cumulative realized P&L", height=320, margin=dict(l=10, r=10, t=40, b=10),
-                          yaxis=dict(tickprefix="$"), showlegend=False, hovermode="x unified")
-        st.plotly_chart(fig, width="stretch")
-        st.dataframe(closed.groupby("exit_reason").realized_pnl.agg(["count", "sum", "mean"]).round(2),
-                     width="stretch")
-        st.dataframe(closed.drop(columns=["cum_pnl"]).iloc[::-1], hide_index=True, width="stretch")
-
 with tab_bt:
     st.caption("Replays 5-minute bars through the exact live rules (VRZ, convergence, gates, sizing, exits). "
                "Real Alpaca option prices are used where they exist (Feb 2024+).")
@@ -548,6 +502,21 @@ with tab_set:
         fc_dd = c[3].number_input("Kill switch: % below peak", 5.0, 50.0, settings.fc_kill_drawdown * 100, 1.0)
         st.caption("First-candle: SPY/QQQ, trend + first 5-min candle colour, breakout by 8:50 CT, target 3x the "
                    "candle range, break-even after +1x, no-progress exit 10:00 CT, skips FOMC/CPI days.")
+        fc_mode = st.selectbox("First-candle mode", list(FC_MODES), index=list(FC_MODES).index(settings.fc_mode),
+                               format_func=FC_MODES.get, help="Smart: gap-graded 0DTE/1DTE, phases, monitor (see How it works). "
+                               "Classic uses the premium/delta/Friday settings above.")
+        c = st.columns(4)
+        sm_scale = c[0].number_input("Phase-1 size x (grades 7%/5%)", 0.25, 3.0, settings.fc_size_scale, 0.25,
+                                     help="2 = 14% QQQ gap days, 10% otherwise")
+        sm_p2 = c[1].number_input("Phase 2 starts at $", 1_000.0, 10_000_000.0, settings.fc_phase2_equity, 5_000.0)
+        sm_p2s = c[2].number_input("Phase-2 size x of phase 1", 0.1, 1.0, settings.fc_phase2_scale, 0.05)
+        sm_mon = c[3].toggle("Monitor C (auto profile)", settings.fc_monitor)
+        c = st.columns(4)
+        sm_floor = c[0].number_input("Floor $ (phase 1)", 0.0, 10_000_000.0, settings.fc_floor_equity, 500.0)
+        sm_floor2 = c[1].number_input("Floor $ (phase 2)", 0.0, 10_000_000.0, settings.fc_phase2_floor, 1_000.0)
+        sm_gapd = c[2].number_input("Gap-day delta (0DTE)", 0.10, 0.80, settings.fc_gap_delta, 0.05)
+        sm_nogapd = c[3].number_input("No-gap delta (next day)", 0.10, 0.80, settings.fc_nogap_delta, 0.05)
+        sm_adj = st.toggle("Skip the session before and after FOMC", settings.fc_skip_fomc_adjacent)
         st.subheader("Capital & risk")
         start_cap = st.number_input("Trading capital $ (sizing base; bot profits are added back; 0 = whole account)",
                                     0.0, 10_000_000.0, float(settings.starting_capital), 1_000.0)
@@ -622,6 +591,10 @@ with tab_set:
                     "custom_events": events,
                     "strategy": strat, "fc_premium_pct": fc_prem / 100, "fc_delta": float(fc_delta),
                     "fc_friday_dte": 1 if fc_fri else 0, "fc_kill_drawdown": fc_dd / 100,
+                    "fc_mode": fc_mode, "fc_size_scale": float(sm_scale), "fc_phase2_equity": float(sm_p2),
+                    "fc_phase2_scale": float(sm_p2s), "fc_monitor": sm_mon, "fc_floor_equity": float(sm_floor),
+                    "fc_phase2_floor": float(sm_floor2), "fc_gap_delta": float(sm_gapd),
+                    "fc_nogap_delta": float(sm_nogapd), "fc_skip_fomc_adjacent": sm_adj,
                 })
                 broker_for.clear()
                 st.success("Saved.")

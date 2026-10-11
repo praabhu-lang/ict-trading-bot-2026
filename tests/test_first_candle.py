@@ -45,7 +45,7 @@ def bear_day(d=TODAY, open_=100.5, follow=None):
 
 
 def S(**kw):
-    return Settings(**{"strategy": "first_candle", "fc_premium_pct": 0.10, **kw})
+    return Settings(**{"strategy": "first_candle", "fc_premium_pct": 0.10, "fc_mode": "classic", **kw})
 
 
 @pytest.fixture

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from ..alerts.notifier import Notifier, table
 from ..brokers.base import Broker
 from ..core.clock import Clock, is_trading_day, market_close_dt, market_open_dt
-from ..core.events import CPI_RELEASE_DAYS, FOMC_DECISION_DAYS, EventCalendar
+from ..core.events import CPI_RELEASE_DAYS, FOMC_DECISION_DAYS, EventCalendar, fomc_adjacent
 from ..core.ledger import Ledger
 from ..core.settings import OPTIONS_ONLY, Settings
 from ..data.market import BAR_MINUTES, MarketData
@@ -482,10 +482,29 @@ class TradingEngine:
             self.ledger.set_kv(f"fc_trade:{t['id']}", meta)
         return reason
 
+    def _fc_today(self, d, **update) -> dict:
+        """Today's first-candle decision record (dashboard 'Today' page, day summary email)."""
+        key = f"fc_today:{d.isoformat()}"
+        cur = self.ledger.get_kv(key) or {"date": d.isoformat()}
+        if update:
+            cur.update(update, updated=self.clock.now().isoformat(timespec="seconds"))
+            self.ledger.set_kv(key, cur)
+        return cur
+
+    def _fc_returns(self) -> list[float]:
+        """Option returns of the smart rule's recent signals: the nightly backtest's shadow list, else live trades."""
+        shadow = self.ledger.get_kv("fc_shadow") or []
+        if shadow:
+            return [float(x["ret"]) for x in shadow]
+        closed = [t for t in reversed(self.ledger.trades()) if t["status"] == "CLOSED"
+                  and (t.get("notes") or "").startswith(fc.STRATEGY_TAG)]
+        return fc.option_returns(closed)
+
     def first_candle_scan(self, now: datetime, trade: bool = True) -> int:
         """One decision per day: pick SPY/QQQ, wait for the first close beyond the 09:30 candle, then buy one
         short-dated option (or stand aside). Returns the number of tickers analysed."""
         d, s = now.date(), self.s
+        smart = s.fc_mode == "smart"
         done_key = f"fc_done:{d.isoformat()}"
         if not trade:
             return 0
@@ -496,11 +515,21 @@ class TradingEngine:
         equity = s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
         peak = max(float(self.ledger.get_kv("fc_peak_equity", 0) or 0), equity)
         self.ledger.set_kv("fc_peak_equity", peak)
+        phase2 = bool(self.ledger.get_kv("fc_phase2_reached")) or equity >= s.fc_phase2_equity
+        if phase2 and not self.ledger.get_kv("fc_phase2_reached"):
+            self.ledger.set_kv("fc_phase2_reached", d.isoformat())
+            self.notifier.send(f"🎯 Trading equity reached {s.fc_phase2_equity:,.0f} - phase 2",
+                               f"<p>Position size is now x{s.fc_phase2_scale:g} of phase 1 and the account floor is "
+                               f"{s.fc_phase2_floor:,.0f}. Consider withdrawing the starting capital.</p>",
+                               dedupe_key="fc_phase2")
         self.status.update({"account_equity": acct.equity, "trading_equity": equity, "buying_power": acct.buying_power,
                             "bot_day_pnl": self.ledger.realized_pnl_on(d)})
         reasons = []
         if s.fc_skip_fomc_cpi and (d in FOMC_DECISION_DAYS or d in CPI_RELEASE_DAYS):
             reasons.append("FOMC/CPI day - no first-candle trade")
+        adjacent = fomc_adjacent(d) if smart and s.fc_skip_fomc_adjacent else None
+        if adjacent:
+            reasons.append(f"{adjacent} - no first-candle trade (all 9 such trades lost in 2024-26)")
         event = self.calendar.active_blackout(now)
         if event:
             reasons.append(f"Event blackout: {event.name}")
@@ -511,17 +540,33 @@ class TradingEngine:
         shock = self.news.market_shock()
         if shock.blocked:
             reasons.append(shock.reason)
-        closed = [t for t in reversed(self.ledger.trades()) if t["status"] == "CLOSED"
-                  and (t.get("notes") or "").startswith(fc.STRATEGY_TAG)]
-        kill = fc.kill_switch(closed, equity, peak, s)
-        if kill:
-            reasons.append(kill)
-            self.notifier.send("🛑 First-candle kill switch", f"<p>{html.escape(kill)}</p><p>No new first-candle trades while this holds. "
-                               f"Open trades are still managed. Review on paper, then adjust the fc_kill_* settings "
-                               f"to resume.</p>",
-                               dedupe_key=f"fc_kill:{d.isoformat()}")
+        profile, mult, size_notes = "classic", 1.0, []
+        if smart:
+            returns = self._fc_returns()
+            profile, profile_why = fc.profile_for(returns, s)
+            mult, size_notes = fc.size_multiplier(returns, phase2, s)
+            floor = fc.floor_reason(equity, phase2, s)
+            if floor:
+                reasons.append(floor)
+                self.notifier.send("🛑 Account floor reached - first-candle paused", f"<p>{html.escape(floor)}</p>",
+                                   dedupe_key=f"fc_floor:{d.isoformat()}")
+            self._fc_today(d, mode="smart", profile=profile, profile_reason=profile_why, phase=2 if phase2 else 1,
+                           size_mult=round(mult, 3), size_notes=size_notes, equity=round(equity, 2),
+                           events=[e.name for e in self.calendar.events_on(d)] + ([adjacent] if adjacent else []))
+        else:
+            closed = [t for t in reversed(self.ledger.trades()) if t["status"] == "CLOSED"
+                      and (t.get("notes") or "").startswith(fc.STRATEGY_TAG)]
+            kill = fc.kill_switch(closed, equity, peak, s)
+            if kill:
+                reasons.append(kill)
+                self.notifier.send("🛑 First-candle kill switch", f"<p>{html.escape(kill)}</p><p>No new first-candle trades while this holds. "
+                                   f"Open trades are still managed. Review on paper, then adjust the fc_kill_* settings "
+                                   f"to resume.</p>",
+                                   dedupe_key=f"fc_kill:{d.isoformat()}")
+            self._fc_today(d, mode="classic", equity=round(equity, 2))
         self.status["gates"] = reasons or ["OPEN - first-candle entries allowed"]
         if reasons:
+            self._fc_today(d, decision="NO TRADE", reason="; ".join(reasons))
             return 0
 
         pick = self.ledger.get_kv(f"fc_pick:{d.isoformat()}")
@@ -541,6 +586,7 @@ class TradingEngine:
             pick = max(scores, key=scores.get)
             self.ledger.set_kv(f"fc_pick:{d.isoformat()}", pick)
             self.ledger.log("INFO", f"First-candle pick {pick}: " + ", ".join(f"{k} {v:.4f}" for k, v in scores.items()))
+            self._fc_today(d, pick=pick, scores={k: round(v, 5) for k, v in scores.items()})
         try:
             bars = self.market.bars(pick, now)
             closes = self.market.daily_closes(pick, now, sessions=25)
@@ -551,16 +597,30 @@ class TradingEngine:
         verdict, x = fc.find_setup(pick, bars, closes, d, s.fc_last_break_bar)
         if verdict == "wait":
             self.status["gates"] = [f"First-candle: {pick} {x}"]
+            self._fc_today(d, decision="WAITING", reason=f"{pick}: {x}")
             return 1
         if verdict == "reject":
             self.ledger.set_kv(done_key, f"{pick}: {x}")
             self.ledger.record_signal(d, pick, "-", 0, 0, 0, 0, {}, "BLOCKED", f"first candle: {x}")
+            self._fc_today(d, decision="NO TRADE", reason=f"{pick}: {x}")
             return 1
+        plan = None
+        if smart:
+            gap_ok = fc.gap_agrees(bars, closes, d, x.direction)
+            plan, why = fc.plan_for(pick, gap_ok, profile, mult, s)
+            self._fc_today(d, direction=x.direction, gap_agrees=gap_ok,
+                           grade=plan.label if plan else why)
+            if plan is None:
+                self.ledger.set_kv(done_key, f"{pick} {x.direction} breakout - {why}")
+                self.ledger.record_signal(d, pick, x.direction, 100, x.entry_ref, 0, 0,
+                                          {"or_high": x.or_high, "or_low": x.or_low}, "BLOCKED", why)
+                self._fc_today(d, decision="NO TRADE", reason=f"{pick} {x.direction} breakout - {why}")
+                return 1
         self.ledger.set_kv(done_key, f"{pick} {x.direction} breakout")
-        self._first_candle_enter(x, now, equity)
+        self._first_candle_enter(x, now, equity, plan)
         return 1
 
-    def _first_candle_enter(self, setup, now: datetime, equity: float) -> bool:
+    def _first_candle_enter(self, setup, now: datetime, equity: float, plan=None) -> bool:
         s, d = self.s, now.date()
         sign = 1 if setup.direction == "bull" else -1
         target = round(setup.entry_ref + sign * s.fc_target_mult * setup.range, 2)
@@ -568,39 +628,54 @@ class TradingEngine:
             chain = self.market.chain(setup.ticker, d, max_dte=7)
         except MarketDataUnavailable as exc:
             self._error("first-candle option chain unavailable", exc)
+            self._fc_today(d, decision="NO TRADE", reason=f"option chain unavailable: {exc}")
             return False
-        contract = fc.choose_contract(chain, setup.direction, setup.entry_ref, fc.expiry_for(d, s.fc_friday_dte), s.fc_delta)
+        if plan is None:                             # classic mode
+            expiry, delta, premium_pct, label = fc.expiry_for(d, s.fc_friday_dte), s.fc_delta, s.fc_premium_pct, "classic"
+        else:
+            expiry = d if plan.dte == 0 else fc.next_trading_day(d)
+            delta, premium_pct, label = plan.delta, plan.premium_pct, plan.label
+        contract = fc.choose_contract(chain, setup.direction, setup.entry_ref, expiry, delta)
         if contract:                                 # chain may be up to 60 s old: price the order on a live quote
             bid, ask = self._option_bid_ask(contract.symbol)
             if bid > 0 and ask > 0:
                 contract.bid, contract.ask = bid, ask
-        qty = fc.contracts_for(equity, contract.ask, s.fc_premium_pct) if contract else 0
-        comps = {"or_high": setup.or_high, "or_low": setup.or_low, "range": round(setup.range, 2)}
+        qty = fc.contracts_for(equity, contract.ask, premium_pct) if contract else 0
+        comps = {"or_high": setup.or_high, "or_low": setup.or_low, "range": round(setup.range, 2), "plan": label,
+                 "premium_pct": round(premium_pct, 4)}
         if not contract or qty < 1:
             why = "no contract near the target delta" if not contract else f"1 contract ({contract.ask * 100:,.0f}) > 20% of equity"
             self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps, "BLOCKED", why)
+            self._fc_today(d, decision="NO TRADE", reason=why)
             return False
         fill = self.execution.buy_option(contract.symbol, qty, contract.bid, contract.ask)   # Schwab bid/ask
         if not fill.filled:
             self._error(f"first-candle entry {contract.symbol} did not fill", RuntimeError("no fill"))
+            self._fc_today(d, decision="NO TRADE", reason=f"order for {contract.symbol} did not fill")
             return False
         tid = self.ledger.open_trade(
             trade_date=d.isoformat(), broker=self.broker.name, underlying=setup.ticker, symbol=contract.symbol,
             asset_class="option", direction=setup.direction, qty=fill.qty, entry_price=fill.avg_price,
             underlying_target=target, signal_score=100, entry_order_id=fill.order_ids[-1],
-            notes=f"{fc.STRATEGY_TAG}|delta {contract.delta:.2f}|exp {contract.expiry}|range {setup.range:.2f}",
+            notes=f"{fc.STRATEGY_TAG}|delta {contract.delta:.2f}|exp {contract.expiry}|range {setup.range:.2f}|{label}",
         )
+        greeks = {"delta": contract.delta, "gamma": contract.gamma, "iv": contract.iv, "oi": contract.open_interest,
+                  "volume": contract.volume, "bid": contract.bid, "ask": contract.ask}
         self.ledger.set_kv(f"fc_trade:{tid}", {"direction": setup.direction, "entry_ref": setup.entry_ref,
                                                "range": setup.range, "break_bar": setup.break_bar.isoformat(),
-                                               "target": target, "progress_ok": False})
+                                               "target": target, "progress_ok": False, "plan": label,
+                                               "premium_pct": premium_pct, "greeks_at_entry": greeks})
         self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps,
                                   "TRADED_OPTION", contract.symbol)
+        premium = round(fill.avg_price * fill.qty * 100, 2)
+        self._fc_today(d, decision="TRADED", reason=f"{setup.ticker} {setup.direction} breakout - {label}",
+                       contract=contract.symbol, qty=fill.qty, fill=fill.avg_price, premium=premium, trade_id=tid)
         self.notifier.send(
             f"🚀 OPENED {contract.symbol} x{fill.qty:g} @ {fill.avg_price:.2f} (first-candle {setup.direction})",
-            table([{"Underlying": setup.ticker, "Direction": setup.direction, "Contract": contract.symbol,
-                    "Delta": round(contract.delta, 2), "Qty": fill.qty, "Fill": fill.avg_price,
-                    "Premium $": round(fill.avg_price * fill.qty * 100, 2), "Candle range": round(setup.range, 2),
-                    "Underlying target": target,
+            table([{"Underlying": setup.ticker, "Direction": setup.direction, "Plan": label, "Contract": contract.symbol,
+                    "Delta": round(contract.delta, 2), "IV": round(contract.iv, 3), "Qty": fill.qty, "Fill": fill.avg_price,
+                    "Premium $": premium, "Premium % of equity": f"{premium / equity:.1%}" if equity else "",
+                    "Candle range": round(setup.range, 2), "Underlying target": target,
                     "Broker": f"{self.broker.name}{' (paper)' if self.broker.is_paper else ' (LIVE)'}"}])
             + f"<p>No stop loss (premium is the risk). Exits: target, back at entry after +{s.fc_breakeven_after:g}x range, "
               f"no progress by 10:00 CT, or {s.flatten_minutes_before_close} min before the close.</p>",
@@ -644,10 +719,21 @@ class TradingEngine:
 
     def _trade_closed_email(self, t: dict, price: float, reason: str, pnl: float) -> None:
         icon = "🛑" if reason.startswith("STOP_LOSS") else "✅" if pnl >= 0 else "🔻"
+        mult = 100.0 if t["asset_class"] == "option" else 1.0
+        cost = float(t["entry_price"]) * float(t["qty"]) * mult
+        held = ""
+        try:
+            held = str(datetime.now(datetime.fromisoformat(t["opened_at"]).tzinfo)
+                       - datetime.fromisoformat(t["opened_at"])).split(".")[0]
+        except (TypeError, ValueError):
+            pass
+        why = {"TARGET": "underlying reached 3x the first-candle range", "BREAKEVEN": "came back to the entry after +1x",
+               "NO_PROGRESS": "had not moved enough by 10:00 CT", "EOD_FLATTEN": "end-of-day flatten"}.get(reason, reason)
         self.notifier.send(
             f"{icon} CLOSED {t['symbol']} {reason} P&L {pnl:+,.2f}",
             table([{"Instrument": t["symbol"], "Qty": t["qty"], "Entry": t["entry_price"], "Exit": price,
-                    "Reason": reason, "P&L $": pnl}]),
+                    "Reason": why, "P&L $": pnl, "P&L %": f"{pnl / cost:+.0%}" if cost else "", "Held": held,
+                    "Bot P&L total": round(self.ledger.total_realized_pnl(), 2)}]),
         )
 
     def daily_summary(self, now: datetime) -> None:
@@ -655,8 +741,18 @@ class TradingEngine:
         closed = [t for t in trades if t["status"] == "CLOSED"]
         total = sum(float(t["realized_pnl"] or 0) for t in closed)
         sigs = self.ledger.signals_on(now.date())
+        today = self.ledger.get_kv(f"fc_today:{now.date().isoformat()}") or {}
+        month = sum(float(t["realized_pnl"] or 0) for t in self.ledger.trades(limit=5000)
+                    if t["status"] == "CLOSED" and str(t["trade_date"])[:7] == now.date().isoformat()[:7])
+        plan_html = ""
+        if today:
+            plan_html = ("<h3>Strategy today</h3>" + table([{
+                "Decision": today.get("decision", "-"), "Why": today.get("reason", ""), "Profile": today.get("profile", ""),
+                "Phase": today.get("phase", ""), "Size": today.get("size_mult", ""), "Pick": today.get("pick", ""),
+                "Gap agrees": today.get("gap_agrees", ""), "Plan": today.get("grade", "")}]))
         self.notifier.send(
             f"📊 Day summary {now:%a %b %d}: {len(closed)} trades, P&L {total:+,.2f}",
+            plan_html + f"<p>Month to date: <b>{month:+,.2f}</b> · bot total: <b>{self.ledger.total_realized_pnl():+,.2f}</b></p>" +
             table([{"Instrument": t["symbol"], "Side": t["direction"], "Qty": t["qty"], "Entry": t["entry_price"],
                     "Exit": t["exit_price"], "Reason": t["exit_reason"], "P&L $": t["realized_pnl"]} for t in closed])
             + f"<p>Signals today: {len(sigs)} (traded {sum(1 for s in sigs if s['action'].startswith('TRADED'))}, "

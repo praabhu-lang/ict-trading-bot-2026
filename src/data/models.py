@@ -26,6 +26,9 @@ class OptionQuote:
     open_interest: int = 0
     volume: int = 0
     iv: float = 0.0        # decimal, e.g. 0.18
+    theta: float = 0.0     # $ per share per day
+    vega: float = 0.0
+    last: float = 0.0
 
     @property
     def mid(self) -> float:
