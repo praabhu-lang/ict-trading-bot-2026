@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 import backtest_breakout_bot as bb
+import market_db
 from backtest_nnfx_options import bs, half_spread, implied_vol, option_bars, years
 from backtest_options import CPI, FOMC
 from backtest_vwap import load_env_file
@@ -49,6 +50,9 @@ CONFIG = {
     "delta": 0.475,
     "target_mult": 2.0,
     "use_stop": False,            # True: exit on a close back through the far side of the first candle
+    "adverse_bars": 0,            # >0: this many bars after entry, exit if the trade is >= adverse_x x first-candle range against us
+    "adverse_x": 0.4,
+    "opt_stop": 0.0,              # >0: stop on the option itself - sell when its 5-min low trades this fraction below the entry price
     "last_entry_slot": 11,        # breakout close by the 10:25 bar
     "exit_slot": 75,              # 15:45 bar
     "fee": 0.65,                  # $ per contract per side
@@ -92,10 +96,15 @@ def cached_bars(sym, start, end, h):
 
 
 def underlying(start, end):
-    key = (start, end)
+    key = (start, end, tuple(CONFIG['tickers']))
     if key not in _DAYS:
-        with contextlib.redirect_stdout(io.StringIO()):
-            raw = bb.load_bars(list(CONFIG['tickers']), start, end)
+        import market_db
+        first = start - timedelta(days=100)                             # same warm-up as bb.load_bars
+        if all(market_db.bars_cover(t, first, end) for t in CONFIG['tickers']):
+            raw = {t: market_db.bars_5m(t, first, end) for t in CONFIG['tickers']}
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                raw = bb.load_bars(list(CONFIG['tickers']), start, end)
         _DAYS[key] = {t: bb.prepare(raw[t]) for t in CONFIG['tickers']}
     return _DAYS[key]
 
@@ -132,12 +141,14 @@ def signal(v):
     return None
 
 
-def strike_for_delta(S, T, iv, cp, target):
-    grid = np.arange(round(S) - 15, round(S) + 16, 1.0)
+def strike_for_delta(S, T, iv, cp, target, strikes=None, atm=None):
+    """Strike whose delta is closest to `target`, from $1 strikes (ETFs) or the listed `strikes` (stocks)."""
+    atm = round(S) if atm is None else atm
+    grid = np.arange(atm - 15, atm + 16, 1.0) if strikes is None else strikes[np.abs(strikes / S - 1) < 0.15]
     otm = target <= 0.5                                                 # below 0.50 delta: at/out of the money; above: in the money
-    grid = grid[(grid >= round(S)) == otm] if cp == "C" else grid[(grid <= round(S)) == otm]
+    grid = grid[(grid >= atm) == otm] if cp == "C" else grid[(grid <= atm) == otm]
     if grid.size == 0:
-        grid = np.array([float(round(S))])
+        grid = np.array([float(atm)])
     sq = iv * np.sqrt(T)
     d1 = (np.log(S / grid) + (0.04 + 0.5 * iv * iv) * T) / sq
     delta = ndtr(d1) if cp == "C" else ndtr(d1) - 1
@@ -247,37 +258,49 @@ def run(start: date, end: date, verbose=False):
                         rows.append({"Date": d, "Ticker": t, "Side": side, "Note": "no credit spread"}); continue
                     equity += res["PnL ($)"]
                     rows.append({**res, "Equity": round(equity, 2), "Weekday": d.strftime('%a')}); continue
-                # expiry: first listed date >= dte days out
-                exp, atm_b = None, None
-                for extra in range(6):
-                    x = d + timedelta(days=CONFIG['dte'] + extra)
+                # expiry: first listed date >= dte days out. ETFs: $1 strikes, daily expiries tried in turn;
+                # stocks: the listed expiries and strikes (market_db.listings - stocks mostly have weeklies, $2.5/$5 strikes)
+                day_end = pd.Timestamp(d).tz_localize("America/New_York") + timedelta(hours=16)
+                listed = market_db.listings(t) if t not in ("SPY", "QQQ") else {}
+                occ = lambda x, k: f"{t}{x:%y%m%d}{cp}{int(round(k * 1000)):08d}"
+                if listed:
+                    cands = [(x, listed[x]) for x in sorted(listed) if x >= d + timedelta(days=CONFIG['dte'])][:2]
+                else:
+                    cands = [(d + timedelta(days=CONFIG['dte'] + e), None) for e in range(6)]
+                exp, atm_b, strikes, Ka = None, None, None, float(round(S0))
+                for x, ks in cands:
                     if x.weekday() > 4:
                         continue
-                    close_dt = pd.Timestamp(x).tz_localize("America/New_York") + timedelta(hours=16)
-                    b = cached_bars(f"{t}{x:%y%m%d}{cp}{round(S0) * 1000:08d}", e_ts - timedelta(minutes=5),
-                                    pd.Timestamp(d).tz_localize("America/New_York") + timedelta(hours=16), h)
+                    ka = float(ks[np.argmin(np.abs(ks - S0))]) if ks is not None else float(round(S0))
+                    b = cached_bars(occ(x, ka), e_ts - timedelta(minutes=5), day_end, h)
                     if not b[(b.index >= e_ts) & (b.index <= e_ts + timedelta(minutes=10))].empty:
-                        exp, atm_b = x, b
+                        exp, atm_b, strikes, Ka = x, b, ks, ka
                         break
                 if exp is None:
                     rows.append({"Date": d, "Ticker": t, "Side": side, "Note": "no option data"}); continue
                 exp_dt = pd.Timestamp(exp).tz_localize("America/New_York") + timedelta(hours=16)
                 a0 = atm_b[atm_b.index >= e_ts].iloc[0]
-                iv = implied_vol(a0.o, S0, round(S0), years(e_ts, exp_dt), cp)
-                K, dl = strike_for_delta(S0, years(e_ts, exp_dt), iv, cp, CONFIG['delta'])
-                ob = atm_b if K == round(S0) else cached_bars(f"{t}{exp:%y%m%d}{cp}{int(K) * 1000:08d}", e_ts - timedelta(minutes=5),
-                                                             pd.Timestamp(d).tz_localize("America/New_York") + timedelta(hours=16), h)
+                iv = implied_vol(a0.o, S0, Ka, years(e_ts, exp_dt), cp)
+                K, dl = strike_for_delta(S0, years(e_ts, exp_dt), iv, cp, CONFIG['delta'], strikes, Ka)
+                ob = atm_b if K == Ka else cached_bars(occ(exp, K), e_ts - timedelta(minutes=5), day_end, h)
                 first = ob[(ob.index >= e_ts) & (ob.index <= e_ts + timedelta(minutes=10))]
                 if first.empty or first.iloc[0].o < 0.05:
-                    ob, K, first = atm_b, float(round(S0)), atm_b[atm_b.index >= e_ts].iloc[:1]   # fall back to ATM
+                    ob, K, first = atm_b, Ka, atm_b[atm_b.index >= e_ts].iloc[:1]   # fall back to ATM
                 o_entry = first.iloc[0].o + half_spread(first.iloc[0].o)
                 # exits on the underlying's 5-minute closes
                 H, L = max(v['high'][:CONFIG['or_bars']]), min(v['low'][:CONFIG['or_bars']])
                 stop = L if s == 1 else H
                 target = S0 + s * CONFIG['target_mult'] * rng
-                x_i, why, best = len(v['close']) - 1, "EOD", 0.0
+                x_i, why, best, stop_fill = len(v['close']) - 1, "EOD", 0.0, None
+                stop_lvl = o_entry * (1 - CONFIG['opt_stop'])
                 for k in range(j, len(v['close'])):
                     c = v['close'][k]
+                    if CONFIG['opt_stop'] and v['ts'][k] in ob.index:
+                        ob_k = ob.loc[[v['ts'][k]]].iloc[0]
+                        if ob_k.l <= stop_lvl:                              # filled at the stop, or the open if it gapped through
+                            x_i, why, stop_fill = k, "Option stop", min(stop_lvl, ob_k.o); break
+                    if CONFIG['adverse_bars'] and k == j + CONFIG['adverse_bars'] and s * (c - S0) <= -CONFIG['adverse_x'] * rng:
+                        x_i, why = k, "Adverse"; break                      # went the wrong way right after entry
                     if CONFIG['be_after'] and best >= CONFIG['be_after'] * rng and s * (c - S0) <= 0:
                         x_i, why = k, "Breakeven"; break                    # was up >= be_after x range, came back
                     if CONFIG['time_stop_slot'] and v['slot'][k] == CONFIG['time_stop_slot'] and best < CONFIG['time_stop_progress'] * rng:
@@ -292,11 +315,13 @@ def run(start: date, end: date, verbose=False):
                 x_end = v['ts'][x_i] + timedelta(minutes=5)
                 done = ob[ob.index < x_end]
                 o_exit = done.iloc[-1].c if not done.empty else o_entry
+                if stop_fill is not None:
+                    o_exit = stop_fill
                 o_exit = max(o_exit - half_spread(o_exit), 0.0)
                 n = max(1, int(equity * CONFIG['premium_pct'] // (o_entry * 100))) if CONFIG['premium_pct'] else 1
                 pnl = ((o_exit - o_entry) * 100 - 2 * CONFIG['fee']) * n
                 equity += pnl
-                rows.append({"Date": d, "Setup": setup, "Ticker": t, "Side": side, "Option": f"{t} {exp} {K:.0f}{cp}", "Delta": round(dl, 2),
+                rows.append({"Date": d, "Setup": setup, "Ticker": t, "Side": side, "Option": f"{t} {exp} {K:g}{cp}", "Delta": round(dl, 2),
                              "Entry": e_ts.strftime('%H:%M'), "Exit": v['ts'][x_i].strftime('%H:%M'), "Why": why,
                              "Contracts": n, "Opt entry": round(o_entry, 2), "Opt exit": round(o_exit, 2), "PnL ($)": round(pnl, 2),
                              "Equity": round(equity, 2),

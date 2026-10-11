@@ -55,25 +55,10 @@ def half_spread(px):
 
 
 def option_bars(sym, start, end, headers):
-    """Real 5-minute bars for one option contract. Retries rate limits / server errors instead of returning empty."""
-    import time as _time
-    for attempt in range(8):
-        try:
-            r = requests.get(URL, headers=headers, timeout=30, params={
-                "symbols": sym, "timeframe": "5Min", "start": start.isoformat(), "end": end.isoformat(), "limit": 10000})
-            if r.status_code == 200:
-                break
-        except requests.RequestException:
-            pass
-        _time.sleep(min(2 ** attempt, 30))                               # 429 / 5xx / network: back off and retry
-    else:
-        raise RuntimeError(f"Alpaca option bars failed for {sym} after retries")
-    bars = r.json().get("bars", {}).get(sym) or []
-    if not bars:
-        return pd.DataFrame()
-    df = pd.DataFrame(bars)
-    df.index = pd.to_datetime(df.t).dt.tz_convert("America/New_York")
-    return df[["o", "h", "l", "c", "v"]]
+    """Real 5-minute bars for one option contract, from the local database (data/marketdb/market_data.db);
+    days not stored yet are downloaded from Alpaca once (with retries) and kept."""
+    import market_db
+    return market_db.option_bars(sym, start, end, headers)
 
 
 def run(log: pd.DataFrame, capital: float, dte: int, risk_pct: float, max_premium_pct: float):

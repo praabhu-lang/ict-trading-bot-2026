@@ -36,6 +36,9 @@ Guardrails / confluence (each switchable):
   vrp           short premium only when VIX > 20-day realized vol (premium is actually rich)
   dd_halt       no new entries while the account is more than dd_halt below its peak
 Sizing: max loss of each new position <= risk_pct of equity; all open max losses <= max_total_risk.
+  size_mode scales risk_pct by a volatility forecast known at that close (clipped to size_min..size_max):
+  fixed = 1 | garch = 1-year median GARCH vol / today's GARCH forecast | vix = 1-year median VIX / VIX |
+  garch_video = vol_target / GARCH forecast (capped at size_max, as in the "Nobel prize" video).
 """
 
 import argparse
@@ -66,7 +69,7 @@ CPI = [date(*d) for d in [
     (2024, 9, 11), (2024, 10, 10), (2024, 11, 13), (2024, 12, 11),
     (2025, 1, 15), (2025, 2, 12), (2025, 3, 12), (2025, 4, 10), (2025, 5, 13), (2025, 6, 11), (2025, 7, 15), (2025, 8, 12),
     (2025, 9, 11), (2025, 10, 24), (2025, 12, 18),
-    (2026, 1, 13), (2026, 2, 11), (2026, 3, 11), (2026, 4, 10), (2026, 5, 12), (2026, 6, 10), (2026, 7, 14), (2026, 8, 12),
+    (2026, 1, 13), (2026, 2, 13), (2026, 3, 11), (2026, 4, 10), (2026, 5, 12), (2026, 6, 10), (2026, 7, 14), (2026, 8, 12),
     (2026, 9, 11), (2026, 10, 14)]]
 EVENTS = set(FOMC) | set(CPI)
 
@@ -90,6 +93,8 @@ CONFIG = {
     "fast_trend": "none",         # none | 50: bullish trades need SPY > 50-day SMA | 50over200: also 50-day > 200-day
     "bear_side": False,           # when a bullish trade is blocked and SPY < 50-day SMA: sell a call spread instead
     "loss_pause": 0,              # >0: after this many bullish losses in a row, no bullish entries until SPY > 50-day SMA
+    "size_mode": "fixed",         # fixed | garch | vix | garch_video (see Sizing)
+    "size_min": 0.25, "size_max": 1.5, "vol_target": 15.0,
 }
 
 SHORT_PREMIUM = {"put_spread", "call_spread", "iron_condor", "iron_fly", "short_strangle", "hybrid"}
@@ -97,10 +102,21 @@ SHORT_PREMIUM = {"put_spread", "call_spread", "iron_condor", "iron_fly", "short_
 
 # ------------------------------------------------------------------------------------------- data
 def load_data() -> pd.DataFrame:
-    raw = pd.read_pickle(DATA).ffill().dropna()
+    """Daily closes from data/marketdb/market_data.db (src/market_db.py), else the older pickle."""
+    try:
+        import market_db
+        raw = market_db.daily(["SPY", "^VIX", "^VIX9D", "^VIX3M", "^IRX"], "close")
+        garch = market_db.vol_forecast("SPY")
+    except Exception:
+        raw, garch = pd.read_pickle(DATA), pd.Series(dtype=float)
+    raw = raw[raw.index >= "2014-01-01"].ffill().dropna()
     df = pd.DataFrame({"S": raw["SPY"], "vix": raw["^VIX"], "vix9": raw["^VIX9D"], "vix3m": raw["^VIX3M"],
                        "r": raw["^IRX"] / 100})
     df.index = df.index.date
+    # GARCH forecast for the next session = known at today's close
+    df["garch"] = garch.reindex(df.index).shift(-1).fillna(garch.iloc[-1] if len(garch) else np.nan) if len(garch) else df.vix
+    df["garch_med"] = df.garch.rolling(252, min_periods=60).median()
+    df["vix_med"] = df.vix.rolling(252, min_periods=60).median()
     df["sma50"] = df.S.rolling(50).mean()
     df["sma200"] = df.S.rolling(200).mean()
     df["rv20"] = np.log(df.S).diff().rolling(20).std() * math.sqrt(252) * 100
@@ -262,6 +278,20 @@ def guard(df, i, name, equity, peak):
     return name
 
 
+def size_mult(row) -> float:
+    """Volatility-targeting multiplier on risk_pct (1.0 = fixed sizing)."""
+    m, c = CONFIG['size_mode'], CONFIG
+    if m == "garch":
+        x = row.garch_med / row.garch
+    elif m == "vix":
+        x = row.vix_med / row.vix
+    elif m == "garch_video":
+        return min(c['size_max'], c['vol_target'] / row.garch)
+    else:
+        return 1.0
+    return float(np.clip(x, c['size_min'], c['size_max']))
+
+
 # ---------------------------------------------------------------------------------------- engine
 _STATE = {"pause": False, "streak": 0}
 
@@ -325,7 +355,7 @@ def run(start: date, end: date, df: pd.DataFrame = None) -> dict:
             ecost = sum(cost(p) for p in prices)
             unit_loss = max_loss_per_unit(legs, val, row) + ecost
             open_risk = sum(p['risk'] for p in positions)
-            budget = min(equity * c['risk_pct'], equity * c['max_total_risk'] - open_risk)
+            budget = min(equity * c['risk_pct'] * size_mult(row), equity * c['max_total_risk'] - open_risk)
             n = int(budget // (unit_loss * 100)) if unit_loss > 0 else 0
             if n > 0 and abs(val) > 0.05:
                 positions.append({"name": todo, "legs": legs, "entry_val": val, "entry_cost": ecost, "n": n,

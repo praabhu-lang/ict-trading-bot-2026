@@ -56,3 +56,21 @@ were backwards: reversals that **fade** the gap did better. Volume spikes above 
   but its value can only be measured going forward from live data.
 - The **Simple Tamil Traders** VRZ definition: no public specification was found; the bot's VRZ zones are
   the prior-day and opening-range extreme candles (wick to body).
+
+## First-candle SPY/QQQ options studies (Oct 9-11, 2026)
+
+Scripts in `src/` (research only), data in `data/marketdb/market_data.db` (`src/market_db.py`), outputs in `results/`
+(not committed). Real Alpaca option prices; each period from $10,000; capped sizing unless noted.
+
+| Study | Result |
+|---|---|
+| First-candle rule (trend + candle colour, 3x target, break-even after 1x, no-progress 10:00 CT) | 2026 strong (Jan 2-Jun 3 and Jun 4-Oct 9 both profitable), 2025 lost, 2024 about flat |
+| Smart rule (`backtest_selector.py`): SPY only with the gap, 0DTE 0.30 delta on gap days, else QQQ next-day 0.40 delta, grades 7%/5% | +$11.2k / +$10.3k in the two 2026 halves, 2025 -$6.4k, 2024 +$2.0k; best of 140 ticker x expiry x size combinations |
+| GARCH / VIX volatility-targeted sizing (`backtest_volsize.py`) | Hurts: the big wins come on high-volatility days |
+| Option-premium stop losses (`backtest_risk_stops.py`) | Hurt: a -30% stop hit 44 of 52 0DTE trades |
+| Early adverse exits, stocks on sideways days, entry filters (`analyze_losers.py`, `backtest_stocks_sideways.py`) | No entry feature separates losers in every period; stocks lose (7% reach the target) |
+| FOMC-adjacent days | All 9 index trades on the session before/after FOMC lost -> skipped in smart mode |
+| Health monitor (`backtest_health.py`) | Profile from the last 50 signals' option return: cuts a 2025-type year from -$6.4k to -$1.0k, costs early-2026 profit |
+| Compounding Monte Carlo (`sim_compounding.py`) | 10-14% premium + half-size kill switch: ~1/3 chance of $50k in a year, ~3% chance of falling to $3k |
+
+These became `fc_mode = "smart"` in `src/strategy/first_candle.py` (paper first).
