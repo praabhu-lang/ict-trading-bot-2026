@@ -86,6 +86,8 @@ def _get(url, headers, params):
             r = requests.get(url, headers=headers, params=params, timeout=30)
             if r.status_code == 200:
                 return r.json()
+            if 400 <= r.status_code < 500 and r.status_code != 429:   # retrying won't fix a rejected request
+                raise RuntimeError(f"Alpaca {r.status_code} {r.text[:120]}: {params.get('symbols', '')[:60]}")
         except requests.RequestException:
             pass
         _time.sleep(min(2 ** attempt, 30))
@@ -203,7 +205,9 @@ def fetch_options(symbols, d0: date, d1: date, headers):
     """Download 5-minute bars for up to 100 contracts over d0..d1 (ET days) and mark those days as fetched."""
     cids = _cids(symbols)
     a = pd.Timestamp(d0, tz=ET).isoformat()
-    b = (pd.Timestamp(d1, tz=ET) + timedelta(hours=23, minutes=59)).isoformat()
+    # the free data plan rejects anything newer than 15 minutes (403 "OPRA agreement is not signed")
+    b = min(pd.Timestamp(d1, tz=ET) + timedelta(hours=23, minutes=59),
+            pd.Timestamp.now(tz=ET) - timedelta(minutes=16)).isoformat()
     params, n = {"symbols": ",".join(symbols), "timeframe": "5Min", "start": a, "end": b, "limit": 10000}, 0
     while True:
         js = _get(OPT_URL, headers, params)
