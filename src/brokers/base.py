@@ -1,6 +1,7 @@
 """Broker interface. Every trading platform implements this; the engine only talks to it."""
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -43,10 +44,24 @@ class OrderStatus:
         return self.status in {"filled", "canceled", "cancelled", "rejected", "expired", "replaced"}
 
 
-def option_tick(price: float, symbol: str) -> float:
+def tick_size(price: float, symbol: str) -> float:
     root = "".join(ch for ch in symbol[:6] if ch.isalpha())
-    tick = 0.01 if (root in PENNY_OPTION_ROOTS or price < 3.0) else 0.05
+    return 0.01 if (root in PENNY_OPTION_ROOTS or price < 3.0) else 0.05
+
+
+def option_tick(price: float, symbol: str) -> float:
+    tick = tick_size(price, symbol)
     return round(round(price / tick) * tick, 2)
+
+
+def floor_tick(price: float, symbol: str) -> float:
+    tick = tick_size(price, symbol)
+    return round(math.floor(price / tick + 1e-9) * tick, 2)
+
+
+def ceil_tick(price: float, symbol: str) -> float:
+    tick = tick_size(price, symbol)
+    return round(math.ceil(price / tick - 1e-9) * tick, 2)
 
 
 class Broker(ABC):

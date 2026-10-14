@@ -32,7 +32,7 @@ from .news_agent import NewsAgent
 from .risk_agent import Gate, account_gate, flatten_time, open_risk, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
-URGENT_EXITS = {"STOP_LOSS", "EOD_FLATTEN", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}
+URGENT_EXITS = {"STOP_LOSS", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}   # EOD has 15 min: it works the mid first
 SCAN_DELAY_SECONDS = 20  # let the data vendor finalize the bar that just closed
 
 
