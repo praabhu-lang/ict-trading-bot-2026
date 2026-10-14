@@ -45,9 +45,12 @@ def signal_table() -> pd.DataFrame:
     with contextlib.redirect_stdout(io.StringIO()):
         for e, dte in (("0", 0), ("1", 1)):
             t = vs.trades_1lot({"dte": dte, "scan": "both", "tickers": ("SPY", "QQQ")})
-            out[e] = t.set_index(["Date", "Ticker"])[["Side", "cost1", "pnl1", "ret", "Rule ok", "Gap %", "RVOL 1st"]]
+            out[e] = t.set_index(["Date", "Ticker"])[["Side", "cost1", "pnl1", "ret", "Rule ok", "Gap %", "RVOL 1st",
+                                                       "Option", "Entry", "Exit", "Why"]]
         days = orb.underlying(vs.START, vs.END)
-    s = out["0"].join(out["1"][["cost1", "pnl1", "ret"]], how="outer", lsuffix="_0", rsuffix="_1")
+    per_expiry = ["cost1", "pnl1", "ret", "Option", "Entry", "Exit", "Why"]
+    s = out["0"][[c for c in out["0"] if c not in per_expiry]].join(out["0"][per_expiry].add_suffix("_0"), how="outer")
+    s = s.join(out["1"][per_expiry].add_suffix("_1"), how="outer")
     for c in ("Side", "Rule ok", "Gap %", "RVOL 1st"):                  # 1DTE-only rows: take features from the 1DTE run
         s[c] = s[c].fillna(out["1"][c].reindex(s.index))
     s = s.reset_index()
@@ -59,7 +62,7 @@ def signal_table() -> pd.DataFrame:
     return s.sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
 
-def run(s, ticker_rule, expiry_rule, size_rule):
+def run(s, ticker_rule, expiry_rule, size_rule, scale=1.0):
     hist = {("SPY", "0"): [], ("SPY", "1"): [], ("QQQ", "0"): [], ("QQQ", "1"): []}   # past returns per $ by ticker/expiry
     taken = []                                                          # past option returns of trades actually taken
     rows = []
@@ -112,9 +115,11 @@ def run(s, ticker_rule, expiry_rule, size_rule):
                     pct = 0.05
             else:
                 pct = float(size_rule) / 100
+            pct *= scale
             cost, pnl = r[f"cost1_{e}"], r[f"pnl1_{e}"]
             n = max(1, int(CAP * pct // cost))
-            rows.append({"Date": d, "Ticker": tk, "Expiry": f"{e}DTE", "pct": pct, "n": n, "pnl": n * pnl, "cost1": cost, "pnl1": pnl, "ret": r[f"ret_{e}"]})
+            rows.append({"Date": d, "Ticker": tk, "Expiry": f"{e}DTE", "pct": pct, "n": n, "pnl": n * pnl, "cost1": cost, "pnl1": pnl, "ret": r[f"ret_{e}"],
+                         "Option": r[f"Option_{e}"], "Entry": r[f"Entry_{e}"], "Exit": r[f"Exit_{e}"], "Why": r[f"Why_{e}"]})
             taken.append(r[f"ret_{e}"])
         for k in sig:                                                   # all of today's outcomes become history
             for x in ("0", "1"):

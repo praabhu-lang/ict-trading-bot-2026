@@ -63,7 +63,7 @@ def session_stats() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def profile_trades():
+def profile_trades(scale=1.0):
     """Daily P&L per profile (capped $10k sizing) and the smart rule's shadow option returns."""
     tabs, saved = {}, sel.vs.RULES["delta"]
     with contextlib.redirect_stdout(io.StringIO()):
@@ -72,10 +72,10 @@ def profile_trades():
             tabs[dl] = sel.signal_table().set_index(["Date", "Ticker"])
     sel.vs.RULES["delta"] = saved                                       # leave the shared rules as they were
     mix = tabs[0.30].copy()
-    for c in ("cost1_1", "pnl1_1", "ret_1"):
+    for c in ("cost1_1", "pnl1_1", "ret_1", "Option_1", "Entry_1", "Exit_1", "Why_1"):
         mix[c] = tabs[0.40][c].reindex(mix.index)
     mix = mix.reset_index()
-    smart = sel.run(mix, "spy_gap", "gap0dte", "grade")
+    smart = sel.run(mix, "spy_gap", "gap0dte", "grade", scale)
     safer = sel.run(mix, "spy_gap", "1dte", "grade")
     d = mix[(mix.Ticker == "QQQ") & mix.gap_ok & mix.pnl1_1.notna()]
     defensive = pd.DataFrame({"Date": d.Date, "pnl": [max(1, int(CAP * 0.02 // c)) * p for c, p in zip(d.cost1_1, d.pnl1_1)]})

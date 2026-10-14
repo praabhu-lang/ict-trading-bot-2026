@@ -59,6 +59,11 @@ CONFIG = {
     "capital": 10000.0,
     "premium_pct": 0.0,           # >0: compound - spend this share of current equity on premium (min 1 contract); 0 = always 1 contract
     "be_after": 0.0,              # >0: once the underlying has moved this x first-candle range our way, exit on a close back at the entry
+    "be_on_option": False,        # True: the break-even exit fires on the option's close back at its entry premium instead
+    "trail_after": 0.0,           # >0: once the underlying has moved this x range our way, exit on a close `trail_x` x range off its best
+    "trail_x": 0.5,
+    "opt_trail_after": 0.0,       # >0: once the option's high is this fraction above entry, exit on a close `opt_trail_pct` below its peak
+    "opt_trail_pct": 0.25,
     "time_stop_slot": 0,          # >0: at this bar, exit if the trade has not yet moved `time_stop_progress` x range our way
     "time_stop_progress": 0.5,
     "structure": "debit",         # debit: buy the call/put | credit: sell a 0DTE credit spread in the signal direction
@@ -291,7 +296,7 @@ def run(start: date, end: date, verbose=False):
                 H, L = max(v['high'][:CONFIG['or_bars']]), min(v['low'][:CONFIG['or_bars']])
                 stop = L if s == 1 else H
                 target = S0 + s * CONFIG['target_mult'] * rng
-                x_i, why, best, stop_fill = len(v['close']) - 1, "EOD", 0.0, None
+                x_i, why, best, stop_fill, opt_peak = len(v['close']) - 1, "EOD", 0.0, None, 0.0
                 stop_lvl = o_entry * (1 - CONFIG['opt_stop'])
                 for k in range(j, len(v['close'])):
                     c = v['close'][k]
@@ -301,11 +306,21 @@ def run(start: date, end: date, verbose=False):
                             x_i, why, stop_fill = k, "Option stop", min(stop_lvl, ob_k.o); break
                     if CONFIG['adverse_bars'] and k == j + CONFIG['adverse_bars'] and s * (c - S0) <= -CONFIG['adverse_x'] * rng:
                         x_i, why = k, "Adverse"; break                      # went the wrong way right after entry
-                    if CONFIG['be_after'] and best >= CONFIG['be_after'] * rng and s * (c - S0) <= 0:
-                        x_i, why = k, "Breakeven"; break                    # was up >= be_after x range, came back
+                    if CONFIG['be_after'] and best >= CONFIG['be_after'] * rng:
+                        back = (ob.loc[[v['ts'][k]]].iloc[0].c <= o_entry if v['ts'][k] in ob.index else False) \
+                            if CONFIG['be_on_option'] else s * (c - S0) <= 0
+                        if back:
+                            x_i, why = k, "Breakeven"; break                # was up >= be_after x range, came back
                     if CONFIG['time_stop_slot'] and v['slot'][k] == CONFIG['time_stop_slot'] and best < CONFIG['time_stop_progress'] * rng:
                         x_i, why = k, "No progress"; break
                     best = max(best, s * ((v['high'][k] if s == 1 else v['low'][k]) - S0))
+                    if CONFIG['trail_after'] and best >= CONFIG['trail_after'] * rng and s * (c - S0) <= best - CONFIG['trail_x'] * rng:
+                        x_i, why = k, "Trail"; break                        # gave back trail_x x range from the best
+                    if CONFIG['opt_trail_after'] and v['ts'][k] in ob.index:
+                        ob_k = ob.loc[[v['ts'][k]]].iloc[0]
+                        opt_peak = max(opt_peak, ob_k.h)
+                        if opt_peak >= o_entry * (1 + CONFIG['opt_trail_after']) and ob_k.c <= opt_peak * (1 - CONFIG['opt_trail_pct']):
+                            x_i, why = k, "Option trail"; break             # premium fell opt_trail_pct off its peak
                     if CONFIG['use_stop'] and s * (c - stop) < 0:
                         x_i, why = k, "Stop"; break
                     if s * (c - target) >= 0:
@@ -317,7 +332,12 @@ def run(start: date, end: date, verbose=False):
                 o_exit = done.iloc[-1].c if not done.empty else o_entry
                 if stop_fill is not None:
                     o_exit = stop_fill
+                o_mid_out = o_exit
                 o_exit = max(o_exit - half_spread(o_exit), 0.0)
+                o_mid_in, S_out = first.iloc[0].o, v['close'][x_i]
+                t_in, t_out = years(e_ts, exp_dt), years(x_end, exp_dt)
+                iv_in = implied_vol(o_mid_in, S0, K, t_in, cp)
+                iv_out = implied_vol(o_mid_out, S_out, K, t_out, cp) if stop_fill is None else np.nan
                 n = max(1, int(equity * CONFIG['premium_pct'] // (o_entry * 100))) if CONFIG['premium_pct'] else 1
                 pnl = ((o_exit - o_entry) * 100 - 2 * CONFIG['fee']) * n
                 equity += pnl
@@ -332,7 +352,11 @@ def run(start: date, end: date, verbose=False):
                              "RVOL 1st": round(v['rvol'][0], 2), "Break slot": int(v['slot'][i]),
                              "Trend dist %": round((lv0['PrevClose'] / lv0['SMA20'] - 1) * 100, 2),
                              "Max fav %": round(s * (max(v['high'][j:x_i + 1]) if s == 1 else min(v['low'][j:x_i + 1])) / S0 * 100 - s * 100, 3),
-                             "Weekday": d.strftime('%a')})
+                             "Weekday": d.strftime('%a'),
+                             # for splitting the option P&L into move / time decay / IV change
+                             "Strike": K, "CP": cp, "S in": round(S0, 4), "S out": round(float(S_out), 4),
+                             "Mid in": round(float(o_mid_in), 4), "Mid out": round(float(o_mid_out), 4),
+                             "T in": t_in, "T out": t_out, "IV in": round(iv_in, 4), "IV out": round(iv_out, 4)})
         finally:
             CONFIG.update(saved)
     return pd.DataFrame(rows), equity

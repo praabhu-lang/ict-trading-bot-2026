@@ -231,7 +231,7 @@ st.caption("First 5-minute candle on SPY/QQQ options · " + ("🧪 paper" if set
            + f" · {settings.strategy} / {settings.fc_mode}")
 (tab_today, tab_perf, tab_trades, tab_levels, tab_how, tab_research, tab_bt, tab_set, tab_plat, tab_log) = st.tabs(
     ["🏠 Today", "📈 Performance", "🧾 Trades", "📡 Signals & levels", "📘 How it works", "🔬 Research",
-     "🧪 Backtest (VRZ)", "⚙️ Settings", "🔌 Platforms", "🪵 Logs"])
+     "🧪 Backtest (first candle)", "⚙️ Settings", "🔌 Platforms", "🪵 Logs"])
 
 
 def money(x) -> str:
@@ -389,86 +389,99 @@ with tab_levels:
     else:
         st.info(f"No VRZ signals today (a signal needs ≥{settings.min_convergence}% convergence).")
 
+@st.cache_resource(ttl=6 * 3600, show_spinner=False)
+def market_db_path(day: str) -> str:
+    """Today's copy of the nightly market database (~600 MB, data/marketdb), downloaded once per 6 hours."""
+    import glob
+
+    name = f"marketdb/market_data_{day}.db"
+    if not store.download("marketdb/market_data.db", name):
+        raise RuntimeError("market database not found in the state bucket (the nightly job builds it)")
+    for old in glob.glob(store.local_path("marketdb/market_data_*.db")):
+        if not old.endswith(f"_{day}.db"):
+            os.remove(old)
+    return store.local_path(name)
+
+
 with tab_bt:
-    st.caption("Replays 5-minute bars through the exact live rules (VRZ, convergence, gates, sizing, exits). "
-               "Real Alpaca option prices are used where they exist (Feb 2024+).")
+    st.caption("Replays the live **smart first-candle** rule on SPY/QQQ with real Alpaca option prices (Feb 2024+), "
+               "the same simulation as the Research page. Capped sizing: premium = capital × grade % × size scale "
+               "(no compounding). The health monitor and kill switch are not applied.")
     with st.form("bt"):
         c = st.columns(4)
-        bt_tickers = c[0].multiselect("Tickers", settings.universe, default=["SPY", "QQQ"])
-        bt_start = c[1].date_input("Start", today - timedelta(days=60))
-        bt_end = c[2].date_input("End", today - timedelta(days=1))
-        bt_cap = c[3].number_input("Starting capital", value=10_000.0, step=1_000.0)
+        bt_start = c[0].date_input("Start", date(2026, 6, 4), min_value=date(2024, 2, 5))
+        bt_end = c[1].date_input("End", today - timedelta(days=1))
+        bt_cap = c[2].number_input("Starting capital", value=10_000.0, step=1_000.0)
+        bt_scale = c[3].number_input("Size scale (live phase 1 = 2.0)", 0.25, 4.0, 1.0, 0.25,
+                                     help="x the grade premium %: 7% QQQ with gap, 5% otherwise")
         c = st.columns(5)
-        bt_conv = c[0].slider("Min convergence %", 50, 100, settings.min_convergence, 5)
-        bt_risk = c[1].number_input("Risk per trade %", 0.5, 10.0, settings.risk_per_trade_pct * 100, 0.5)
-        bt_pool = c[2].number_input("Options pool %", 5.0, 50.0, settings.options_allocation_pct * 100, 5.0)
-        bt_stop = c[3].number_input("Option stop %", 10.0, 90.0, settings.option_stop_pct * 100, 5.0)
-        bt_tgt = c[4].number_input("Option target %", 10.0, 500.0, settings.option_target_pct * 100, 10.0)
+        bt_tgt = c[0].number_input("Target (x candle range)", 0.5, 10.0, settings.fc_target_mult, 0.5)
+        bt_be = c[1].number_input("Stop to entry after (x range, 0 = off)", 0.0, 5.0, settings.fc_breakeven_after, 0.25)
+        bt_np = c[2].number_input("11:00 no-progress (x range, 0 = off)", 0.0, 3.0, settings.fc_no_progress_frac, 0.25)
+        bt_tr = c[3].number_input("Trail starts after (x range, 0 = off)", 0.0, 5.0, 0.0, 0.25)
+        bt_trx = c[4].number_input("Trail gives back (x range)", 0.25, 3.0, 0.5, 0.25)
         go_bt = st.form_submit_button("Run backtest", type="primary")
-    if go_bt and bt_tickers:
-        from src.backtest.data import HistoricalData
-        from src.backtest.engine import Backtester
+    if go_bt:
+        from src import fc_backtest
 
-        bt_settings = Settings.from_overrides({**settings.to_dict(), "min_convergence": bt_conv,
-                                               "risk_per_trade_pct": bt_risk / 100, "options_allocation_pct": bt_pool / 100,
-                                               "option_stop_pct": bt_stop / 100, "option_target_pct": bt_tgt / 100})
-        with st.spinner("Loading bars and replaying…"):
-            data = HistoricalData()
-            bars = {t: data.stock_bars(t, bt_start, bt_end) for t in bt_tickers}
-            spy = bars["SPY"] if "SPY" in bars else data.stock_bars("SPY", bt_start, bt_end)
-            result = Backtester(bt_settings, bt_cap, bars, data.option_bars, spy_bars=spy).run(bt_start, bt_end)
-        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:4]
-        record = {"id": run_id, "params": {"tickers": bt_tickers, "start": str(bt_start), "end": str(bt_end),
-                                           "capital": bt_cap, "min_convergence": bt_conv, "risk_pct": bt_risk,
-                                           "pool_pct": bt_pool, "stop_pct": bt_stop, "target_pct": bt_tgt},
-                  "stats": result["stats"], "sources": data.source_used,
-                  "equity": result["equity"].astype(str).to_dict("records"),
-                  "trades": result["trades"].astype(str).to_dict("records")}
-        store.update_json(f"backtests/{run_id}.json", lambda _: record)
-        store.update_json("backtests/index.json", lambda idx: ([{"id": run_id, **record["params"],
-                                                                  "return_pct": result["stats"].get("total_return_pct"),
-                                                                  "trades": result["stats"].get("trades")}] + (idx or []))[:50],
-                          default=[])
-        ss["bt_last"] = run_id
+        exits = {"target_mult": bt_tgt, "be_after": bt_be, "time_stop_progress": bt_np, "trail_after": bt_tr,
+                 "trail_x": bt_trx}
+        if bt_np == 0:
+            exits["time_stop_slot"] = 0
+        try:
+            with st.spinner("Loading the market database and replaying… (first run of the day downloads ~600 MB)"):
+                res = fc_backtest.run(market_db_path(today.isoformat()), bt_start, bt_end, bt_cap, bt_scale, exits)
+        except Exception as exc:  # noqa: BLE001 - show it, keep the page alive
+            st.error(f"Backtest failed: {exc}")
+            res = None
+        if res is not None:
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:4]
+            params = {"start": str(bt_start), "end": str(bt_end), "capital": bt_cap, "scale": bt_scale,
+                      "target": bt_tgt, "breakeven": bt_be, "no_progress": bt_np, "trail_after": bt_tr, "trail_x": bt_trx}
+            stats = {k: (v.item() if hasattr(v, "item") else v) for k, v in res["stats"].items()}
+            record = {"id": run_id, "params": params, "stats": stats,
+                      "equity": res["equity"].astype(str).to_dict("records"),
+                      "by_reason": json.loads(res["by_reason"].to_json(orient="records")),
+                      "trades": res["trades"].astype(str).to_dict("records")}
+            store.update_json(f"fc_backtests/{run_id}.json", lambda _: record)
+            store.update_json("fc_backtests/index.json",
+                              lambda idx: ([{"id": run_id, **params, "net": stats.get("net $"),
+                                             "trades": stats.get("trades")}] + (idx or []))[:50], default=[])
+            ss["bt_last"] = run_id
 
-    runs = store.read_json("backtests/index.json", []) or []
+    runs = store.read_json("fc_backtests/index.json", []) or []
     if runs:
-        labels = {r["id"]: f"{r['id']} · {','.join(r['tickers'])} {r['start']}→{r['end']} · "
-                           f"{r.get('return_pct')}% · {r.get('trades')} trades" for r in runs}
+        labels = {r["id"]: f"{r['start']}→{r['end']} · target {r['target']}x · BE {r['breakeven']}x · "
+                           f"trail {r['trail_after']}x/{r['trail_x']}x · scale {r['scale']} · "
+                           f"net ${r.get('net') or 0:,} · {r.get('trades')} trades · {r['id']}" for r in runs}
         chosen = st.selectbox("Saved runs", list(labels), format_func=labels.get,
                               index=list(labels).index(ss["bt_last"]) if ss.get("bt_last") in labels else 0)
-        rec = store.read_json(f"backtests/{chosen}.json", {})
+        rec = store.read_json(f"fc_backtests/{chosen}.json", {})
         stats = rec.get("stats", {})
         if stats.get("trades"):
             m = st.columns(6)
-            m[0].metric("Return", f"{stats['total_return_pct']}%")
+            m[0].metric("Net", f"${stats['net $']:,}", f"{stats.get('return %')}%")
             m[1].metric("Trades", stats["trades"])
-            m[2].metric("Win rate", f"{stats['win_rate_pct']}%")
-            m[3].metric("Profit factor", stats.get("profit_factor"))
-            m[4].metric("Max drawdown", f"{stats['max_drawdown_pct']}%")
-            m[5].metric("Model-priced options", stats.get("model_priced_option_trades"))
+            m[2].metric("Win rate", f"{stats['win %']}%")
+            m[3].metric("Max drawdown", f"${stats['max DD $']:,}")
+            m[4].metric("Worst trade", f"${stats['worst $']:,}")
+            m[5].metric("QQQ / 0DTE", f"{stats['QQQ %']}% / {stats['0DTE %']}%")
             eq = pd.DataFrame(rec["equity"])
             eq["equity"] = eq["equity"].astype(float)
-            fig = go.Figure(go.Scatter(x=pd.to_datetime(eq["date"]), y=eq["equity"], mode="lines",
-                                       line=dict(color=SERIES, width=2),
+            fig = go.Figure(go.Scatter(x=pd.to_datetime(eq["Date"]), y=eq["equity"], mode="lines+markers",
+                                       line=dict(color=SERIES, width=2), marker=dict(size=4),
                                        hovertemplate="%{x|%b %d, %Y}<br>Equity $%{y:,.2f}<extra></extra>"))
             fig.add_hline(y=float(rec["params"]["capital"]), line=dict(color=MUTED, width=1, dash="dot"),
                           annotation_text="starting capital", annotation_font_color=MUTED)
-            fig.update_layout(title="Backtest equity (end of day)", height=340, showlegend=False,
+            fig.update_layout(title="Backtest equity (after each trade)", height=340, showlegend=False,
                               margin=dict(l=10, r=10, t=40, b=10), yaxis=dict(tickprefix="$"), hovermode="x unified")
             st.plotly_chart(fig, width="stretch")
-            c1, c2 = st.columns(2)
-            c1.dataframe(pd.DataFrame(stats.get("by_reason", [])), hide_index=True, width="stretch")
-            c2.dataframe(pd.DataFrame(stats.get("by_ticker", [])), hide_index=True, width="stretch")
-            st.dataframe(pd.DataFrame(rec["trades"]), hide_index=True, width="stretch")
+            st.dataframe(pd.DataFrame(rec.get("by_reason", [])), hide_index=True, width="stretch")
+            cols = ["Date", "Ticker", "Expiry", "Option", "Entry", "Exit", "Why", "pct", "n", "pnl", "ret", "equity"]
+            tr = pd.DataFrame(rec["trades"])
+            st.dataframe(tr[[c for c in cols if c in tr]].iloc[::-1], hide_index=True, width="stretch")
         else:
             st.info("That run produced no trades.")
-        st.caption("Data: " + ", ".join(f"{k}: {v}" for k, v in rec.get("sources", {}).items()))
-        from src.backtest.engine import ASSUMPTIONS
-
-        with st.expander("Backtest assumptions"):
-            for a in ASSUMPTIONS:
-                st.markdown(f"- {a}")
 
 with tab_set:
     st.caption("Saved to control.json; the engine applies changes within one cycle (~30 s). "
