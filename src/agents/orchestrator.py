@@ -6,6 +6,7 @@ Each cycle (every ~30 s):
   3. at each new 5-minute bar: MarketAnalystAgent scans the universe, RiskAgent gates,
      ExecutionAgent enters the single best signal (option ~2 weeks out, or stock fallback)
   4. FOMC decision days: the paper-only SPX reaction trade (simulated, never sent to the broker)
+     and, while first-candle is the strategy, a paper-only VRZ universe scan (simulated stock trades)
   5. heartbeat/status written for the dashboard
 """
 from __future__ import annotations
@@ -88,7 +89,8 @@ class TradingEngine:
         for key in ("gates", "account_equity", "trading_equity", "buying_power", "bot_day_pnl"):
             if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
                 self.status[key] = previous[key]
-        for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now)):
+        for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now),
+                     lambda: self.vrz_paper_manage(now)):
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - one failing step must not stop exit management
@@ -315,7 +317,14 @@ class TradingEngine:
             self.status["gates"] = ["Market closed"]
             return 0
         if self.s.strategy == fc.STRATEGY_TAG:
-            return self.first_candle_scan(now, trade)
+            try:
+                return self.first_candle_scan(now, trade)
+            finally:                                    # runs even if the first-candle scan raised
+                if trade and self.s.vrz_paper:
+                    try:
+                        self.vrz_paper_scan(now)
+                    except Exception as exc:  # noqa: BLE001 - the paper scan must never stop the real strategy
+                        self._error("VRZ paper scan failed", exc)
         if trade:
             gate = self.gates(now)
             self.status["gates"] = gate.reasons or ["OPEN - entries allowed"]
@@ -323,34 +332,7 @@ class TradingEngine:
             gate = Gate(True, [])
         earnings = set(self.ledger.get_kv(f"earnings:{now.date().isoformat()}", []) or [])
         held = {t["underlying"] for t in self.ledger.open_trades()}
-
-        candidates = []
-        failures = analysed = 0
-        for ticker in self.s.universe:
-            try:
-                analysis, chain, news = self.analyst.analyze(ticker, now, self.s, require_chain=trade)
-            except MarketDataUnavailable as exc:
-                failures += 1
-                self.market.health[f"scan:{ticker}"] = str(exc)[:200]
-                continue
-            if not analysis:
-                continue
-            analysed += 1
-            snap = analysis.snapshot
-            sig = analysis.signal
-            self.ledger.upsert_levels(
-                now.date(), ticker, spot=snap["spot"], prior_close=snap["prior_close"], gap_pct=snap["gap_pct"],
-                vwap=snap["vwap"], poc=snap["poc"], vah=snap["vah"], val=snap["val"], rvol=snap["rvol"],
-                net_gex=snap.get("net_gex"), gamma_flip=snap.get("gamma_flip"), call_wall=snap.get("call_wall"),
-                put_wall=snap.get("put_wall"), gex_regime=snap.get("gex_regime"), zones=snap["zones"],
-                best_score=sig.score if sig else snap.get("candidate_score"), news=(news.headlines[:3] if news else None),
-            )
-            if sig and sig.score >= self.s.min_convergence:
-                candidates.append((sig, chain))
-
-        self.ledger.set_kv("last_scan", {"ts": now.isoformat(timespec="seconds"), "trade": trade,
-                                         "analysed": analysed, "failed": failures,
-                                         "schwab": self.market.health.get("chains:schwab", "")})
+        candidates, analysed, failures = self._vrz_candidates(now, require_chain=trade)
         if failures == len(self.s.universe):
             if trade:
                 self._data_outage(now)
@@ -376,6 +358,37 @@ class TradingEngine:
             if self._enter(sig, chain, now):
                 return analysed  # one new position per cycle
         return analysed
+
+    def _vrz_candidates(self, now: datetime, require_chain: bool) -> tuple[list, int, int]:
+        """Analyse the universe (VRZ sweep-and-reject); refresh levels. (candidates >= min_convergence, analysed, failed)."""
+        candidates = []
+        failures = analysed = 0
+        for ticker in self.s.universe:
+            try:
+                analysis, chain, news = self.analyst.analyze(ticker, now, self.s, require_chain=require_chain)
+            except MarketDataUnavailable as exc:
+                failures += 1
+                self.market.health[f"scan:{ticker}"] = str(exc)[:200]
+                continue
+            if not analysis:
+                continue
+            analysed += 1
+            snap = analysis.snapshot
+            sig = analysis.signal
+            self.ledger.upsert_levels(
+                now.date(), ticker, spot=snap["spot"], prior_close=snap["prior_close"], gap_pct=snap["gap_pct"],
+                vwap=snap["vwap"], poc=snap["poc"], vah=snap["vah"], val=snap["val"], rvol=snap["rvol"],
+                net_gex=snap.get("net_gex"), gamma_flip=snap.get("gamma_flip"), call_wall=snap.get("call_wall"),
+                put_wall=snap.get("put_wall"), gex_regime=snap.get("gex_regime"), zones=snap["zones"],
+                best_score=sig.score if sig else snap.get("candidate_score"), news=(news.headlines[:3] if news else None),
+            )
+            if sig and sig.score >= self.s.min_convergence:
+                candidates.append((sig, chain))
+
+        self.ledger.set_kv("last_scan", {"ts": now.isoformat(timespec="seconds"), "trade": require_chain,
+                                         "analysed": analysed, "failed": failures,
+                                         "schwab": self.market.health.get("chains:schwab", "")})
+        return candidates, analysed, failures
 
     def _enter(self, sig, chain, now: datetime) -> bool:
         acct = self.broker.account()
@@ -802,6 +815,139 @@ class TradingEngine:
             dedupe_key=f"fomc_paper_close:{rec['date']}",
         )
 
+    # ------------------------------------------------ VRZ universe scan (paper only)
+    def vrz_paper_scan(self, now: datetime) -> None:
+        """While first-candle is the strategy, run the VRZ universe scan and paper-trade its signals as stock
+        (the form that was profitable in docs/strategy_research.md). Same gates, sizing and exits as the live
+        VRZ engine, but simulated at the live bid/ask: nothing is sent to the broker. kv vrz_paper_open / _log."""
+        s, d = self.s, now.date()
+        gate = session_gate(now, s, self.calendar)
+        candidates, _analysed, _failed = self._vrz_candidates(now, require_chain=False)
+        book = self.ledger.get_kv("vrz_paper_open") or []
+        self.status["vrz_paper_open"] = len(book)
+        if not candidates:
+            return
+        today = d.isoformat()
+        n_today = sum(1 for x in book if x["date"] == today) + sum(
+            1 for x in (self.ledger.get_kv("vrz_paper_log") or []) if x["date"] == today)
+        earnings = set(self.ledger.get_kv(f"earnings:{today}", []) or [])
+        equity = s.trading_equity(self.broker.account().equity, self.ledger.total_realized_pnl())
+        for sig, _chain in sorted(candidates, key=lambda c: c[0].score, reverse=True):
+            block = list(gate.reasons)
+            if sig.ticker in earnings:
+                block.append("Earnings today")
+            if any(x["ticker"] == sig.ticker for x in book):
+                block.append("Already holding this underlying (paper)")
+            if len(book) >= s.max_open_positions:
+                block.append(f"{len(book)} paper positions open (max {s.max_open_positions})")
+            if n_today >= s.max_trades_per_day:
+                block.append(f"{n_today} paper trades today (max {s.max_trades_per_day})")
+            if sig.direction == "bear" and not s.allow_short_stock:
+                block.append("short stock disabled")
+            key = f"vrz_paper_seen:{sig.ticker}:{sig.direction}:{sig.bar_time}"
+            if block:
+                if not self.ledger.get_kv(key):
+                    self.ledger.set_kv(key, 1)
+                    self.ledger.record_signal(d, sig.ticker, sig.direction, sig.score, sig.entry, sig.stop, sig.target,
+                                              sig.components, "BLOCKED", "VRZ paper: " + "; ".join(block))
+                continue
+            bull = sig.direction == "bull"
+            try:
+                bid, ask = self.broker.quote(sig.ticker)
+            except Exception:  # noqa: BLE001
+                bid = ask = 0.0
+            live = (ask if bull else bid) or sig.entry
+            risk = abs(sig.entry - sig.stop)
+            why = None
+            if (bull and live <= sig.stop) or (not bull and live >= sig.stop) or abs(live - sig.entry) > 0.5 * risk:
+                why = f"live price {live:.2f} moved too far from signal {sig.entry:.2f}"
+            shares = 0 if why else size_stock(s, equity, live, sig.stop, equity, open_risk(book, s),
+                                              sum(float(x["entry_price"]) * float(x["qty"]) for x in book))
+            if not why and shares < 1:
+                why = "size < 1 share"
+            if why:
+                if not self.ledger.get_kv(key):
+                    self.ledger.set_kv(key, 1)
+                    self.ledger.record_signal(d, sig.ticker, sig.direction, sig.score, sig.entry, sig.stop, sig.target,
+                                              sig.components, "BLOCKED", f"VRZ paper: {why}")
+                continue
+            rec = {"id": f"{sig.ticker}-{now:%Y%m%d%H%M%S}", "date": today, "ticker": sig.ticker, "direction": sig.direction,
+                   "asset_class": "stock", "qty": shares, "entry_price": round(live, 2), "stop_price": round(sig.stop, 2),
+                   "target_price": round(sig.target, 2), "score": sig.score, "signal_entry": round(sig.entry, 2),
+                   "opened_at": now.isoformat(timespec="seconds"), "last_price": round(live, 2)}
+            book.append(rec)
+            n_today += 1
+            self.ledger.set_kv(key, 1)
+            self.ledger.record_signal(d, sig.ticker, sig.direction, sig.score, sig.entry, sig.stop, sig.target,
+                                      sig.components, "PAPER_VRZ", f"{shares} sh @ {live:.2f} (simulated)")
+            self.ledger.log("INFO", f"VRZ paper: {sig.direction} {shares} {sig.ticker} @ {live:.2f}, stop {sig.stop:.2f}, "
+                                    f"target {sig.target:.2f}")
+            self.notifier.send(
+                f"📝 PAPER VRZ {sig.ticker} {sig.direction.upper()} {shares} sh @ {live:.2f} (score {sig.score:.0f})",
+                table([{"Ticker": sig.ticker, "Direction": sig.direction, "Shares": shares, "Fill": round(live, 2),
+                        "Stop": round(sig.stop, 2), "Target": round(sig.target, 2), "Risk $": round(abs(live - sig.stop) * shares, 2),
+                        "Score": sig.score}])
+                + "<p>Simulated only - no order was sent to the broker. Exits: stop, target, momentum fade, or "
+                  f"{s.flatten_minutes_before_close} min before the close.</p>",
+                dedupe_key=f"vrz_paper_open:{rec['id']}",
+            )
+        self.ledger.set_kv("vrz_paper_open", book)
+        self.status["vrz_paper_open"] = len(book)
+
+    def vrz_paper_manage(self, now: datetime) -> None:
+        """Exit checks for open VRZ paper positions (the live engine's stock exit rules), every cycle."""
+        book = self.ledger.get_kv("vrz_paper_open") or []
+        if not book or not is_trading_day(now.date()) or now < market_open_dt(now.date()):
+            return
+        flatten_at = flatten_time(now, self.s)
+        keep, closed = [], []
+        for rec in book:
+            bars = None
+            try:
+                bars = day_slice(self.market.bars(rec["ticker"], now), now.date())
+            except MarketDataUnavailable as exc:
+                log.warning("VRZ paper: bars for %s unavailable: %s", rec["ticker"], exc)
+            fading = bool(bars is not None and len(bars) and momentum_against(bars, rec["direction"]))
+            bull = rec["direction"] == "bull"
+            try:
+                bid, ask = self.broker.quote(rec["ticker"])
+            except Exception:  # noqa: BLE001
+                bid = ask = 0.0
+            price = (bid + ask) / 2 if bid > 0 and ask > 0 else (
+                float(bars["close"].iloc[-1]) if bars is not None and len(bars) else 0.0)
+            if price > 0:
+                rec["last_price"] = round(price, 2)
+            reason = stock_exit_reason(rec, price, self.s, now, flatten_at, fading)
+            if not reason:
+                keep.append(rec)
+                continue
+            fill = (bid if bull else ask) or price                     # sell longs at the bid, cover shorts at the ask
+            if fill <= 0:
+                keep.append(rec)
+                continue
+            pnl = round((fill - float(rec["entry_price"])) * float(rec["qty"]) * (1 if bull else -1), 2)
+            risk = abs(float(rec["entry_price"]) - float(rec["stop_price"])) * float(rec["qty"])
+            rec.update(exit_price=round(fill, 2), exit_reason=reason, closed_at=now.isoformat(timespec="seconds"),
+                       pnl=pnl, r=round(pnl / risk, 2) if risk else None)
+            closed.append(rec)
+        if not closed:
+            self.ledger.set_kv("vrz_paper_open", keep)
+            return
+        history = (self.ledger.get_kv("vrz_paper_log") or []) + closed
+        self.ledger.set_kv("vrz_paper_log", history)
+        self.ledger.set_kv("vrz_paper_open", keep)
+        total = round(sum(float(x.get("pnl") or 0) for x in history), 2)
+        for rec in closed:
+            self.ledger.log("INFO", f"VRZ paper: closed {rec['ticker']} {rec['exit_reason']} @ {rec['exit_price']}, "
+                                    f"P&L {rec['pnl']:+,.2f}")
+            self.notifier.send(
+                f"{'✅' if rec['pnl'] >= 0 else '🔻'} PAPER VRZ {rec['ticker']} closed {rec['exit_reason']} P&L {rec['pnl']:+,.2f}",
+                table([{"Ticker": rec["ticker"], "Direction": rec["direction"], "Shares": rec["qty"], "Entry": rec["entry_price"],
+                        "Exit": rec["exit_price"], "Reason": rec["exit_reason"], "P&L $": rec["pnl"], "R": rec["r"],
+                        "All VRZ paper trades $": total}]) + "<p>Simulated only - no broker orders.</p>",
+                dedupe_key=f"vrz_paper_close:{rec['id']}",
+            )
+
     def _data_outage(self, now: datetime) -> None:
         detail = "; ".join(f"{k}: {v}" for k, v in self.market.health.items() if "error" in str(v) or k.startswith("scan:"))
         self.status.setdefault("gates", []).append("MARKET DATA UNAVAILABLE - entries blocked")
@@ -870,6 +1016,11 @@ class TradingEngine:
                 "Decision": today.get("decision", "-"), "Why": today.get("reason", ""), "Profile": today.get("profile", ""),
                 "Phase": today.get("phase", ""), "Size": today.get("size_mult", ""), "Pick": today.get("pick", ""),
                 "Gap agrees": today.get("gap_agrees", ""), "Plan": today.get("grade", "")}]))
+        vrz_today = [x for x in (self.ledger.get_kv("vrz_paper_log") or []) if x["date"] == now.date().isoformat()]
+        if vrz_today:
+            plan_html += "<h3>VRZ paper trades (simulated)</h3>" + table([{
+                "Ticker": x["ticker"], "Side": x["direction"], "Shares": x["qty"], "Entry": x["entry_price"],
+                "Exit": x["exit_price"], "Reason": x["exit_reason"], "P&L $": x["pnl"], "R": x.get("r")} for x in vrz_today])
         fomc = self.ledger.get_kv(f"fomc_paper:{now.date().isoformat()}")
         if fomc:
             plan_html += "<h3>FOMC paper trade (simulated)</h3>" + table([{

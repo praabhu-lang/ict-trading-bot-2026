@@ -153,6 +153,9 @@ class Settings:
     fomc_exit: str = "15:45"             # time exit, ET
     fomc_fee: float = 1.50               # $ per contract per side
 
+    # --- VRZ universe scan as PAPER trades while first_candle is the strategy (simulated stock trades) ---
+    vrz_paper: bool = True
+
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
     custom_events: list[dict] = field(default_factory=list)

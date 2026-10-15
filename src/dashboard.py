@@ -530,6 +530,10 @@ with tab_set:
         sm_gapd = c[2].number_input("Gap-day delta (0DTE)", 0.10, 0.80, settings.fc_gap_delta, 0.05)
         sm_nogapd = c[3].number_input("No-gap delta (next day)", 0.10, 0.80, settings.fc_nogap_delta, 0.05)
         sm_adj = st.toggle("Skip the session before and after FOMC", settings.fc_skip_fomc_adjacent)
+        st.subheader("Paper scans (simulated, never sent to the broker)")
+        vrz_on = st.toggle("VRZ universe scan as paper stock trades (while first-candle is the strategy)",
+                           settings.vrz_paper, help="Every 5 min: VRZ sweep-and-reject on the universe, same gates, "
+                           "sizing and exits as the VRZ engine; fills simulated at the live bid/ask.")
         st.subheader("FOMC paper trade (simulated, never sent to the broker)")
         c = st.columns(5)
         fomc_on = c[0].toggle("On", settings.fomc_paper, help="FOMC decision days: 14:20 ET, direction of the SPY move "
@@ -616,7 +620,7 @@ with tab_set:
                     "fc_phase2_scale": float(sm_p2s), "fc_monitor": sm_mon, "fc_floor_equity": float(sm_floor),
                     "fc_phase2_floor": float(sm_floor2), "fc_gap_delta": float(sm_gapd),
                     "fc_nogap_delta": float(sm_nogapd), "fc_skip_fomc_adjacent": sm_adj,
-                    "fomc_paper": fomc_on, "fomc_delta": float(fomc_delta), "fomc_stop_pct": float(fomc_stop),
+                    "vrz_paper": vrz_on, "fomc_paper": fomc_on, "fomc_delta": float(fomc_delta), "fomc_stop_pct": float(fomc_stop),
                     "fomc_rr": float(fomc_rr), "fomc_qty": int(fomc_qty),
                 })
                 broker_for.clear()

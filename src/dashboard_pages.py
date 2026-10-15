@@ -202,6 +202,8 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
     else:
         st.caption("Appears after the 08:45 ET pre-market run on trading days.")
 
+    vrz_paper_panel(led, settings)
+
     st.subheader("Open positions")
     if broker is None:
         st.error(f"Broker unavailable: {broker_error}")
@@ -301,6 +303,7 @@ def trades_page(led) -> None:
     if df.empty:
         st.info("No closed trades yet.")
         fomc_paper_history(led)
+        vrz_paper_history(led)
         return
     c = st.columns(4)
     a, b = c[0].date_input("From / to", (df.day.min(), df.day.max()), key="tr_range")
@@ -323,6 +326,57 @@ def trades_page(led) -> None:
                  column_config={"realized_pnl": st.column_config.NumberColumn("P&L $", format="$%.2f")})
     st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(), "trades.csv", "text/csv")
     fomc_paper_history(led)
+    vrz_paper_history(led)
+
+
+# --------------------------------------------------------------------------- VRZ universe paper scan
+def vrz_paper_panel(led, settings) -> None:
+    """Today page: open VRZ paper positions (simulated stock trades from the extra universe scan)."""
+    if settings.strategy != "first_candle":
+        return
+    st.subheader("VRZ paper scan (simulated stock trades)")
+    if not settings.vrz_paper:
+        st.caption("Off (Settings → Paper scans).")
+        return
+    book = (led.get_kv("vrz_paper_open") if led else None) or []
+    today = datetime.now(ET).date().isoformat()
+    done = [x for x in ((led.get_kv("vrz_paper_log") if led else None) or []) if x["date"] == today]
+    if not book:
+        st.caption(f"No paper positions open · {len(done)} closed today "
+                   f"({money(sum(float(x['pnl']) for x in done), True)}) · scans {len(settings.universe)} tickers every "
+                   "5 min for VRZ sweep-and-reject setups.")
+        return
+    for p in book:
+        bull = p["direction"] == "bull"
+        last = float(p.get("last_price") or p["entry_price"])
+        pnl = (last - float(p["entry_price"])) * float(p["qty"]) * (1 if bull else -1)
+        c = st.columns(5)
+        c[0].metric(p["ticker"], f"{p['direction']} {p['qty']} sh", f"score {p.get('score', '')}")
+        c[1].metric("Entry", f"{float(p['entry_price']):.2f}")
+        c[2].metric("Now", f"{last:.2f}")
+        c[3].metric("P&L (paper)", money(pnl, True))
+        c[4].metric("Stop / target", f"{float(p['stop_price']):.2f} / {float(p['target_price']):.2f}")
+
+
+def vrz_paper_history(led) -> None:
+    """Trades page: closed VRZ paper trades next to the backtest they should track."""
+    st.subheader("VRZ paper trades (simulated stock)")
+    log = (led.get_kv("vrz_paper_log") if led else None) or []
+    if not log:
+        st.caption("None yet. Backtest (stocks only, $10k, 2% risk): 2025 +4.0%, PF 1.38, 61% wins; "
+                   "2026 +2.5%, PF 1.30, 65% wins (docs/strategy_research.md).")
+        return
+    df = pd.DataFrame(log)
+    pnl = df.pnl.astype(float)
+    w, l = pnl[pnl > 0], pnl[pnl <= 0]
+    stat_row([("Trades", str(len(df)), None), ("Net", money(pnl.sum(), True), None),
+              ("Win rate", f"{len(w) / len(df):.0%}", "backtest 61-65%"),
+              ("Profit factor", f"{w.sum() / -l.sum():.2f}" if l.sum() < 0 else "—", "backtest 1.30-1.38"),
+              ("Avg R", f"{pd.to_numeric(df.r, errors='coerce').mean():+.2f}", None)])
+    cols = [c for c in ("date", "ticker", "direction", "qty", "entry_price", "exit_price", "exit_reason", "r", "pnl", "score")
+            if c in df]
+    st.dataframe(df[cols].iloc[::-1], hide_index=True, width="stretch",
+                 column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f")})
 
 
 # ------------------------------------------------------------------------------- FOMC paper trade
