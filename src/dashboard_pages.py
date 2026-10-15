@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.core.clock import ET
-from src.core.events import EventCalendar, fomc_adjacent
+from src.core.events import FOMC_DECISION_DAYS, EventCalendar, fomc_adjacent
 
 LIGHT = {"gain": "#2a78d6", "loss": "#e34948", "line": "#2a78d6", "grid": "#e1e0d9", "axis": "#c3c2b7",
          "muted": "#898781", "text": "#52514e"}
@@ -192,6 +192,7 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
             st.markdown(f"- {e}")
         if pre.get("events") and not evs:
             st.caption(", ".join(pre["events"]))
+        fomc_paper_panel(led, settings, today)
 
     st.subheader("Key pre-market levels")
     if pre.get("levels"):
@@ -299,6 +300,7 @@ def trades_page(led) -> None:
     df = closed_trades(led)
     if df.empty:
         st.info("No closed trades yet.")
+        fomc_paper_history(led)
         return
     c = st.columns(4)
     a, b = c[0].date_input("From / to", (df.day.min(), df.day.max()), key="tr_range")
@@ -320,6 +322,65 @@ def trades_page(led) -> None:
     st.dataframe(view, hide_index=True, width="stretch",
                  column_config={"realized_pnl": st.column_config.NumberColumn("P&L $", format="$%.2f")})
     st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(), "trades.csv", "text/csv")
+    fomc_paper_history(led)
+
+
+# ------------------------------------------------------------------------------- FOMC paper trade
+def fomc_paper_panel(led, settings, today: date) -> None:
+    """Today page: the simulated SPX trade on FOMC decision days (src/strategy/fomc_react.py)."""
+    st.subheader("FOMC paper trade")
+    if not settings.fomc_paper:
+        st.caption("Off (Settings → FOMC paper trade).")
+        return
+    rec = (led.get_kv(f"fomc_paper:{today.isoformat()}") if led else None) or {}
+    if today not in FOMC_DECISION_DAYS and not rec:
+        nxt = next((d for d in FOMC_DECISION_DAYS if d > today), None)
+        st.caption(f"Next decision day: {nxt:%a %b %d} - simulated {settings.fomc_symbol} trade at 14:20 ET "
+                   f"(13:20 CT)." if nxt else "No FOMC dates listed - add them in src/core/events.py.")
+        return
+    status = rec.get("status", "WAITING")
+    badge = {"WAITING": "🟡 WAITING", "OPEN": "🟢 OPEN", "CLOSED": "⚪ CLOSED", "SKIPPED": "⚪ SKIPPED"}.get(status, status)
+    st.markdown(f"**{badge}** · simulated, no broker orders")
+    if status == "WAITING":
+        st.caption(rec.get("reason") or "Enters at 14:20 ET in the direction SPY moved since the 14:00 decision.")
+        if rec.get("signal"):
+            st.caption(rec["signal"])
+        return
+    if status == "SKIPPED":
+        st.caption(rec.get("reason", ""))
+        return
+    sign = 1 if rec.get("side") == "bull" else -1
+    last, entry_ref = rec.get("last_ref"), rec.get("entry_ref")
+    move = sign * (last / entry_ref - 1) * 100 if last and entry_ref else None
+    c = st.columns(3)
+    c[0].metric(rec.get("contract", ""), f"{rec.get('side', '')} x{rec.get('qty', 1)}", f"delta {rec.get('delta', '')}")
+    c[1].metric("Entry (ask)", f"{rec.get('entry', 0):.2f}", f"premium {money(rec.get('entry', 0) * 100 * rec.get('qty', 1))}")
+    if status == "CLOSED":
+        c[2].metric("P&L", money(rec.get("pnl"), True), f"{rec.get('exit_reason', '')} @ {rec.get('exit', 0):.2f}")
+    else:
+        c[2].metric("SPY vs entry", f"{move:+.2f}%" if move is not None else "—", f"SPY {last}" if last else None)
+    st.caption(f"Signal: {rec.get('signal', '')} · SPY entry {entry_ref} · stop {rec.get('stop')} · target {rec.get('target')} "
+               f"· time exit {settings.fomc_exit} ET")
+
+
+def fomc_paper_history(led) -> None:
+    """Trades page: every simulated FOMC trade so far, next to the backtest it should track."""
+    st.subheader("FOMC paper trades (simulated SPX)")
+    log = (led.get_kv("fomc_paper_log") if led else None) or []
+    if not log:
+        st.caption("None yet - the first runs on the next FOMC decision day. Backtest (21 days, Feb 2024 - Oct 2026, "
+                   "1 SPX contract modelled as 10x SPY): +$18,971, 48% wins, profit factor 2.5, worst drawdown -$2,842.")
+        return
+    df = pd.DataFrame(log)
+    pnl = df.pnl.astype(float)
+    w, l = pnl[pnl > 0], pnl[pnl <= 0]
+    stat_row([("Trades", str(len(df)), None), ("Net", money(pnl.sum(), True), None),
+              ("Win rate", f"{len(w) / len(df):.0%}", "backtest 48%"),
+              ("Profit factor", f"{w.sum() / -l.sum():.2f}" if l.sum() < 0 else "—", "backtest 2.54")])
+    cols = [c for c in ("date", "signal", "contract", "entry", "exit", "exit_reason", "entry_ref", "last_ref", "pnl") if c in df]
+    st.dataframe(df[cols].iloc[::-1], hide_index=True, width="stretch",
+                 column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f"),
+                                "entry_ref": "SPY entry", "last_ref": "SPY exit"})
 
 
 # ------------------------------------------------------------------------------------ How it works
