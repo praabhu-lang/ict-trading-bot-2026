@@ -5,7 +5,8 @@ Each cycle (every ~30 s):
   2. MonitorAgent: manage exits for every open trade (ALWAYS - even when paused/blocked)
   3. at each new 5-minute bar: MarketAnalystAgent scans the universe, RiskAgent gates,
      ExecutionAgent enters the single best signal (option ~2 weeks out, or stock fallback)
-  4. heartbeat/status written for the dashboard
+  4. FOMC decision days: the paper-only SPX reaction trade (simulated, never sent to the broker)
+  5. heartbeat/status written for the dashboard
 """
 from __future__ import annotations
 
@@ -13,17 +14,18 @@ import html
 import logging
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 
 from ..alerts.notifier import Notifier, table
 from ..brokers.base import Broker
-from ..core.clock import Clock, is_trading_day, market_close_dt, market_open_dt
+from ..core.clock import ET, Clock, is_trading_day, market_close_dt, market_open_dt
 from ..core.events import CPI_RELEASE_DAYS, FOMC_DECISION_DAYS, EventCalendar, fomc_adjacent
 from ..core.ledger import Ledger
 from ..core.settings import OPTIONS_ONLY, Settings
 from ..data.market import BAR_MINUTES, MarketData
 from ..data.models import MarketDataUnavailable
 from ..strategy import first_candle as fc
+from ..strategy import fomc_react as fr
 from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
@@ -86,7 +88,7 @@ class TradingEngine:
         for key in ("gates", "account_equity", "trading_equity", "buying_power", "bot_day_pnl"):
             if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
                 self.status[key] = previous[key]
-        for step in (self.reconcile, lambda: self.manage_exits(now)):
+        for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now)):
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - one failing step must not stop exit management
@@ -682,6 +684,124 @@ class TradingEngine:
         )
         return True
 
+    # ------------------------------------------------ FOMC reaction trade (paper only)
+    def fomc_paper(self, now: datetime) -> None:
+        """Simulated 0DTE SPX trade on FOMC decision days (src/strategy/fomc_react.py). Never places broker orders:
+        fills are the live Schwab ask (entry) and bid (exit). State: ledger kv fomc_paper:<date>, closed trades in
+        fomc_paper_log."""
+        s, d = self.s, now.date()
+        if not s.fomc_paper or d not in FOMC_DECISION_DAYS or now < market_open_dt(d):
+            return
+        key = f"fomc_paper:{d.isoformat()}"
+        rec = self.ledger.get_kv(key) or {"date": d.isoformat(), "status": "WAITING", "reason": "entry at 14:20 ET"}
+        if rec["status"] == "OPEN":
+            self._fomc_manage(rec, now)
+        elif rec["status"] == "WAITING":
+            self._fomc_enter(rec, now)
+        self.ledger.set_kv(key, rec)
+        self.status["fomc_paper"] = rec
+
+    def _spy_price(self, bars_today) -> float | None:
+        try:
+            bid, ask = self.broker.quote("SPY")
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+        except Exception as exc:  # noqa: BLE001 - fall back to the last closed bar
+            log.info("SPY quote unavailable: %s", exc)
+        return float(bars_today["close"].iloc[-1]) if bars_today is not None and len(bars_today) else None
+
+    def _fomc_enter(self, rec: dict, now: datetime) -> None:
+        s, d = self.s, now.date()
+        entry_at = datetime.combine(d, dtime(14, 20), tzinfo=ET)
+        if now < entry_at:
+            return
+        if now > entry_at + timedelta(minutes=fr.ENTRY_WINDOW_MIN):
+            rec.update(status="SKIPPED", reason="missed the 14:20-14:30 entry window")
+            return
+        try:
+            bars = day_slice(self.market.bars("SPY", now), d)
+        except MarketDataUnavailable as exc:
+            rec["reason"] = f"SPY bars unavailable: {exc}"[:200]
+            return
+        side, why = fr.direction(bars)
+        rec["signal"] = why
+        if side is None:
+            if "unchanged" in why:
+                rec.update(status="SKIPPED", reason=why)
+            return
+        try:
+            chain = self.market.chain(s.fomc_symbol, d, max_dte=0)
+        except MarketDataUnavailable as exc:
+            rec["reason"] = f"{s.fomc_symbol} chain unavailable: {exc}"[:200]
+            return
+        contract = fc.choose_contract(chain, side, chain.spot, d, s.fomc_delta)
+        if contract:
+            bid, ask = self._option_bid_ask(contract.symbol)
+            if bid > 0 and ask > 0:
+                contract.bid, contract.ask = bid, ask
+        ref = self._spy_price(bars)
+        if not contract or contract.ask <= 0 or ref is None:
+            rec["reason"] = "no 0DTE contract near the target delta" if not contract else "no ask / SPY price yet"
+            return
+        stop, target = fr.levels(ref, side, s.fomc_stop_pct, s.fomc_rr)
+        rec.update(status="OPEN", reason="", side=side, contract=contract.symbol, put_call=contract.put_call,
+                   strike=contract.strike, delta=round(contract.delta, 2), qty=s.fomc_qty, entry=contract.ask,
+                   entry_bid=contract.bid, entry_ts=now.isoformat(timespec="seconds"), index_at_entry=chain.spot,
+                   entry_ref=round(ref, 2), stop=stop, target=target, last_ref=round(ref, 2))
+        self.ledger.log("INFO", f"FOMC paper: bought {contract.symbol} x{s.fomc_qty} @ {contract.ask:.2f} ({why})")
+        self.notifier.send(
+            f"📝 PAPER {s.fomc_symbol} FOMC trade: bought {contract.symbol} x{s.fomc_qty} @ {contract.ask:.2f}",
+            table([{"Signal": why, "Direction": side, "Contract": contract.symbol, "Delta": round(contract.delta, 2),
+                    "Fill (ask)": contract.ask, "Premium $": round(contract.ask * 100 * s.fomc_qty, 2),
+                    f"{s.fomc_symbol}": chain.spot, "SPY entry": round(ref, 2), "SPY stop": stop, "SPY target": target}])
+            + f"<p>Simulated only - no order was sent to the broker. Exit: SPY stop/target (1:{s.fomc_rr:g}) "
+              f"or {s.fomc_exit} ET.</p>",
+            dedupe_key=f"fomc_paper_open:{d.isoformat()}",
+        )
+
+    def _fomc_manage(self, rec: dict, now: datetime) -> None:
+        s, d = self.s, now.date()
+        bars = None
+        try:
+            bars = day_slice(self.market.bars("SPY", now), d)
+        except MarketDataUnavailable as exc:
+            log.warning("FOMC paper: SPY bars unavailable: %s", exc)
+        price = self._spy_price(bars)
+        if price is not None:
+            rec["last_ref"] = round(price, 2)
+        if now >= market_close_dt(d):                  # missed the exit: cash-settles at intrinsic value
+            try:
+                index_px = self.market.chain(s.fomc_symbol, d, max_dte=0).spot
+            except MarketDataUnavailable:
+                index_px = float(rec["index_at_entry"]) * (price or rec["entry_ref"]) / float(rec["entry_ref"])
+            self._fomc_close(rec, now, fr.intrinsic(rec["put_call"], float(rec["strike"]), index_px), "SETTLED")
+            return
+        reason = fr.exit_reason(rec, price, now, fr.parse_hhmm(s.fomc_exit))
+        if not reason:
+            return
+        bid, _ask = self._option_bid_ask(rec["contract"])
+        if bid <= 0:
+            rec["reason"] = f"{reason}: no bid yet - retrying"
+            return
+        self._fomc_close(rec, now, bid, reason)
+
+    def _fomc_close(self, rec: dict, now: datetime, price: float, reason: str) -> None:
+        s = self.s
+        pnl = fr.pnl(float(rec["entry"]), price, int(rec["qty"]), s.fomc_fee)
+        rec.update(status="CLOSED", exit=round(price, 2), exit_reason=reason, exit_ts=now.isoformat(timespec="seconds"),
+                   pnl=pnl, reason="")
+        history = self.ledger.get_kv("fomc_paper_log") or []
+        self.ledger.set_kv("fomc_paper_log", history + [dict(rec)])
+        total = round(sum(float(x.get("pnl") or 0) for x in history) + pnl, 2)
+        self.ledger.log("INFO", f"FOMC paper: closed {rec['contract']} {reason} @ {price:.2f}, P&L {pnl:+,.2f}")
+        self.notifier.send(
+            f"{'✅' if pnl >= 0 else '🔻'} PAPER {s.fomc_symbol} FOMC trade closed {reason} P&L {pnl:+,.2f}",
+            table([{"Contract": rec["contract"], "Qty": rec["qty"], "Entry (ask)": rec["entry"], "Exit (bid)": round(price, 2),
+                    "Reason": reason, "SPY entry": rec["entry_ref"], "SPY exit": rec.get("last_ref"), "P&L $": pnl,
+                    "All FOMC paper trades $": total}]) + "<p>Simulated only - no broker orders.</p>",
+            dedupe_key=f"fomc_paper_close:{rec['date']}",
+        )
+
     def _data_outage(self, now: datetime) -> None:
         detail = "; ".join(f"{k}: {v}" for k, v in self.market.health.items() if "error" in str(v) or k.startswith("scan:"))
         self.status.setdefault("gates", []).append("MARKET DATA UNAVAILABLE - entries blocked")
@@ -750,6 +870,12 @@ class TradingEngine:
                 "Decision": today.get("decision", "-"), "Why": today.get("reason", ""), "Profile": today.get("profile", ""),
                 "Phase": today.get("phase", ""), "Size": today.get("size_mult", ""), "Pick": today.get("pick", ""),
                 "Gap agrees": today.get("gap_agrees", ""), "Plan": today.get("grade", "")}]))
+        fomc = self.ledger.get_kv(f"fomc_paper:{now.date().isoformat()}")
+        if fomc:
+            plan_html += "<h3>FOMC paper trade (simulated)</h3>" + table([{
+                "Status": fomc.get("status"), "Signal": fomc.get("signal", ""), "Contract": fomc.get("contract", ""),
+                "Entry": fomc.get("entry", ""), "Exit": fomc.get("exit", ""), "Reason": fomc.get("exit_reason") or fomc.get("reason", ""),
+                "P&L $": fomc.get("pnl", "")}])
         self.notifier.send(
             f"📊 Day summary {now:%a %b %d}: {len(closed)} trades, P&L {total:+,.2f}",
             plan_html + f"<p>Month to date: <b>{month:+,.2f}</b> · bot total: <b>{self.ledger.total_realized_pnl():+,.2f}</b></p>" +

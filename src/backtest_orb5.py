@@ -72,6 +72,7 @@ CONFIG = {
     "skip_weekdays": (),          # e.g. ("Fri",)
     "skip_fomc": False,           # no trades on FOMC decision days
     "cpi_mode": "normal",         # normal | skip | reaction: on CPI days trade the 08:30 reaction candle with the trend
+    "only_days": None,            # set of dates: simulate these sessions only (event-day studies)
 }
 _BARS, _DAYS, _PRE = {}, {}, {}
 
@@ -224,6 +225,8 @@ def run(start: date, end: date, verbose=False):
         CONFIG.update(fri)
         try:
             if d.strftime('%a') in CONFIG['skip_weekdays']:
+                continue
+            if CONFIG['only_days'] is not None and d not in CONFIG['only_days']:
                 continue
             if CONFIG['skip_fomc'] and d in FOMC:
                 continue

@@ -15,7 +15,7 @@ load_dotenv()
 INDEX_0DTE = ("SPY", "QQQ", "XSP")   # daily expiries, $1 strikes
 # Cash-settled index options (Mini-SPX = SPX / 10): there are no shares, so no stock fallback.
 OPTIONS_ONLY = ("XSP",)
-DATA_SYMBOL = {"XSP": "$XSP"}           # Schwab market-data symbol for the index
+DATA_SYMBOL = {"XSP": "$XSP", "SPX": "$SPX"}   # Schwab market-data symbols for the indexes
 GEX_PROXY = {"XSP": ("SPX", 0.1)}       # gexbot covers SPX, not XSP: same levels / 10
 VOLUME_PROXY = {"XSP": "SPY"}            # index bars have no volume: SPY trades the same market
 
@@ -143,6 +143,16 @@ class Settings:
     fc_monitor_lookback: int = 50
     fc_skip_fomc_adjacent: bool = True   # also skip the session before and after an FOMC decision
 
+    # --- FOMC reaction trade: PAPER ONLY, simulated on live Schwab quotes (src/strategy/fomc_react.py) ---
+    fomc_paper: bool = True
+    fomc_symbol: str = "SPX"             # 0DTE SPXW options
+    fomc_qty: int = 1
+    fomc_delta: float = 0.50
+    fomc_stop_pct: float = 0.75          # stop on SPY, % from the entry price
+    fomc_rr: float = 1.5                 # target = fomc_rr x the stop
+    fomc_exit: str = "15:45"             # time exit, ET
+    fomc_fee: float = 1.50               # $ per contract per side
+
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
     custom_events: list[dict] = field(default_factory=list)
@@ -201,6 +211,11 @@ class Settings:
         "fc_phase2_floor": (0.0, 10_000_000.0),
         "fc_halfsize_lookback": (3, 50),
         "fc_monitor_lookback": (10, 200),
+        "fomc_qty": (1, 10),
+        "fomc_delta": (0.10, 0.80),
+        "fomc_stop_pct": (0.10, 3.0),
+        "fomc_rr": (0.5, 5.0),
+        "fomc_fee": (0.0, 10.0),
     }
 
     @classmethod
