@@ -19,6 +19,9 @@ upsert ict-engine-open "30,45 9 * * 1-5"    ai-trading-engine
 upsert ict-engine-day  "*/15 10-15 * * 1-5" ai-trading-engine
 upsert ict-gex-archive "0 18 * * 1-5"       ai-trading-gexarchive
 upsert ict-nightly     "15 18 * * 1-5"      ai-trading-nightly
+upsert ict-biotech-scan   "0,30 7 * * 1-5"  ai-trading-biotech   # paper: pre-market gap scan 07:00, 07:30
+upsert ict-biotech-scan8  "0 8 * * 1-5"     ai-trading-biotech   # ... and 08:00
+upsert ict-biotech-settle "30 16 * * 1-5"   ai-trading-biotech   # paper: settle on the regular-session bar
 
 for old in ai-trading-postopen-trigger ai-trading-premarket-trigger ai-trading-premarket-schedule \
            ai-trading-postopen-schedule ai-trading-cron; do

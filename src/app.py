@@ -225,6 +225,28 @@ def cmd_backtest(tickers: list[str], start: date, end: date, capital: float, gex
     return 0
 
 
+def cmd_biotech() -> int:
+    """Biotech gap scanner, paper only: pre-market = scan, after 16:00 ET = settle open paper positions."""
+    from .agents.biotech_scanner import run_biotech_scan
+
+    store = Store.from_env()
+    try:
+        with store.lock(LOCK, ttl_seconds=600, wait_seconds=120):
+            store.download(LEDGER)
+            ledger = Ledger(store.local_path(LEDGER))
+            settings = load_settings(store)
+            market = MarketData.from_env(store)
+            report = run_biotech_scan(settings, ledger, market.schwab, NewsAgent(), Notifier.from_env(ledger),
+                                      Clock().now())
+            store.upload(LEDGER)
+            ledger.close()
+    except LockHeld:
+        log.warning("Another run holds the lock - biotech scan skipped")
+        return 0
+    print(json.dumps(report, default=str, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     p = argparse.ArgumentParser(prog="python -m src.app")
@@ -237,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("scan")
     sub.add_parser("gex-archive")
     sub.add_parser("nightly")
+    sub.add_parser("biotech")
     pre = sub.add_parser("premarket")
     pre.add_argument("--no-email", action="store_true")
     bt = sub.add_parser("backtest")
@@ -260,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_gex_archive()
     if a.cmd == "nightly":
         return cmd_nightly()
+    if a.cmd == "biotech":
+        return cmd_biotech()
     if a.cmd == "test-email":
         return cmd_test_email()
     if a.cmd == "premarket":

@@ -36,6 +36,7 @@ LIVE_BROKERS = {"alpaca_live", "ibkr"}
 
 STRATEGIES = {"vrz": "VRZ sweep-and-reject (universe)", "first_candle": "First 5-min candle breakout (SPY/QQQ options)"}
 FC_MODES = {"smart": "Smart rule (gap-graded 0DTE/1DTE, phases, monitor)", "classic": "Classic (one size, fixed delta)"}
+FC_EXIT_MODES = {"target": "3x target + break-even", "trail": "No target, trail 1x range off the best (variant G)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -142,6 +143,25 @@ class Settings:
     fc_monitor: bool = True              # monitor C: profile from the last fc_monitor_lookback smart-rule signals
     fc_monitor_lookback: int = 50
     fc_skip_fomc_adjacent: bool = True   # also skip the session before and after an FOMC decision
+    fc_exit_mode: str = "target"         # target: 3x target + break-even | trail: no target, exit fc_trail_x x range
+    fc_trail_after: float = 1.0          # off the best move once it reaches fc_trail_after x range (variant G,
+    fc_trail_x: float = 1.0              # results/fc_exit_variants.csv); the 11:00 no-progress exit applies to both
+    fc_entry_chase_pct: float = 0.10    # entry ladder unfilled: chase the live ask up to +10% over the quoted ask
+    fc_entry_chase_rounds: int = 3       # re-quotes while chasing (one order wait each); 0 = never above the ask
+
+    # --- Biotech pre-market gap-up: PAPER ONLY, simulated on Schwab quotes (src/strategy/biotech_gap.py) ---
+    bio_paper: bool = True
+    bio_equity: float = 9_000.0          # paper account the trades are sized on
+    bio_min_gap: float = 0.30            # pre-market last >= prev close x 1.30
+    bio_min_price: float = 1.0
+    bio_min_dollar_vol: float = 5e6      # avg daily $ volume (10-day avg volume x prev close)
+    bio_risk_pct: float = 0.05           # loss at the stop, share of bio_equity
+    bio_max_pos_pct: float = 0.25        # position value cap, share of bio_equity
+    bio_stop_pct: float = 0.15
+    bio_rr: float = 2.0                  # target = 2 x the stop distance (+30%)
+    bio_max_hold: int = 20               # sessions
+    bio_max_open: int = 2
+    bio_slip: float = 0.01               # paid over the pre-market ask
 
     # --- FOMC reaction trade: PAPER ONLY, simulated on live Schwab quotes (src/strategy/fomc_react.py) ---
     fomc_paper: bool = True
@@ -213,6 +233,21 @@ class Settings:
         "fc_floor_equity": (0.0, 10_000_000.0),
         "fc_phase2_floor": (0.0, 10_000_000.0),
         "fc_halfsize_lookback": (3, 50),
+        "fc_trail_after": (0.25, 5.0),
+        "fc_trail_x": (0.25, 5.0),
+        "fc_entry_chase_pct": (0.0, 0.25),
+        "bio_equity": (1_000.0, 10_000_000.0),
+        "bio_min_gap": (0.10, 2.0),
+        "bio_min_price": (0.5, 100.0),
+        "bio_min_dollar_vol": (1e5, 1e10),
+        "bio_risk_pct": (0.001, 0.10),
+        "bio_max_pos_pct": (0.01, 0.50),
+        "bio_stop_pct": (0.03, 0.50),
+        "bio_rr": (0.5, 10.0),
+        "bio_max_hold": (1, 60),
+        "bio_max_open": (1, 10),
+        "bio_slip": (0.0, 0.05),
+        "fc_entry_chase_rounds": (0, 10),
         "fc_monitor_lookback": (10, 200),
         "fomc_qty": (1, 10),
         "fomc_delta": (0.10, 0.80),
@@ -252,6 +287,8 @@ class Settings:
             s.strategy = "vrz"
         if s.fc_mode not in FC_MODES:
             s.fc_mode = "smart"
+        if s.fc_exit_mode not in FC_EXIT_MODES:
+            s.fc_exit_mode = "target"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

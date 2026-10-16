@@ -43,4 +43,9 @@ gcloud run jobs deploy ai-trading-nightly --project "$PROJECT" --region "$REGION
   --command python --args=-m,src.app,nightly --env-vars-file env.yaml \
   --memory 4Gi --cpu 2 --task-timeout 60m --max-retries 1
 
+# Biotech pre-market gap scanner, PAPER ONLY (07:00-08:00 ET scan, 16:30 ET settle). Never places orders.
+gcloud run jobs deploy ai-trading-biotech --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+  --command python --args=-m,src.app,biotech --env-vars-file env.yaml \
+  --memory 1Gi --task-timeout 10m --max-retries 0
+
 echo "Deployed $IMAGE. Run deploy/scheduler.sh once to (re)create the schedules."

@@ -122,6 +122,19 @@ def test_exit_rules():
     assert fc.exit_reason(meta, since_f, at(11, 0, 30), s) == "NO_PROGRESS"
 
 
+def test_trail_exit_mode_lets_winners_run():
+    s = S(fc_exit_mode="trail")
+    meta = {"direction": "bear", "entry_ref": 99.7, "range": 0.7}
+    run = bear_day(follow=[99.5, 99.0, 98.5, 97.5, 96.5, 97.0, 97.4] + [97.4] * 69)
+    since = lambda upto: run[(run.index > at(9, 35)) & (run.index <= upto)]       # noqa: E731
+    assert fc.exit_reason(meta, since(at(10, 0)), at(10, 5), s) is None           # past the 3x target: still held
+    assert fc.exit_reason(meta, since(at(10, 5)), at(10, 10), s) is None          # 97.0: gave back 0.55 < 1x range
+    assert fc.exit_reason(meta, since(at(10, 10)), at(10, 15), s) == "TRAIL"      # 97.4 >= 96.45 + 0.7
+    back = bear_day(follow=[99.2, 98.9, 99.8] + [99.8] * 73)                        # break-even case: no BREAKEVEN
+    since_b = back[(back.index > at(9, 35)) & (back.index <= at(9, 50))]
+    assert fc.exit_reason(meta, since_b, at(9, 55), s) == "TRAIL"                 # 1x+ our way, gave back 1x
+
+
 def test_kill_switch():
     s = S()
     losers = [{"realized_pnl": -10.0}] * 20

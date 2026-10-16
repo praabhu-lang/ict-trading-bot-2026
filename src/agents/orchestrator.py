@@ -663,7 +663,9 @@ class TradingEngine:
             self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps, "BLOCKED", why)
             self._fc_today(d, decision="NO TRADE", reason=why)
             return False
-        fill = self.execution.buy_option(contract.symbol, qty, contract.bid, contract.ask)   # Schwab bid/ask
+        fill = self.execution.buy_option(contract.symbol, qty, contract.bid, contract.ask,   # Schwab bid/ask
+                                         requote=self._option_bid_ask, max_chase_pct=s.fc_entry_chase_pct,
+                                         chase_rounds=s.fc_entry_chase_rounds)
         if not fill.filled:
             self._error(f"first-candle entry {contract.symbol} did not fill", RuntimeError("no fill"))
             self._fc_today(d, decision="NO TRADE", reason=f"order for {contract.symbol} did not fill")

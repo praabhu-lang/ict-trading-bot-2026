@@ -145,11 +145,16 @@ def exit_reason(meta: dict, bars_since_entry: pd.DataFrame, now: datetime, s) ->
     closes = bars_since_entry["close"].to_numpy()
     fav = ((bars_since_entry["high"] - entry) if sign == 1 else (entry - bars_since_entry["low"])).to_numpy()
     last = float(closes[-1])
-    if sign * (last - entry) >= s.fc_target_mult * rng:
-        return "TARGET"
-    best_before = float(fav[:-1].max()) if len(fav) > 1 else 0.0       # earlier bars only
-    if s.fc_breakeven_after and best_before >= s.fc_breakeven_after * rng and sign * (last - entry) <= 0:
-        return "BREAKEVEN"
+    if s.fc_exit_mode == "trail":                 # no fixed target / break-even: let winners run, exit on a give-back
+        best = float(fav.max())                                         # this bar's extreme counts (as the backtest)
+        if best >= s.fc_trail_after * rng and sign * (last - entry) <= best - s.fc_trail_x * rng:
+            return "TRAIL"
+    else:
+        if sign * (last - entry) >= s.fc_target_mult * rng:
+            return "TARGET"
+        best_before = float(fav[:-1].max()) if len(fav) > 1 else 0.0   # earlier bars only
+        if s.fc_breakeven_after and best_before >= s.fc_breakeven_after * rng and sign * (last - entry) <= 0:
+            return "BREAKEVEN"
     no_progress_at = datetime.combine(now.date(), NO_PROGRESS_AT, tzinfo=ET)
     if now >= no_progress_at:
         upto = bars_since_entry[bars_since_entry.index < no_progress_at]

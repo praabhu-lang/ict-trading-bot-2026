@@ -110,12 +110,37 @@ class ExecutionAgent:
                      fill.avg_price, mid, (fill.avg_price - mid) * (1 if side == "buy" else -1), len(ids))
         return fill
 
-    def buy_option(self, symbol: str, qty: int, bid: float, ask: float) -> Fill:
-        """Start at the mid and step one notch at a time toward the ask; never chase beyond the ask."""
+    def buy_option(self, symbol: str, qty: int, bid: float, ask: float, requote=None,
+                   max_chase_pct: float = 0.0, chase_rounds: int = 0) -> Fill:
+        """Start at the mid and step one notch at a time toward the ask. Without `requote` it never pays above
+        that ask. With it, a market that runs away is chased: re-quote and bid the fresh ask, up to
+        `chase_rounds` times, never above the original ask x (1 + max_chase_pct)."""
         if not (bid > 0 and ask >= bid):
             return self._ladder(symbol, qty, "buy", [option_tick(ask, symbol)] if ask > 0 else [])
         prices = limit_ladder(symbol, bid, ask, "buy")
-        return self._ladder(symbol, qty, "buy", prices, mid=prices[0])
+        fill = self._ladder(symbol, qty, "buy", prices, mid=prices[0])
+        if requote is None or max_chase_pct <= 0 or chase_rounds <= 0 or fill.qty >= qty:
+            return fill
+        cap = floor_tick(ask * (1 + max_chase_pct), symbol)
+        filled, cost, ids = fill.qty, fill.qty * fill.avg_price, list(fill.order_ids)
+        for _ in range(chase_rounds):
+            try:
+                fresh_ask = requote(symbol)[1]
+            except Exception as exc:  # noqa: BLE001 - no quote: stop chasing
+                log.info("Chase quote for %s failed: %s", symbol, exc)
+                break
+            if fresh_ask <= 0:
+                break
+            price = min(cap, option_tick(fresh_ask, symbol))   # bid the live ask, never above the cap
+            got, avg, oid = self._work(symbol, qty - filled, "buy", price, self.wait)
+            ids.append(oid)
+            cost += got * avg
+            filled += got
+            if filled >= qty:
+                break
+        if filled > fill.qty:
+            log.info("buy %s chased (ask was %.2f, cap %.2f): %g of %g filled", symbol, ask, cap, filled, qty)
+        return Fill(filled, round(cost / filled, 4) if filled else 0.0, ids)
 
     def sell_option(self, symbol: str, qty: float, bid: float, ask: float, urgent: bool) -> Fill:
         """Exits must complete. Normal: mid stepping down to the bid, then market. Urgent (stops): bid, then market."""

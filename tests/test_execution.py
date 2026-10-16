@@ -55,6 +55,27 @@ def test_buy_never_pays_above_the_ask():
     assert max(o["price"] for o in b.submitted) == 2.60 and not fill.filled
 
 
+def test_buy_chases_live_ask_when_market_runs_away():
+    b = Unfilled(2.70)                                                    # 2026-10-16: option ran past the quoted ask
+    quotes = iter([(2.66, 2.68), (2.68, 2.70)])
+    fill = agent(b).buy_option(QQQ, 3, 2.40, 2.60, requote=lambda _: next(quotes), max_chase_pct=0.10, chase_rounds=3)
+    assert [o["price"] for o in b.submitted][-2:] == [2.68, 2.70]
+    assert fill.qty == 3 and fill.avg_price == 2.70
+
+
+def test_buy_chase_never_pays_above_the_cap():
+    b = Unfilled(9.99)
+    fill = agent(b).buy_option(QQQ, 1, 2.40, 2.60, requote=lambda _: (3.50, 3.60), max_chase_pct=0.10, chase_rounds=3)
+    assert max(o["price"] for o in b.submitted) == 2.86 and not fill.filled   # 2.60 x 1.10
+    assert len(b.submitted) == 5 + 3                                     # ladder, then one order per chase round
+
+
+def test_buy_without_chase_settings_keeps_old_behaviour():
+    b = Unfilled(9.99)
+    agent(b).buy_option(QQQ, 1, 2.40, 2.60, requote=lambda _: (3.50, 3.60), max_chase_pct=0.0, chase_rounds=3)
+    assert max(o["price"] for o in b.submitted) == 2.60
+
+
 def test_normal_exit_tries_mid_first_urgent_goes_to_bid_then_market():
     b = Unfilled(0.0, "sell")                                             # nothing fills at a limit
     agent(b).sell_option(QQQ, 2, 2.40, 2.60, urgent=False)

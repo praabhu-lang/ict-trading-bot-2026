@@ -198,9 +198,15 @@ class SchwabClient:
         df.index = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(ET)
         return df[["open", "high", "low", "close", "volume"]].astype(float)
 
-    def quotes(self, symbols: list[str]) -> dict[str, dict]:
-        data = self._get_json("/marketdata/v1/quotes", {"symbols": ",".join(symbols), "fields": "quote"})
-        return {k: (v or {}).get("quote", {}) for k, v in data.items()}
+    def quotes(self, symbols: list[str], fundamental: bool = False) -> dict[str, dict]:
+        """Quote fields per symbol; with fundamental=True also the fundamental (avg10DaysVolume, ...) and regular-session
+        (regularMarketLastPrice, ...) fields merged in."""
+        data = self._get_json("/marketdata/v1/quotes", {"symbols": ",".join(symbols),
+                                                        "fields": "quote,fundamental,regular" if fundamental else "quote"})
+        if not fundamental:
+            return {k: (v or {}).get("quote", {}) for k, v in data.items()}
+        return {k: {**(v or {}).get("fundamental", {}), **(v or {}).get("regular", {}), **(v or {}).get("quote", {})}
+                for k, v in data.items()}
 
 
 def _num(value) -> float:
