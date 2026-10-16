@@ -153,9 +153,11 @@ class Ledger:
     def trades_on(self, d: date) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM trades WHERE trade_date = ?", (d.isoformat(),))]
 
-    def total_realized_pnl(self) -> float:
-        row = self.conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM trades WHERE status = 'CLOSED'").fetchone()
-        return float(row[0])
+    def total_realized_pnl(self, asset_class: str | None = None) -> float:
+        sql, args = "SELECT COALESCE(SUM(realized_pnl), 0) FROM trades WHERE status = 'CLOSED'", ()
+        if asset_class:
+            sql, args = sql + " AND asset_class = ?", (asset_class,)
+        return float(self.conn.execute(sql, args).fetchone()[0])
 
     def realized_pnl_on(self, d: date) -> float:
         row = self.conn.execute(

@@ -527,7 +527,7 @@ class TradingEngine:
             self.status["gates"] = [f"First-candle: done for today ({self.ledger.get_kv(done_key)})"]
             return 0
         acct = self.broker.account()
-        equity = s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
+        equity = s.trading_equity(acct.equity, self.ledger.total_realized_pnl("option"))   # options pool
         peak = max(float(self.ledger.get_kv("fc_peak_equity", 0) or 0), equity)
         self.ledger.set_kv("fc_peak_equity", peak)
         phase2 = bool(self.ledger.get_kv("fc_phase2_reached")) or equity >= s.fc_phase2_equity
@@ -833,7 +833,8 @@ class TradingEngine:
         n_today = sum(1 for x in book if x["date"] == today) + sum(
             1 for x in (self.ledger.get_kv("vrz_paper_log") or []) if x["date"] == today)
         earnings = set(self.ledger.get_kv(f"earnings:{today}", []) or [])
-        equity = s.trading_equity(self.broker.account().equity, self.ledger.total_realized_pnl())
+        paper_pnl = sum(float(x.get("pnl") or 0) for x in (self.ledger.get_kv("vrz_paper_log") or []))
+        equity = s.stock_equity(self.broker.account().equity, paper_pnl)            # stock pool
         for sig, _chain in sorted(candidates, key=lambda c: c[0].score, reverse=True):
             block = list(gate.reasons)
             if sig.ticker in earnings:

@@ -10,7 +10,7 @@ Signal (scan 07:00-08:00 ET, Schwab quotes incl. extended hours):
   - pre-market last >= prev close x (1 + `bio_min_gap`), security status normal (not halted)
   - a Tavily headline from today names a catalyst (FDA / trial data) and nothing like a buyout or a stock offering
 Trade (simulated, no broker order): bought at the ask + `bio_slip`, shares = min(risk budget / stop distance,
-  `bio_max_pos_pct` of equity / price, 1% of pre-market volume), at most `bio_max_open` positions.
+  `bio_max_pos_pct` of the stock pool (stock_capital) / price, 1% of pre-market volume), at most `bio_max_open` positions.
 Exits on the daily bar after the close: stop -`bio_stop_pct` (a gap through it fills at the open), target `bio_rr` x the
   stop, else after `bio_max_hold` sessions at the close.
 """

@@ -130,7 +130,7 @@ def first_candle_plan(s: Settings, ledger: Ledger, market: MarketData, quotes: d
     dashboard as kv 'fc_premarket')."""
     d = now.date()
     shadow = [float(x["ret"]) for x in (ledger.get_kv("fc_shadow") or [])]
-    equity = s.starting_capital + ledger.total_realized_pnl() if s.starting_capital > 0 else None
+    equity = s.starting_capital + ledger.total_realized_pnl("option") if s.starting_capital > 0 else None
     phase2 = bool(ledger.get_kv("fc_phase2_reached")) or (equity or 0) >= s.fc_phase2_equity
     profile, why = fc.profile_for(shadow, s) if s.fc_mode == "smart" else ("classic", "")
     mult, notes = fc.size_multiplier(shadow, phase2, s) if s.fc_mode == "smart" else (1.0, [])

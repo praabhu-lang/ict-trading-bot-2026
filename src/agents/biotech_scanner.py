@@ -87,7 +87,8 @@ def _scan(s, ledger, schwab, news, notifier, now) -> dict:
                 else:
                     ask = _num(q, "askPrice", "lastPrice")
                     entry = round(ask * (1 + s.bio_slip), 2)
-                    sh = bg.size(s.bio_equity, entry, s, _num(q, "totalVolume"))
+                    pool = s.stock_capital + sum(float(x.get("pnl") or 0) for x in (ledger.get_kv("bio_paper_log") or []))
+                    sh = bg.size(pool, entry, s, _num(q, "totalVolume"))            # stock pool
                     if sh < 1:
                         rec["decision"] = "skip: too little pre-market volume for 1% sizing"
                     else:

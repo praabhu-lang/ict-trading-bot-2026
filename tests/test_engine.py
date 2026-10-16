@@ -327,3 +327,10 @@ def test_options_only_index_never_falls_back_to_stock(ledger, monkeypatch):
     engine.run_cycle(scan=True)
     assert ledger.open_trades() == [] and broker.submitted == []
     assert "index options only" in ledger.signals_on(TODAY)[0]["reason"]
+
+
+def test_separate_option_and_stock_pools():
+    s = Settings(starting_capital=9_288, stock_capital=10_000)
+    assert s.trading_equity(99_288, -44) == 9_244 and s.stock_equity(99_288, 120) == 10_120
+    assert Settings(stock_capital=0).stock_equity(99_288, 0) == 99_288
+    assert s.trading_equity(5_000, 0) == 5_000                          # never more than the account

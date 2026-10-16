@@ -66,7 +66,8 @@ class Settings:
     # --- capital & risk ---
     # Sizing equity = starting_capital + bot's cumulative realized P&L (profits reinvested),
     # capped at the broker account's equity. 0 = use the full account equity.
-    starting_capital: float = 10_000.0
+    starting_capital: float = 10_000.0   # options pool (first-candle sizes on this + realized option P&L)
+    stock_capital: float = 10_000.0      # stock pool (VRZ paper stock trades: this + their realized P&L)
     options_allocation_pct: float = 0.20
     risk_per_trade_pct: float = 0.02
     stock_allocation_pct: float = 0.50
@@ -151,12 +152,11 @@ class Settings:
 
     # --- Biotech pre-market gap-up: PAPER ONLY, simulated on Schwab quotes (src/strategy/biotech_gap.py) ---
     bio_paper: bool = True
-    bio_equity: float = 9_000.0          # paper account the trades are sized on
     bio_min_gap: float = 0.30            # pre-market last >= prev close x 1.30
     bio_min_price: float = 1.0
     bio_min_dollar_vol: float = 5e6      # avg daily $ volume (10-day avg volume x prev close)
-    bio_risk_pct: float = 0.05           # loss at the stop, share of bio_equity
-    bio_max_pos_pct: float = 0.25        # position value cap, share of bio_equity
+    bio_risk_pct: float = 0.05           # loss at the stop, share of the stock pool (stock_capital + P&L)
+    bio_max_pos_pct: float = 0.25        # position value cap, share of the stock pool
     bio_stop_pct: float = 0.15
     bio_rr: float = 2.0                  # target = 2 x the stop distance (+30%)
     bio_max_hold: int = 20               # sessions
@@ -183,6 +183,7 @@ class Settings:
     # Bounds applied to dashboard overrides so a typo cannot create a dangerous config.
     _BOUNDS = {
         "starting_capital": (0.0, 10_000_000.0),
+        "stock_capital": (0.0, 10_000_000.0),
         "options_allocation_pct": (0.0, 0.50),
         "risk_per_trade_pct": (0.0, 0.10),
         "stock_allocation_pct": (0.0, 1.0),
@@ -236,7 +237,6 @@ class Settings:
         "fc_trail_after": (0.25, 5.0),
         "fc_trail_x": (0.25, 5.0),
         "fc_entry_chase_pct": (0.0, 0.25),
-        "bio_equity": (1_000.0, 10_000_000.0),
         "bio_min_gap": (0.10, 2.0),
         "bio_min_price": (0.5, 100.0),
         "bio_min_dollar_vol": (1e5, 1e10),
@@ -300,6 +300,12 @@ class Settings:
         if self.starting_capital <= 0:
             return account_equity
         return max(0.0, min(account_equity, self.starting_capital + realized_pnl))
+
+    def stock_equity(self, account_equity: float, realized_pnl: float) -> float:
+        """Stock pool: stock_capital + its realized P&L, capped at the account (0 = the full account equity)."""
+        if self.stock_capital <= 0:
+            return account_equity
+        return max(0.0, min(account_equity, self.stock_capital + realized_pnl))
 
     def to_dict(self) -> dict:
         return asdict(self)
