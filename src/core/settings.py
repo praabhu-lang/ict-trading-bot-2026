@@ -68,6 +68,7 @@ class Settings:
     # capped at the broker account's equity. 0 = use the full account equity.
     starting_capital: float = 10_000.0   # options pool (first-candle sizes on this + realized option P&L)
     stock_capital: float = 10_000.0      # stock pool (VRZ paper stock trades: this + their realized P&L)
+    reserve_capital: float = 0.0         # never deployed (live: 80k): pools and real orders stay within account - reserve
     options_allocation_pct: float = 0.20
     risk_per_trade_pct: float = 0.02
     stock_allocation_pct: float = 0.50
@@ -184,6 +185,7 @@ class Settings:
     _BOUNDS = {
         "starting_capital": (0.0, 10_000_000.0),
         "stock_capital": (0.0, 10_000_000.0),
+        "reserve_capital": (0.0, 100_000_000.0),
         "options_allocation_pct": (0.0, 0.50),
         "risk_per_trade_pct": (0.0, 0.10),
         "stock_allocation_pct": (0.0, 1.0),
@@ -297,15 +299,17 @@ class Settings:
         return s
 
     def trading_equity(self, account_equity: float, realized_pnl: float) -> float:
+        room = max(0.0, account_equity - self.reserve_capital)
         if self.starting_capital <= 0:
-            return account_equity
-        return max(0.0, min(account_equity, self.starting_capital + realized_pnl))
+            return room
+        return max(0.0, min(room, self.starting_capital + realized_pnl))
 
     def stock_equity(self, account_equity: float, realized_pnl: float) -> float:
-        """Stock pool: stock_capital + its realized P&L, capped at the account (0 = the full account equity)."""
+        """Stock pool: stock_capital + its realized P&L, capped at account - reserve (0 = all of that)."""
+        room = max(0.0, account_equity - self.reserve_capital)
         if self.stock_capital <= 0:
-            return account_equity
-        return max(0.0, min(account_equity, self.stock_capital + realized_pnl))
+            return room
+        return max(0.0, min(room, self.stock_capital + realized_pnl))
 
     def to_dict(self) -> dict:
         return asdict(self)

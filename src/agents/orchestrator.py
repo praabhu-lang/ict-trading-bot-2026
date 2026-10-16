@@ -32,7 +32,7 @@ from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
 from .monitor_agent import momentum_against, option_exit_reason, stock_exit_reason
 from .news_agent import NewsAgent
-from .risk_agent import Gate, account_gate, flatten_time, open_risk, session_gate, size_option, size_stock
+from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_room, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
 URGENT_EXITS = {"STOP_LOSS", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}   # EOD has 15 min: it works the mid first
@@ -658,8 +658,20 @@ class TradingEngine:
         qty = fc.contracts_for(equity, contract.ask, premium_pct) if contract else 0
         comps = {"or_high": setup.or_high, "or_low": setup.or_low, "range": round(setup.range, 2), "plan": label,
                  "premium_pct": round(premium_pct, 4)}
+        reserve_note = ""
+        if contract and qty >= 1:                    # hard guard: never dip into reserve_capital
+            try:
+                acct = self.broker.account()
+                room = reserve_room(s, acct.equity, self.broker.positions())
+            except Exception as exc:  # noqa: BLE001 - cannot verify the reserve: do not trade
+                room, reserve_note = 0.0, f"reserve check failed ({exc})"[:120]
+            fit = int(room // (contract.ask * 100)) if contract.ask > 0 else 0
+            if fit < qty:
+                reserve_note = reserve_note or f"reserve {s.reserve_capital:,.0f}: room {room:,.0f} fits {fit} contract(s)"
+                qty = fit
         if not contract or qty < 1:
-            why = "no contract near the target delta" if not contract else f"1 contract ({contract.ask * 100:,.0f}) > 20% of equity"
+            why = ("no contract near the target delta" if not contract else reserve_note
+                   or f"1 contract ({contract.ask * 100:,.0f}) > 20% of equity")
             self.ledger.record_signal(d, setup.ticker, setup.direction, 100, setup.entry_ref, 0, target, comps, "BLOCKED", why)
             self._fc_today(d, decision="NO TRADE", reason=why)
             return False

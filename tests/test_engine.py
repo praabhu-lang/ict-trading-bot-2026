@@ -334,3 +334,13 @@ def test_separate_option_and_stock_pools():
     assert s.trading_equity(99_288, -44) == 9_244 and s.stock_equity(99_288, 120) == 10_120
     assert Settings(stock_capital=0).stock_equity(99_288, 0) == 99_288
     assert s.trading_equity(5_000, 0) == 5_000                          # never more than the account
+
+
+def test_reserve_caps_both_pools_and_counts_every_broker_position():
+    from src.agents.risk_agent import reserve_room
+    from src.brokers.base import Position
+    s = Settings(starting_capital=9_288, stock_capital=10_000, reserve_capital=80_000)
+    assert s.trading_equity(99_288, 0) == 9_288 and s.stock_equity(99_288, 0) == 10_000
+    assert s.trading_equity(85_000, 0) == 5_000 and s.stock_equity(85_000, 0) == 5_000   # losses shrink, reserve holds
+    pos = [Position("MPC", 6, 478.0, 480.0, 12.0, "stock"), Position("QQQ261019P00700000", 2, 1.0, 1.5, 100.0, "option")]
+    assert reserve_room(s, 99_288, pos) == 99_288 - 80_000 - 2_880 - 300

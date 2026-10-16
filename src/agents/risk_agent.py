@@ -98,3 +98,10 @@ def size_stock(s: Settings, equity: float, entry: float, stop: float, buying_pow
     by_alloc = (equity * s.stock_allocation_pct - open_stock_cost) / entry
     by_bp = max(buying_power, 0) / entry
     return max(0, math.floor(min(by_risk, by_alloc, by_bp)))
+
+
+def reserve_room(s: Settings, account_equity: float, positions) -> float:
+    """Dollars a new real order may still use: account equity - reserve_capital - everything already deployed
+    at the broker (bot and manual positions, options x100), so the reserve is never touched."""
+    deployed = sum(abs(p.qty) * p.current_price * (100.0 if p.asset_class == "option" else 1.0) for p in positions)
+    return max(0.0, account_equity - s.reserve_capital - deployed)

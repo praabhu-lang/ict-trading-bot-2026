@@ -111,6 +111,53 @@ def stats(df: pd.DataFrame) -> dict:
             "worst": df.realized_pnl.min(), "streak": streak}
 
 
+# ---------------------------------------------------------------------------------- capital pools
+def _paper_log(led, key: str, kind: str) -> pd.DataFrame:
+    """Closed simulated trades from a ledger kv log as (day, pnl, source) rows."""
+    rows = (led.get_kv(key) if led else None) or []
+    if not rows:
+        return pd.DataFrame(columns=["day", "pnl", "source"])
+    df = pd.DataFrame(rows)
+    day = df["exit_date"] if "exit_date" in df else df["date"]
+    return pd.DataFrame({"day": pd.to_datetime(day).dt.date, "pnl": df["pnl"].astype(float), "source": kind})
+
+
+def pool_pnl(led, closed: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Realized P&L rows per capital pool. Options: the bot's option trades. Stocks: the bot's stock trades plus the
+    simulated VRZ and biotech paper trades (labelled by source)."""
+    def book(cls):
+        if closed.empty:
+            return pd.DataFrame(columns=["day", "pnl", "source"])
+        x = closed[closed.asset_class == cls]
+        return pd.DataFrame({"day": x.day, "pnl": x.realized_pnl, "source": "bot"})
+    parts = [book("stock"), _paper_log(led, "vrz_paper_log", "VRZ paper"), _paper_log(led, "bio_paper_log", "biotech paper")]
+    return {"options": book("option"), "stocks": pd.concat([x for x in parts if not x.empty] or [parts[0]], ignore_index=True)}
+
+
+def pools_panel(led, settings, closed: pd.DataFrame, acct_eq: float | None, today: date) -> None:
+    """Options pool / stock pool / reserve, each pool with its own P&L (all, this month, today)."""
+    pnl = pool_pnl(led, closed)
+    month0 = today.replace(day=1)
+
+    def tot(df, since=None):
+        return float(df[df.day >= since].pnl.sum() if since else df.pnl.sum()) if not df.empty else 0.0
+
+    o, s_ = pnl["options"], pnl["stocks"]
+    paper = s_[s_.source != "bot"]
+    room = (acct_eq - settings.reserve_capital) if acct_eq else None
+    stat_row([
+        ("Options pool", money(settings.starting_capital + tot(o)),
+         f"start {money(settings.starting_capital)} · P&L {money(tot(o), True)}"),
+        ("Options P&L", f"{money(tot(o, month0), True)} month", f"today {money(tot(o, today), True)}"),
+        ("Stock pool", money(settings.stock_capital + tot(s_)),
+         f"start {money(settings.stock_capital)} · P&L {money(tot(s_), True)}"
+         + (f" (paper {money(tot(paper), True)})" if not paper.empty else "")),
+        ("Stocks P&L", f"{money(tot(s_, month0), True)} month", f"today {money(tot(s_, today), True)}"),
+        ("Reserve (untouched)", money(settings.reserve_capital),
+         f"usable {money(room)} of account {money(acct_eq)}" if room is not None else None),
+    ])
+
+
 # ------------------------------------------------------------------------------------------- Today
 def today_page(led, settings, engine_status: dict, now: datetime, broker, broker_error, ss) -> None:
     today = now.date()
@@ -149,6 +196,7 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
         ("Phase · size", f"{phase} · x{fc_today.get('size_mult', pre.get('size_mult', settings.fc_size_scale))}",
          "; ".join(fc_today.get("size_notes") or pre.get("size_notes") or [])),
     ])
+    pools_panel(led, settings, closed, acct_eq, today)
 
     left, right = st.columns([3, 2])
     with left:
@@ -251,6 +299,11 @@ def _filter_period(df: pd.DataFrame, today: date, key: str) -> tuple[pd.DataFram
 
 def performance_page(led, settings, today: date) -> None:
     all_closed = closed_trades(led)
+    pool = st.radio("Book", ["All", "Options", "Stocks"], horizontal=True, key="perf_book",
+                    help="Options = options pool, Stocks = stock pool (bot stock trades; simulated paper trades are "
+                         "on the Today page)")
+    if pool != "All" and not all_closed.empty:
+        all_closed = all_closed[all_closed.asset_class == pool.lower().rstrip("s")]
     df, _ = _filter_period(all_closed, today, "perf_period")
     if df.empty:
         st.info("No closed trades in this period yet. The Research page shows the strategy's backtest from the "
@@ -266,8 +319,9 @@ def performance_page(led, settings, today: date) -> None:
         ("Longest losing streak", str(s["streak"]), None),
     ])
     daily = df.groupby("day").realized_pnl.sum()
-    start = settings.starting_capital + (all_closed[all_closed.day < df.day.min()].realized_pnl.sum()
-                                         if not all_closed.empty else 0.0)
+    base = {"Options": settings.starting_capital, "Stocks": settings.stock_capital}.get(
+        pool, settings.starting_capital + settings.stock_capital)
+    start = base + (all_closed[all_closed.day < df.day.min()].realized_pnl.sum() if not all_closed.empty else 0.0)
     eq = start + daily.cumsum()
     st.plotly_chart(equity_line(pd.to_datetime(eq.index), eq.values, "Trading equity (closed trades)", start),
                     width="stretch")

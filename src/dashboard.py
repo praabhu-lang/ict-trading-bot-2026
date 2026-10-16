@@ -543,8 +543,13 @@ with tab_set:
         fomc_rr = c[3].number_input("Target x stop", 0.5, 5.0, settings.fomc_rr, 0.25)
         fomc_qty = c[4].number_input("Contracts", 1, 10, settings.fomc_qty)
         st.subheader("Capital & risk")
-        start_cap = st.number_input("Trading capital $ (sizing base; bot profits are added back; 0 = whole account)",
-                                    0.0, 10_000_000.0, float(settings.starting_capital), 1_000.0)
+        cc = st.columns(3)
+        start_cap = cc[0].number_input("Options pool $ (first-candle sizing; option profits added back)",
+                                       0.0, 10_000_000.0, float(settings.starting_capital), 1_000.0)
+        stock_cap = cc[1].number_input("Stock pool $ (stock strategies; stock profits added back)",
+                                       0.0, 10_000_000.0, float(settings.stock_capital), 1_000.0)
+        reserve_cap = cc[2].number_input("Reserve $ (never used: no real order may dip into it)",
+                                         0.0, 100_000_000.0, float(settings.reserve_capital), 1_000.0)
         c = st.columns(3)
         risk = c[0].number_input("Risk per trade %", 0.5, 10.0, settings.risk_per_trade_pct * 100, 0.5)
         pool = c[1].number_input("Max options exposure %", 5.0, 50.0, settings.options_allocation_pct * 100, 5.0)
@@ -600,7 +605,8 @@ with tab_set:
                           for r in ev_df.dropna(subset=["date", "name"]).to_dict("records")]
                 save_control({
                     "broker": broker_choice, "auto_trade": auto_trade, "universe": universe,
-                    "starting_capital": float(start_cap),
+                    "starting_capital": float(start_cap), "stock_capital": float(stock_cap),
+                    "reserve_capital": float(reserve_cap),
                     "risk_per_trade_pct": risk / 100, "options_allocation_pct": pool / 100,
                     "stock_allocation_pct": stock_alloc / 100, "max_trades_per_day": int(max_trades),
                     "max_open_positions": int(max_open), "daily_loss_limit_pct": loss_lim / 100,

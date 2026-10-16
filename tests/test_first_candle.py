@@ -208,3 +208,23 @@ def test_falls_back_to_broker_quote_when_schwab_has_none(ledger):
     eng.market.option_quotes = {}
     eng.run_cycle(scan=True)
     assert len(ledger.open_trades()) == 1                                # chain bid/ask used, broker quote for exits
+
+
+def test_reserve_capital_blocks_entry_that_would_dip_into_it(ledger):
+    from src.brokers.base import Position
+    spy = bear_day(follow=[99.5, 99.0, 98.5, 97.5] + [97.4] * 72)
+    eng, broker, _ = engine_for(ledger, at(9, 40, 30), spy, settings=S(reserve_capital=2_000, starting_capital=8_000, vrz_paper=False))
+    broker.pos["MPC"] = Position("MPC", 17, 478.0, 493.0, 255.0, "stock")    # manual: 8,381 deployed -> no room
+    eng.run_cycle(scan=True)
+    assert ledger.open_trades() == []
+    assert "reserve 2,000" in ledger.get_kv(f"fc_today:{TODAY.isoformat()}")["reason"]
+
+
+def test_reserve_capital_trims_entry_to_the_room_left(ledger):
+    from src.brokers.base import Position
+    spy = bear_day(follow=[99.5, 99.0, 98.5, 97.5] + [97.4] * 72)
+    eng, broker, _ = engine_for(ledger, at(9, 40, 30), spy, settings=S(reserve_capital=2_000, starting_capital=8_000))
+    broker.pos["MPC"] = Position("MPC", 15, 478.0, 493.0, 225.0, "stock")    # 7,395 deployed -> room 605
+    eng.run_cycle(scan=True)
+    t = ledger.open_trades()[0]
+    assert t["qty"] * t["entry_price"] * 100 <= 605
