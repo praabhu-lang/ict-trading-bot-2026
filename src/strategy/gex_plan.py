@@ -293,16 +293,18 @@ def wall_reaction(today: pd.DataFrame, side: str, level: float, near: float) -> 
     return 0, "no test of the level in the last 3 bars"
 
 
-def convergence(side: str, level: float, p: Profile, ctx: dict, mtf: dict, news: dict | None) -> tuple[int, int, dict]:
-    """(rate 0-100 agreeing, points against, {factor: {score, weight, note}}) for trading `side` at `level`."""
+def convergence(side: str, level: float, p: Profile, ctx: dict, mtf: dict, news: dict | None,
+                band: tuple[float, float] | None = None) -> tuple[int, int, dict]:
+    """(rate 0-100 agreeing, points against, {factor: {score, weight, note}}) for trading `side` at `level`.
+    `band` (low, high): the zone; price inside it scores the GEX level (default: level +/- near)."""
     call = side == "CALL"
     sign = 1 if call else -1
     near = near_band(p)
     spot = p.spot
     f: dict[str, tuple[int, str]] = {}
     dist = spot - level
-    f["gex_level"] = (1 if abs(dist) <= near else 0, f"price {abs(dist):.2f} {'above' if dist >= 0 else 'below'} "
-                      f"{level:.2f} (zone ±{near:.2f})")
+    lo_, hi_ = band or (level - near, level + near)
+    f["gex_level"] = (1 if lo_ <= spot <= hi_ else 0, f"price {spot:.2f} vs zone {lo_:.2f}-{hi_:.2f}")
     for tf in (30, 5):
         m = mtf.get(tf) if mtf else None
         if not m:
@@ -342,7 +344,7 @@ def zone_rates(p: Profile, ctx: dict, mtf: dict, news: dict | None) -> list[dict
     """plan_zones with the convergence rate of trading each one right now."""
     out = []
     for z in plan_zones(p):
-        rate, against, _ = convergence(z["side"], z["level"], p, ctx, mtf, news)
+        rate, against, _ = convergence(z["side"], z["level"], p, ctx, mtf, news, (z["low"], z["high"]))
         out.append({**z, "rate": rate, "against": against})
     return out
 
@@ -368,7 +370,8 @@ def _trigger(p: Profile, ctx: dict, near: float) -> tuple[str, str, float, float
         return "PUT", "Rejected at gamma flip (negative gamma)", flip, flip + near, pw if pw and pw < spot - near else spot - em
     if falling and (not pw or spot - pw > 2 * near):
         stop = min(spot + 0.5 * em, flip + near) if flip else spot + 0.5 * em
-        return "PUT", "Momentum below flip (negative gamma)", flip or spot, stop, pw if pw and pw < spot else spot - em
+        name = "Momentum below flip (negative gamma)" if flip else "Momentum, negative gamma (no flip in range)"
+        return "PUT", name, flip or spot, stop, pw if pw and pw < spot else spot - em
     return None
 
 
@@ -391,9 +394,16 @@ def plan_zones(p: Profile) -> list[dict]:
         if g.gamma_flip:
             out.append({"side": "CALL", "level": g.gamma_flip, "low": g.gamma_flip, "high": g.gamma_flip + near,
                         "label": "CALL on flip reclaim"})
-    elif g.gamma_flip:
-        out.append({"side": "PUT", "level": g.gamma_flip, "low": g.gamma_flip - near, "high": g.gamma_flip,
-                    "label": "PUT on flip rejection"})
+    else:
+        if g.gamma_flip:
+            out.append({"side": "PUT", "level": g.gamma_flip, "low": g.gamma_flip - near, "high": g.gamma_flip,
+                        "label": "PUT on flip rejection"})
+        # momentum: anywhere below the flip with room (2 x near) above the put wall - same rule as _trigger
+        top = min(g.gamma_flip, spot + near) if g.gamma_flip else spot + near
+        bottom = g.put_wall + 2 * near if g.put_wall and g.put_wall < spot else spot - p.expected_move
+        if top > bottom:
+            out.append({"side": "PUT", "level": spot, "low": bottom, "high": top,
+                        "label": "PUT momentum (negative gamma, falling)"})
     return out
 
 

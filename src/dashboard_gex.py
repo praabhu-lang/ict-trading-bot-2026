@@ -214,7 +214,8 @@ def idea_card(r: dict) -> None:
         st.dataframe(factor_table(i.confluence), hide_index=True, width="stretch")
     for z in zones:
         with st.expander(f"Why {z['rate']}%: {z['label']} {z['level']:,.2f}"):
-            _, _, conf = gp.convergence(z["side"], z["level"], p, r["ctx"], r.get("mtf") or {}, r.get("news"))
+            _, _, conf = gp.convergence(z["side"], z["level"], p, r["ctx"], r.get("mtf") or {}, r.get("news"),
+                                        (z["low"], z["high"]))
             st.dataframe(factor_table(conf), hide_index=True, width="stretch")
 
 
