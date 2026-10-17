@@ -237,8 +237,16 @@ FACTOR_RULES = {
 def rules_guide() -> None:
     """The page's rules, generated from the constants the code uses (gex_plan), so it cannot drift."""
     w = gp.CONV_WEIGHTS
-    with st.expander("📘 Rules: how to read and use this page", expanded=False):
+    with st.expander("📘 How GEX works & how to use this chart", expanded=True):
         st.markdown(f"""
+**How GEX works.** When you buy a call or put, a market maker (the dealer) usually sells it to you and hedges by
+trading the stock. *Gamma* is how much that hedge must change per $1 move; summed over every strike's open interest
+it is the **gamma exposure (GEX)**: how much dealers must buy or sell as price moves.
+- **Positive gamma** (price above the gamma flip): dealers sell rallies and buy dips, fighting every move - price
+  ranges and pins to big strikes. *Fade the edges.*
+- **Negative gamma** (price below the flip): dealers sell into drops and buy into rips, fuelling every move - price
+  trends and moves fast. *Go with momentum.*
+
 **What this page is.** Our own dealer gamma exposure (GEX) from Schwab option chains, plus price structure, turned
 into a CALL or PUT idea per ticker. **Suggestions only - nothing places orders.** Use 🟢 ACTIVE ideas; everything
 else is a map of where an idea could appear.
