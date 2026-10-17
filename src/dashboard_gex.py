@@ -38,7 +38,11 @@ def summary_row(r: dict, live: dict) -> dict:
         "Spot (chain)": round(p.spot, 2), "Expiry": f"{p.dte}DTE", "Gamma": regime,
         "Flip": g.gamma_flip and round(g.gamma_flip, 2), "Put wall": g.put_wall, "Call wall": g.call_wall,
         "Exp. move ±": round(p.expected_move, 2), "P/C vol": p.pc_volume, "Weighted by": p.weight,
-        "Idea": f"{'🟢' if i.status == 'ACTIVE' else '⚪'} {i.side or 'WAIT'}" + (f" {i.grade}" if i.grade else ""),
+        "Idea": f"{'🟢' if i.status == 'ACTIVE' else '⚪'} {i.side or 'WAIT'}" + (f" {i.rate}%" if i.side else ""),
+        "Best zone": max((f"{z['rate']}% {z['side']} @ {z['level']:,.2f}" for z in r.get("zones") or []),
+                         key=lambda t: int(t.split("%")[0]), default=""),
+        "30m structure": {1: "▲ up", -1: "▼ down", 0: "↔ mixed"}[(r.get("mtf") or {}).get(30, {}).get(
+            "structure", {}).get("trend", 0)],
         "Contract": f"{i.strike:g}{'C' if i.side == 'CALL' else 'P'} @ {i.mid:.2f}" if i.contract else "",
         "Stop": i.stop, "Target": i.target, "Why": i.reason,
     }
@@ -82,9 +86,13 @@ def _gutter(fig, labels: list[tuple[float, str]], lo: float, hi: float, colors: 
                           line=dict(color=colors["axis"], width=1))
 
 
-def chart(r: dict, show: str, now: datetime, quote: dict | None = None) -> go.Figure:
-    """Left: today's 5-min candles + VWAP and every level. Right: GEX / open interest / volume by strike on the
-    same price axis, so a wall on the right lines up with price on the left."""
+TF_SESSIONS = {5: 1, 15: 2, 30: 3}     # sessions of candles shown per timeframe
+
+
+def chart(r: dict, show: str, now: datetime, quote: dict | None = None, tf: int = 5) -> go.Figure:
+    """Left: candles (5/15/30-min) with swing structure labels, VWAP and every level, the CALL/PUT zones with their
+    convergence %. Right: GEX / open interest / volume by strike on the same price axis, so a wall on the right lines
+    up with price on the left."""
     c = palette()
     p, ctx, idea = r["profile"], r["ctx"], r["idea"]
     price = quote["price"] if quote else p.spot
@@ -94,26 +102,39 @@ def chart(r: dict, show: str, now: datetime, quote: dict | None = None) -> go.Fi
 
     bars = r["bars"]
     today = bars[bars.index.date == now.date()] if bars is not None and not bars.empty else None
-    if today is not None and not today.empty:
+    m = (r.get("mtf") or {}).get(tf)
+    candles = None
+    if m is not None and not m["candles"].empty:
+        days = sorted(set(m["candles"].index.date))[-TF_SESSIONS[tf]:]
+        candles = m["candles"][[d in days for d in m["candles"].index.date]]
+    if candles is not None and not candles.empty:
         fig.add_trace(go.Candlestick(
-            x=today.index, open=today["open"], high=today["high"], low=today["low"], close=today["close"],
+            x=candles.index, open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"],
             increasing=dict(line=dict(color=c["gain"], width=1), fillcolor=c["gain"]),
-            decreasing=dict(line=dict(color=c["loss"], width=1), fillcolor=c["loss"]), name="Price",
+            decreasing=dict(line=dict(color=c["loss"], width=1), fillcolor=c["loss"]), name=f"{tf}m",
             showlegend=False), row=1, col=1)
+        lo, hi = min(lo, float(candles["low"].min())), max(hi, float(candles["high"].max()))
+        start = candles.index[0]
+        for sw in m["structure"]["swings"]:        # HH / HL / LH / LL at each swing point
+            if sw["ts"] < start:
+                continue
+            up = sw["kind"] == "high"
+            fig.add_annotation(x=sw["ts"], y=sw["price"], text=sw["label"], showarrow=False, row=1, col=1,
+                               yshift=10 if up else -10, font=dict(size=10, color=c["text"]))
+    else:
+        fig.add_annotation(text="No intraday bars yet", x=0.3, y=p.spot, xref="paper", showarrow=False,
+                           font=dict(color=c["muted"]))
+    if today is not None and not today.empty and float(today["volume"].sum()) > 0:
         vw = (today["close"] * today["volume"]).cumsum() / today["volume"].cumsum().where(lambda v: v > 0)
         fig.add_trace(go.Scatter(x=today.index, y=vw, mode="lines", name="VWAP",
                                  line=dict(color=c["text"], width=2), hovertemplate="VWAP %{y:,.2f}<extra></extra>"),
                       row=1, col=1)
-        lo, hi = min(lo, float(today["low"].min())), max(hi, float(today["high"].max()))
     if quote:   # the live print, after the last closed 5-min bar
         x = quote["ts"] or now
         fig.add_trace(go.Scatter(x=[x], y=[price], mode="markers", name="Live",
                                  marker=dict(size=10, color=c["text"], line=dict(width=2, color=c["axis"])),
                                  hovertemplate=f"Live %{{y:,.2f}} · {quote['source']} %{{x|%H:%M:%S}}<extra></extra>"),
                       row=1, col=1)
-    else:
-        fig.add_annotation(text="No intraday bars yet", x=0.3, y=p.spot, xref="paper", showarrow=False,
-                           font=dict(color=c["muted"]))
 
     strikes = sorted(k for k in set(p.calls) | set(p.puts) if lo <= k <= hi)
     if show == "Open interest":
@@ -129,12 +150,13 @@ def chart(r: dict, show: str, now: datetime, quote: dict | None = None) -> go.Fi
         fig.add_trace(go.Bar(y=strikes, x=xs, orientation="h", name=name, marker=dict(color=color, line=dict(width=0)),
                              hovertemplate=f"{name} %{{y:g}}: %{{x:,.1f}} {unit}<extra></extra>"), row=1, col=2)
     fig.add_hline(y=price, line=dict(color=c["text"], width=2), row=1, col="all")
-    for z in gp.plan_zones(p):   # where a call / put would trigger, shaded across both panels
+    for z in r.get("zones") or gp.plan_zones(p):   # where a call / put would trigger, shaded across both panels
         color = c["gain"] if z["side"] == "CALL" else c["loss"]
         fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor=color, opacity=0.12, line_width=0, row=1, col="all")
         if not lo <= (z["low"] + z["high"]) / 2 <= hi:
             continue
-        fig.add_annotation(x=0.01, xref="x domain", y=(z["low"] + z["high"]) / 2, yref="y", text=z["label"],
+        rate = f" · <b>{z['rate']}%</b>" + (f" ({z['against']} against)" if z.get("against") else "") if "rate" in z else ""
+        fig.add_annotation(x=0.01, xref="x domain", y=(z["low"] + z["high"]) / 2, yref="y", text=z["label"] + rate,
                            showarrow=False, xanchor="left", font=dict(color=c["text"], size=11),
                            bgcolor=c["surface"])
     if idea.status == "ACTIVE":  # point at the live price with the suggested contract
@@ -148,31 +170,52 @@ def chart(r: dict, show: str, now: datetime, quote: dict | None = None) -> go.Fi
     _gutter(fig, labels, lo, hi, c)
 
     fig.update_layout(height=580, barmode="relative", bargap=0.15, margin=dict(l=64, r=150, t=40, b=56),
-                      title=dict(text=f"{p.ticker} · {p.expiry:%b %d} ({p.dte}DTE) · {show} by strike", font=dict(size=14)),
+                      title=dict(text=f"{p.ticker} · {tf}-min candles · {p.expiry:%b %d} ({p.dte}DTE) · {show} by strike",
+                                 font=dict(size=14)),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="closest",
                       legend=dict(orientation="h", y=-0.1, x=0, xanchor="left", font=dict(color=c["text"])),
                       font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color=c["text"]),
                       xaxis=dict(rangeslider=dict(visible=False)))
     fig.update_xaxes(showgrid=False, linecolor=c["axis"], tickfont=dict(color=c["muted"]))
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")], row=1, col=1)
     fig.update_xaxes(title=dict(text=unit, font=dict(color=c["muted"], size=11)), row=1, col=2,
                      zeroline=True, zerolinecolor=c["axis"])
     fig.update_yaxes(range=[lo, hi], gridcolor=c["grid"], tickfont=dict(color=c["muted"]), tickformat=",.2f")
     return fig
 
 
+ICON = {1: "✅ agrees", -1: "❌ against", 0: "➖ unknown / neutral"}
+
+
+def factor_table(conf: dict) -> pd.DataFrame:
+    return pd.DataFrame([{"Factor": k.replace("_", " ").replace("5m", "5-min").replace("30m", "30-min").title(),
+                          "Weight": v["weight"], "Vote": ICON[v["score"]], "Detail": v["note"]} for k, v in conf.items()])
+
+
 def idea_card(r: dict) -> None:
     i, p = r["idea"], r["profile"]
     if i.status == "ACTIVE":
         tone = st.success if i.side == "CALL" else st.error
-        tone(f"**{i.side} {p.ticker} {i.strike:g} {i.expiry:%b %d} ({i.dte}DTE)** · grade {i.grade} · "
-             f"mid {i.mid:.2f}, ask {i.ask:.2f}, delta {i.delta:+.2f}  \n"
+        tone(f"**{i.side} {p.ticker} {i.strike:g} {i.expiry:%b %d} ({i.dte}DTE)** · convergence **{i.rate}%** "
+             f"(grade {i.grade}) · mid {i.mid:.2f}, ask {i.ask:.2f}, delta {i.delta:+.2f}  \n"
              f"Underlying stop **{i.stop:,.2f}** · target **{i.target:,.2f}** · {i.reason}")
     else:
         st.info(f"**{p.ticker}: WAIT** · {i.reason}")
+    zones = r.get("zones") or []
+    if zones:
+        st.caption(f"Convergence if traded now (ACTIVE needs >= {gp.MIN_CONVERGENCE}% with <= {gp.MAX_AGAINST} pts "
+                   "against, and price inside the zone):")
+        cols = st.columns(len(zones))
+        for col, z in zip(cols, zones):
+            col.metric(f"{z['label']} {z['level']:,.2f}", f"{z['rate']}%",
+                       delta=f"-{z['against']} against" if z["against"] else "nothing against",
+                       delta_color="inverse" if z["against"] else "off")
     if i.confluence:
-        icon = {1: "✅ agrees", -1: "❌ against", 0: "➖ neutral"}
-        st.dataframe(pd.DataFrame([{"Factor": k.replace("_", " ").title(), "Vote": icon[v["score"]], "Detail": v["note"]}
-                                   for k, v in i.confluence.items()]), hide_index=True, width="stretch")
+        st.dataframe(factor_table(i.confluence), hide_index=True, width="stretch")
+    for z in zones:
+        with st.expander(f"Why {z['rate']}%: {z['label']} {z['level']:,.2f}"):
+            _, _, conf = gp.convergence(z["side"], z["level"], p, r["ctx"], r.get("mtf") or {}, r.get("news"))
+            st.dataframe(factor_table(conf), hide_index=True, width="stretch")
 
 
 def tracker(led) -> None:
@@ -245,8 +288,11 @@ def gex_page(market, news, led, now: datetime) -> None:
         c[2].metric("Gamma flip", f"{g.gamma_flip:,.2f}" if g.gamma_flip else "—")
         c[3].metric("Expected move ±", f"{r['profile'].expected_move:,.2f}")
         idea_card(r)
-        show = st.radio("Right panel", ["GEX", "Open interest", "Volume"], horizontal=True, key="gex_show")
-        st.plotly_chart(chart(r, show, now, q), width="stretch", key="gex_chart")
+        cc = st.columns(2)
+        tf = cc[0].radio("Candles", [5, 15, 30], format_func=lambda m: f"{m}-min", horizontal=True, key="gex_tf",
+                         help="Swing labels: HH/HL = higher high / higher low (up structure), LH/LL = lower (down)")
+        show = cc[1].radio("Right panel", ["GEX", "Open interest", "Volume"], horizontal=True, key="gex_show")
+        st.plotly_chart(chart(r, show, now, q, tf), width="stretch", key="gex_chart")
         with st.expander(f"{pick} by strike (table)"):
             p = r["profile"]
             ks = sorted(set(p.calls) | set(p.puts))

@@ -11,12 +11,20 @@ Trigger (where to trade), from GEX of the chosen expiry (0DTE before 14:00 ET, e
       PUT on a rejection at the flip from below, PUT on momentum below the flip with room to the put wall
 "Near" a level = within a quarter of the expected move (ATM straddle) or 0.1% of spot, whichever is larger.
 
-Confluence (each agrees +1, disagrees -1, unknown 0) - an idea is ACTIVE only with a trigger, at least
-MIN_AGREE agreeing and none disagreeing:
-  volume profile  CALL: at/above the POC or at the VAL;  PUT: at/below the POC or at the VAH
-  momentum        CALL: above VWAP and the last 3 bars rising;  PUT: below VWAP and falling
-  options flow    today's put/call volume on the expiry: CALL < 0.8, PUT > 1.2
-  LLM news        sentiment >= +0.3 for CALL, <= -0.3 for PUT; an LLM "block" (news-driven tape) cancels the idea
+Convergence rate (0-100) for the side the zone trades - each factor agrees (+weight), disagrees (counted
+against) or is unknown (0, never rescaled):
+  gex_level 20      price inside the zone (within "near" of the wall / flip)
+  structure_30m 20  swing structure on 30-min candles: HH+HL or break of structure up = bullish, LH+LL / BOS down
+                    = bearish (higher timeframe: a 30m structure against the trade is a veto)
+  structure_5m 15   same on 5-min candles
+  momentum_30m 10   close > EMA9 > EMA21 with EMA9 rising (mirror for bearish)
+  momentum_5m 10    same on 5-min, and on the trade side of VWAP
+  wall_reaction 10  a 5-min rejection wick into the wall in the last 3 bars (CALL: low tags it, closes up and
+                    above; PUT: mirror); closing through the wall disagrees
+  volume_profile 5  CALL: at/above the POC or at the VAL; PUT: at/below the POC or at the VAH
+  options_flow 5    put/call volume on the expiry: CALL < 0.8, PUT > 1.2
+  llm_news 5        LLM sentiment >= +0.3 (CALL) / <= -0.3 (PUT); an LLM "block" cancels the idea
+ACTIVE = trigger + rate >= MIN_CONVERGENCE + at most MAX_AGAINST points disagreeing. Grade A >= 75, B >= 60.
 """
 from __future__ import annotations
 
@@ -40,7 +48,11 @@ FIRST_IDEA = time(9, 45)
 LAST_IDEA = time(15, 30)
 TARGET_DELTA = 0.40
 MAX_SPREAD = 0.15
-MIN_AGREE = 2
+CONV_WEIGHTS = {"gex_level": 20, "structure_30m": 20, "structure_5m": 15, "momentum_30m": 10, "momentum_5m": 10,
+                "wall_reaction": 10, "volume_profile": 5, "options_flow": 5, "llm_news": 5}
+MIN_CONVERGENCE = 60
+MAX_AGAINST = 15          # 30m structure against (20) is therefore always a veto
+SWING_K = 2               # a swing high/low is the extreme of 2 bars either side
 EXPIRY_MODES = {"auto": "Auto (0DTE until 2 pm ET, then 1DTE)", "0dte": "0DTE", "1dte": "1DTE"}
 WEIGHTS = {"oi": "Open interest (yesterday's positioning)", "volume": "Today's volume (intraday flow)"}
 
@@ -78,6 +90,8 @@ class Idea:
     expiry: date | None = None
     dte: int | None = None
     grade: str = ""
+    rate: int = 0                         # convergence 0-100
+    against: int = 0                      # weight of disagreeing factors
     confluence: dict = field(default_factory=dict)
     reason: str = ""
 
@@ -191,42 +205,145 @@ def intraday(bars: pd.DataFrame | None, d: date) -> dict:
             "falling": bool(close.iloc[-1] < close.iloc[-4]), "day_open": float(today["open"].iloc[0])}
 
 
-def confluence(side: str, p: Profile, ctx: dict, news: dict | None, near: float) -> dict:
-    """Factor -> (+1 agree | -1 disagree | 0 unknown/neutral, note)."""
+# ------------------------------------------------------------------ market structure (multi-timeframe)
+def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """5-min regular-session bars -> N-minute candles (bins on :00/:30, empty overnight bins dropped)."""
+    if minutes == 5 or bars.empty:
+        return bars
+    out = bars.resample(f"{minutes}min").agg({"open": "first", "high": "max", "low": "min", "close": "last",
+                                               "volume": "sum"})
+    return out.dropna(subset=["open"])
+
+
+def structure(df: pd.DataFrame, k: int = SWING_K) -> dict:
+    """Swing points labelled HH/LH (highs) and HL/LL (lows) against the previous swing of the same kind.
+    trend +1: last high HH and last low HL, or the last close broke above the last swing high (BOS up);
+    -1: LH + LL or BOS down; 0: mixed / not enough swings."""
+    swings: list[dict] = []
+    if len(df) < 2 * k + 3:
+        return {"trend": 0, "note": "not enough candles", "swings": swings}
+    hi, lo = df["high"].to_numpy(), df["low"].to_numpy()
+    last_h = last_l = None
+    for i in range(k, len(df) - k):
+        if hi[i] == hi[i - k:i + k + 1].max():
+            label = "H" if last_h is None else "HH" if hi[i] > last_h else "LH"
+            swings.append({"ts": df.index[i], "price": float(hi[i]), "kind": "high", "label": label})
+            last_h = hi[i]
+        if lo[i] == lo[i - k:i + k + 1].min():
+            label = "L" if last_l is None else "HL" if lo[i] > last_l else "LL"
+            swings.append({"ts": df.index[i], "price": float(lo[i]), "kind": "low", "label": label})
+            last_l = lo[i]
+    highs = [x for x in swings if x["kind"] == "high"]
+    lows = [x for x in swings if x["kind"] == "low"]
+    if not highs or not lows:
+        return {"trend": 0, "note": "no swing high/low yet", "swings": swings}
+    close = float(df["close"].iloc[-1])
+    h, l = highs[-1], lows[-1]
+    if close > h["price"]:
+        return {"trend": 1, "note": f"BOS up: close {close:.2f} > swing high {h['price']:.2f}", "swings": swings}
+    if close < l["price"]:
+        return {"trend": -1, "note": f"BOS down: close {close:.2f} < swing low {l['price']:.2f}", "swings": swings}
+    trend = 1 if (h["label"], l["label"]) == ("HH", "HL") else -1 if (h["label"], l["label"]) == ("LH", "LL") else 0
+    return {"trend": trend, "note": f"last high {h['label']} {h['price']:.2f}, last low {l['label']} {l['price']:.2f}",
+            "swings": swings}
+
+
+def ema_momentum(df: pd.DataFrame) -> tuple[int, str]:
+    if len(df) < 21:
+        return 0, "fewer than 21 candles"
+    c = df["close"]
+    e9, e21 = c.ewm(span=9, adjust=False).mean(), c.ewm(span=21, adjust=False).mean()
+    close, f, s_, slope = float(c.iloc[-1]), float(e9.iloc[-1]), float(e21.iloc[-1]), float(e9.iloc[-1] - e9.iloc[-3])
+    note = f"close {close:.2f}, EMA9 {f:.2f} ({'rising' if slope > 0 else 'falling'}), EMA21 {s_:.2f}"
+    if close > f > s_ and slope > 0:
+        return 1, note
+    if close < f < s_ and slope < 0:
+        return -1, note
+    return 0, note
+
+
+def market_structure(bars: pd.DataFrame | None, d: date) -> dict:
+    """Structure + momentum on 5, 15 and 30-minute candles. 5m uses the last session and a half (swings form
+    intraday); 15m/30m use every session in `bars` (the bot loads ~6), so the higher timeframe sees days of swings."""
+    if bars is None or bars.empty:
+        return {}
+    out = {"today": day_slice(bars, d)}
+    for tf in (5, 15, 30):
+        df = resample(bars, tf)
+        if tf == 5:
+            df = df.tail(120)
+        out[tf] = {"candles": df, "structure": structure(df), "momentum": ema_momentum(df)}
+    return out
+
+
+def wall_reaction(today: pd.DataFrame, side: str, level: float, near: float) -> tuple[int, str]:
+    if today is None or len(today) < 2:
+        return 0, "no 5-min bars"
+    for ts, b in today.tail(3).iloc[::-1].iterrows():
+        if side == "CALL" and b["low"] <= level + near:
+            if b["close"] < level - near:
+                return -1, f"{ts:%H:%M} closed through the put wall ({b['close']:.2f})"
+            if b["close"] > b["open"] and b["close"] > level:
+                return 1, f"{ts:%H:%M} rejection wick to {b['low']:.2f}, closed up at {b['close']:.2f}"
+        if side == "PUT" and b["high"] >= level - near:
+            if b["close"] > level + near:
+                return -1, f"{ts:%H:%M} closed through the call wall ({b['close']:.2f})"
+            if b["close"] < b["open"] and b["close"] < level:
+                return 1, f"{ts:%H:%M} rejection wick to {b['high']:.2f}, closed down at {b['close']:.2f}"
+    return 0, "no test of the level in the last 3 bars"
+
+
+def convergence(side: str, level: float, p: Profile, ctx: dict, mtf: dict, news: dict | None) -> tuple[int, int, dict]:
+    """(rate 0-100 agreeing, points against, {factor: {score, weight, note}}) for trading `side` at `level`."""
     call = side == "CALL"
+    sign = 1 if call else -1
+    near = near_band(p)
     spot = p.spot
-    out: dict[str, tuple[int, str]] = {}
+    f: dict[str, tuple[int, str]] = {}
+    dist = spot - level
+    f["gex_level"] = (1 if abs(dist) <= near else 0, f"price {abs(dist):.2f} {'above' if dist >= 0 else 'below'} "
+                      f"{level:.2f} (zone ±{near:.2f})")
+    for tf in (30, 5):
+        m = mtf.get(tf) if mtf else None
+        if not m:
+            f[f"structure_{tf}m"] = (0, "no candles")
+            f[f"momentum_{tf}m"] = (0, "no candles")
+            continue
+        st_ = m["structure"]
+        f[f"structure_{tf}m"] = (st_["trend"] * sign, st_["note"])
+        mom, note = m["momentum"]
+        if tf == 5 and ctx and mom * sign > 0 and (spot > ctx["vwap"]) != call:
+            mom, note = 0, note + f"; but {'below' if call else 'above'} VWAP {ctx['vwap']:.2f}"
+        f[f"momentum_{tf}m"] = (mom * sign, note)
+    f["wall_reaction"] = wall_reaction(mtf.get("today") if mtf else None, side, level, near)
     if ctx:
         poc, vah, val = ctx["poc"], ctx["vah"], ctx["val"]
-        if call:
-            ok = spot >= poc or abs(spot - val) <= near
-            out["volume_profile"] = (1 if ok else -1, f"{'at VAL' if abs(spot - val) <= near else 'above' if ok else 'below'} "
-                                     f"POC {poc:.2f} (VAL {val:.2f})")
-        else:
-            ok = spot <= poc or abs(spot - vah) <= near
-            out["volume_profile"] = (1 if ok else -1, f"{'at VAH' if abs(spot - vah) <= near else 'below' if ok else 'above'} "
-                                     f"POC {poc:.2f} (VAH {vah:.2f})")
-        above = spot > ctx["vwap"]
-        if call:
-            m = 1 if above and ctx["rising"] else -1 if not above and ctx["falling"] else 0
-        else:
-            m = 1 if not above and ctx["falling"] else -1 if above and ctx["rising"] else 0
-        trend = "rising" if ctx["rising"] else "falling" if ctx["falling"] else "flat"
-        out["momentum"] = (m, f"{'above' if above else 'below'} VWAP {ctx['vwap']:.2f}, last 3 bars {trend}")
+        ok = (spot >= poc or abs(spot - val) <= near) if call else (spot <= poc or abs(spot - vah) <= near)
+        f["volume_profile"] = (1 if ok else -1, f"POC {poc:.2f}, VAH {vah:.2f}, VAL {val:.2f}")
     else:
-        out["volume_profile"] = (0, "no intraday bars")
-        out["momentum"] = (0, "no intraday bars")
+        f["volume_profile"] = (0, "no intraday bars")
     if p.pc_volume is None:
-        out["options_flow"] = (0, "no option volume yet")
+        f["options_flow"] = (0, "no option volume yet")
     else:
-        f = (1 if p.pc_volume < 0.8 else -1 if p.pc_volume > 1.2 else 0) * (1 if call else -1)
-        out["options_flow"] = (f, f"put/call volume {p.pc_volume:.2f}")
+        f["options_flow"] = ((1 if p.pc_volume < 0.8 else -1 if p.pc_volume > 1.2 else 0) * sign,
+                             f"put/call volume {p.pc_volume:.2f}")
     if news:
         s = float(news.get("sentiment", 0))
-        n = (1 if s >= 0.3 else -1 if s <= -0.3 else 0) * (1 if call else -1)
-        out["llm_news"] = (n, f"sentiment {s:+.2f}: {news.get('reason', '')}"[:160])
+        f["llm_news"] = ((1 if s >= 0.3 else -1 if s <= -0.3 else 0) * sign,
+                         f"sentiment {s:+.2f}: {news.get('reason', '')}"[:160])
     else:
-        out["llm_news"] = (0, "no LLM verdict")
+        f["llm_news"] = (0, "no LLM verdict")
+    rate = sum(CONV_WEIGHTS[k] for k, (v, _) in f.items() if v > 0)
+    against = sum(CONV_WEIGHTS[k] for k, (v, _) in f.items() if v < 0)
+    return rate, against, {k: {"score": v, "weight": CONV_WEIGHTS[k], "note": n} for k, (v, n) in f.items()}
+
+
+def zone_rates(p: Profile, ctx: dict, mtf: dict, news: dict | None) -> list[dict]:
+    """plan_zones with the convergence rate of trading each one right now."""
+    out = []
+    for z in plan_zones(p):
+        rate, against, _ = convergence(z["side"], z["level"], p, ctx, mtf, news)
+        out.append({**z, "rate": rate, "against": against})
     return out
 
 
@@ -266,13 +383,17 @@ def plan_zones(p: Profile) -> list[dict]:
     out = []
     if positive:
         if g.put_wall and g.put_wall <= spot + near:
-            out.append({"side": "CALL", "low": g.put_wall - near, "high": g.put_wall + near, "label": "CALL zone: put-wall bounce"})
+            out.append({"side": "CALL", "level": g.put_wall, "low": g.put_wall - near, "high": g.put_wall + near,
+                        "label": "CALL at put wall"})
         if g.call_wall and g.call_wall >= spot - near:
-            out.append({"side": "PUT", "low": g.call_wall - near, "high": g.call_wall + near, "label": "PUT zone: call-wall fade"})
+            out.append({"side": "PUT", "level": g.call_wall, "low": g.call_wall - near, "high": g.call_wall + near,
+                        "label": "PUT at call wall"})
         if g.gamma_flip:
-            out.append({"side": "CALL", "low": g.gamma_flip, "high": g.gamma_flip + near, "label": "CALL zone: flip reclaim (rising)"})
+            out.append({"side": "CALL", "level": g.gamma_flip, "low": g.gamma_flip, "high": g.gamma_flip + near,
+                        "label": "CALL on flip reclaim"})
     elif g.gamma_flip:
-        out.append({"side": "PUT", "low": g.gamma_flip - near, "high": g.gamma_flip, "label": "PUT zone: rejected at flip (falling)"})
+        out.append({"side": "PUT", "level": g.gamma_flip, "low": g.gamma_flip - near, "high": g.gamma_flip,
+                    "label": "PUT on flip rejection"})
     return out
 
 
@@ -283,7 +404,8 @@ def choose_contract(options: list[OptionQuote], side: str, target_delta: float =
     return min(ok, key=lambda o: abs(abs(o.delta) - target_delta)) if ok else None
 
 
-def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime) -> Idea:
+def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime,
+               mtf: dict | None = None) -> Idea:
     near = near_band(p)
     base = Idea(p.ticker, "WAIT", expiry=p.expiry, dte=p.dte)
     g = p.gex
@@ -304,22 +426,23 @@ def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now
         base.reason = "Not at a GEX level. Watch: " + ("; ".join(plan) or "no walls on this expiry")
         return base
     side, setup, level, stop, target = trig
-    conf = confluence(side, p, ctx, news, near)
-    agree = sum(1 for v, _ in conf.values() if v > 0)
-    against = sum(1 for v, _ in conf.values() if v < 0)
-    grade = "A" if agree >= 3 and not against else "B" if agree >= MIN_AGREE and not against else "C"
+    rate, against, conf = convergence(side, level, p, ctx, mtf or {}, news)
+    grade = "A" if rate >= 75 else "B" if rate >= MIN_CONVERGENCE else "C"
+    if against > MAX_AGAINST:
+        grade = "C"
     o = choose_contract(chain.for_expiry(p.expiry), side)
     idea = replace(base, side=side, setup=setup, level=round(level, 2), stop=round(stop, 2), target=round(target, 2),
-                   grade=grade, confluence={k: {"score": v, "note": n} for k, (v, n) in conf.items()})
+                   grade=grade, rate=rate, against=against, confluence=conf)
     if o:
         idea = replace(idea, contract=o.symbol, strike=o.strike, mid=o.mid, ask=o.ask, delta=round(o.delta, 2))
     if grade == "C":
-        idea.reason = f"{setup}, but confluence too weak ({agree} agree, {against} against)"
+        idea.reason = (f"{setup}, but convergence {rate}% with {against} pts against "
+                       f"(needs >= {MIN_CONVERGENCE}%, <= {MAX_AGAINST} against)")
     elif not o:
         idea.reason = f"{setup}: no {side.lower()} with a tight enough spread"
     else:
         idea.status = "ACTIVE"
-        idea.reason = f"{setup}; {agree} confluences agree"
+        idea.reason = f"{setup}; convergence {rate}%"
     return idea
 
 
@@ -343,10 +466,12 @@ def analyse(market, news, ticker: str, now: datetime, mode: str = "auto", weight
     except MarketDataUnavailable:
         pass
     ctx = intraday(bars, now.date())
-    idea = build_idea(p, chain, ctx, None, now)
+    mtf = market_structure(bars, now.date())
+    idea = build_idea(p, chain, ctx, None, now, mtf)
     verdict = None
     if with_news and news is not None and (idea.side or ticker == pick):
         verdict = news.check(ticker).llm
         if verdict:
-            idea = build_idea(p, chain, ctx, verdict, now)
-    return {"ticker": ticker, "chain": chain, "profile": p, "ctx": ctx, "bars": bars, "idea": idea, "news": verdict}
+            idea = build_idea(p, chain, ctx, verdict, now, mtf)
+    return {"ticker": ticker, "chain": chain, "profile": p, "ctx": ctx, "bars": bars, "idea": idea, "news": verdict,
+            "mtf": mtf, "zones": zone_rates(p, ctx, mtf, verdict)}

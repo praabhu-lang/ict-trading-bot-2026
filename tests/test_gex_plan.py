@@ -24,6 +24,14 @@ def bars(closes, start=100.0, vol=1000.0):
                          "volume": [vol] * len(closes)}, index=idx)
 
 
+def mtf(trend30, trend5, mom30=0, mom5=0, today=None):
+    """Hand-set multi-timeframe readings (the structure maths is tested separately)."""
+    def tf(trend, mom):
+        return {"candles": None, "structure": {"trend": trend, "note": f"trend {trend}", "swings": []},
+                "momentum": (mom, f"mom {mom}")}
+    return {30: tf(trend30, mom30), 5: tf(trend5, mom5), "today": today}
+
+
 def prof(spot=100.1, flip=99.0, pw=100.0, cw=102.0, net=1e6, em=1.0, pc=0.6):
     return gp.Profile("SPY", spot, TODAY, 0, GexResult(net, "POSITIVE" if net >= 0 else "NEGATIVE", cw, pw, flip),
                       {}, {}, {}, {}, em, pc)
@@ -48,19 +56,30 @@ def test_profile_finds_walls_and_falls_back_to_volume_without_oi():
 
 def test_put_wall_bounce_with_confluence_is_active_call():
     chain = make_chain(100.1, dtes=(0,))
-    ctx = gp.intraday(bars([99.6, 99.7, 99.8, 99.9, 100.0, 100.1], start=99.5), TODAY)
-    idea = gp.build_idea(prof(), chain, ctx, {"sentiment": 0.5, "risk": "none", "reason": "beat"}, at(10, 0))
+    b = bars([99.6, 99.7, 99.8, 99.9, 100.0, 100.1], start=99.5)
+    ctx = gp.intraday(b, TODAY)
+    idea = gp.build_idea(prof(), chain, ctx, {"sentiment": 0.5, "risk": "none", "reason": "beat"}, at(10, 0),
+                         mtf(1, 1, mom30=1, mom5=1, today=b))
     assert idea.status == "ACTIVE" and idea.side == "CALL" and idea.setup.startswith("Put-wall bounce")
     assert idea.stop < 100.0 < idea.target and idea.contract and "C" in idea.contract[-9:]
-    assert idea.confluence["momentum"]["score"] == 1 and idea.confluence["llm_news"]["score"] == 1
-    assert idea.grade == "A"
+    assert idea.confluence["structure_30m"]["score"] == 1 and idea.confluence["llm_news"]["score"] == 1
+    # every factor agrees, including the wick that tagged the put wall and closed up
+    assert idea.rate == 100 and idea.confluence["wall_reaction"]["score"] == 1 and idea.grade == "A"
 
 
 def test_conflicting_confluence_waits():
     chain = make_chain(100.1, dtes=(0,))
     ctx = gp.intraday(bars([100.8, 100.6, 100.5, 100.4, 100.3, 100.1], start=101.0), TODAY)   # below VWAP, falling
-    idea = gp.build_idea(prof(pc=1.5), chain, ctx, None, at(10, 0))
+    idea = gp.build_idea(prof(pc=1.5), chain, ctx, None, at(10, 0), mtf(0, 1, mom5=1))   # 30m mixed
     assert idea.side == "CALL" and idea.status == "WAIT" and idea.grade == "C"
+    assert idea.confluence["momentum_5m"]["score"] == 0          # bullish EMAs, but price below VWAP
+
+
+def test_higher_timeframe_structure_against_is_a_veto():
+    chain = make_chain(100.1, dtes=(0,))
+    idea = gp.build_idea(prof(), chain, {}, {"sentiment": 0.9, "risk": "none", "reason": ""}, at(10, 0),
+                         mtf(-1, 1, mom30=1, mom5=1))
+    assert idea.against == 20 and idea.status == "WAIT" and idea.grade == "C"
 
 
 def test_llm_block_and_session_window_cancel_ideas():
@@ -73,7 +92,8 @@ def test_llm_block_and_session_window_cancel_ideas():
 def test_negative_gamma_rejection_at_flip_is_put():
     chain = make_chain(101.0, dtes=(0,))
     ctx = gp.intraday(bars([101.6, 101.5, 101.4, 101.3, 101.2, 101.0], start=101.7), TODAY)
-    idea = gp.build_idea(prof(spot=101.0, flip=101.2, pw=99.0, cw=103.0, net=-1e6, pc=1.5), chain, ctx, None, at(11, 0))
+    idea = gp.build_idea(prof(spot=101.0, flip=101.2, pw=99.0, cw=103.0, net=-1e6, pc=1.5), chain, ctx, None, at(11, 0),
+                         mtf(-1, -1, mom30=-1))
     assert idea.side == "PUT" and idea.setup.startswith("Rejected at gamma flip") and idea.status == "ACTIVE"
     assert idea.stop > 101.2 and idea.target == 99.0
 
@@ -139,3 +159,49 @@ def test_nightly_space_warnings():
     assert space_warnings({"db_size_mb": 600, "ledger_size_mb": 0.3}) == []
     w = space_warnings({"db_size_mb": 3500, "ledger_size_mb": 40})
     assert len(w) == 2 and "compact" in w[0]
+
+
+
+def zigzag(n_legs: int, up: bool, start=100.0, leg=6, step=1.0):
+    """5-min bars zig-zagging up (HH/HL) or down (LH/LL): each leg moves 2 points, then gives back 1."""
+    closes, px = [], start
+    for i in range(n_legs):
+        move = (2 if i % 2 == 0 else -1) * step * (1 if up else -1)
+        for _ in range(leg):
+            px += move / leg
+            closes.append(px)
+    idx = pd.date_range(at(9, 30), periods=len(closes), freq="5min")
+    return pd.DataFrame({"open": [start] + closes[:-1], "high": [c + 0.05 for c in closes],
+                         "low": [c - 0.05 for c in closes], "close": closes, "volume": 1000.0}, index=idx)
+
+
+def test_structure_labels_swings_and_trend():
+    up = gp.structure(zigzag(9, up=True))
+    assert up["trend"] == 1 and {"HH", "HL"} <= {s["label"] for s in up["swings"]}
+    down = gp.structure(zigzag(9, up=False))
+    assert down["trend"] == -1 and {"LH", "LL"} <= {s["label"] for s in down["swings"]}
+    assert gp.structure(zigzag(1, up=True))["trend"] == 0
+
+
+def test_resample_and_momentum():
+    df = zigzag(14, up=True)
+    m30 = gp.resample(df, 30)
+    assert len(m30) == -(-len(df) // 6) and m30["high"].iloc[0] == df["high"].iloc[:6].max()
+    assert gp.ema_momentum(df)[0] in (0, 1) and gp.ema_momentum(df.head(10))[0] == 0
+
+
+def test_wall_reaction_wick_and_break():
+    idx = pd.date_range(at(10, 0), periods=3, freq="5min")
+    wick = pd.DataFrame({"open": [100.4, 100.3, 100.05], "high": [100.5, 100.4, 100.4],
+                         "low": [100.2, 100.1, 99.95], "close": [100.3, 100.1, 100.3]}, index=idx)
+    assert gp.wall_reaction(wick, "CALL", 100.0, 0.1)[0] == 1
+    broke = wick.assign(close=[100.3, 100.1, 99.7])
+    assert gp.wall_reaction(broke, "CALL", 100.0, 0.1)[0] == -1
+    assert gp.wall_reaction(wick, "PUT", 103.0, 0.1)[0] == 0
+
+
+def test_zone_rates_cover_each_zone():
+    zones = gp.zone_rates(prof(), {}, mtf(1, 0), None)
+    call = next(z for z in zones if z["label"] == "CALL at put wall")
+    put = next(z for z in zones if z["label"] == "PUT at call wall")
+    assert call["rate"] >= 40 and put["against"] >= 20       # 30m up structure helps the call, vetoes the put
