@@ -1,0 +1,10 @@
+# CI alternative to deploy/deploy.sh: gcloud builds submit --config cloudbuild.yaml
+# Runs the tests, then builds and pushes the image. Deploy with deploy/deploy.sh (needs env.yaml).
+steps:
+  - name: python:3.12-slim
+    entrypoint: sh
+    args: ["-c", "pip install -q -r requirements-dev.txt && python -m pytest -q tests"]
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/ict-trading-bot:$SHORT_SHA", "."]
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/ict-trading-bot:$SHORT_SHA

@@ -1,5 +1,10 @@
+import sys
 import os
-import psycopg2
+
+# Add root directory and src to Python path for seamless imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
 from datetime import datetime
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
@@ -7,8 +12,8 @@ from tavily import TavilyClient
 from config import Config
 from alpaca_client import AlpacaManager
 from options_client import OptionExecutionManager
+from executor import SpreadExecutor
 
-# Define the shared state schema for our multi-agent workflow
 class BotState(TypedDict):
     tickers: List[str]
     sentiment_scores: dict
@@ -55,13 +60,15 @@ def macro_risk_agent(state: BotState):
     return state
 
 def execution_option_scanner_agent(state: BotState):
-    print("\n[AGENT 3] Evaluating Option Chains & Spread Parameters...")
+    print("\n[AGENT 3] Evaluating Option Chains & Executing Spread Strategy...")
     if not state["risk_approved"] or state["macro_status"] != "CLEAR":
         state["execution_signals"] = ["Trade execution blocked by risk/macro guardrails."]
         print("[AGENT 3] Trade execution aborted due to guardrail failure.")
         return state
 
     option_manager = OptionExecutionManager()
+    alpaca = AlpacaManager()
+    executor = SpreadExecutor()
     chains_found = {}
     signals = []
 
@@ -70,13 +77,23 @@ def execution_option_scanner_agent(state: BotState):
         contract_count = len(chain) if chain else 0
         if contract_count > 0:
             chains_found[ticker] = {"expiry_type": expiry_type, "contracts": contract_count}
-            signals.append(f"READY: {ticker} ({expiry_type}) with {contract_count} contracts under ${state['allowed_risk_amount']:,.2f} risk cap.")
+            
+            current_price = alpaca.get_last_price(ticker)
+            
+            # Execute sizing & database audit logging via SpreadExecutor
+            execution_result = executor.execute_credit_spread(
+                ticker=ticker,
+                underlying_price=current_price, 
+                allowed_risk_amount=state["allowed_risk_amount"],
+                chain_data=chain
+            )
+            signals.append(f"EXECUTED/LOGGED: {ticker} ({expiry_type}) -> {execution_result['contracts']} contract(s) under risk limit.")
         else:
             signals.append(f"SKIPPED: {ticker} - No valid option chain found.")
 
     state["option_chains"] = chains_found
     state["execution_signals"] = signals
-    print(f"[AGENT 3] Evaluated {len(state['tickers'])} tickers. Generated {len(signals)} execution signals.")
+    print(f"[AGENT 3] Evaluated {len(state['tickers'])} tickers. Completed execution pipeline.")
     return state
 
 def run_workflow():
@@ -84,7 +101,6 @@ def run_workflow():
     print(f"[START] ICT Multi-Agent Trading Pipeline - {datetime.now()}")
     print("=" * 70)
 
-    # Initialize LangGraph State Machine
     workflow = StateGraph(BotState)
 
     workflow.add_node("sentiment_node", sentiment_agent)

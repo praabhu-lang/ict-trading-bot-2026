@@ -7,7 +7,7 @@ import logging
 sys.path.append(os.path.expanduser("~/ict-trading-bot-2026"))
 
 from src.top20_volume_profile_scanner import scan_top20_and_rank
-from src.execution_engine import ExecutionEngine
+from src.execution_engine import LiveTradingExecutionEngine as ExecutionEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

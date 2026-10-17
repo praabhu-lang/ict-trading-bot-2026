@@ -1,0 +1,22 @@
+# Cloud Build upload: only what the Dockerfile needs
+.env
+env.yaml
+*.env
+/data/
+/logs/
+*.log
+/venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+/legacy/
+/docs/
+/grafana/
+
+# local secrets / scratch output (never ship)
+schwab_token.json
+*token*.json
+/results/
+/trades_*.csv
+.claude/
