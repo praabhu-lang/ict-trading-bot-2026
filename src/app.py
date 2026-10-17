@@ -16,7 +16,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 from .agents.news_agent import NewsAgent
 from .agents.orchestrator import TradingEngine
@@ -196,7 +196,10 @@ def cmd_nightly() -> int:
             ledger.close()
 
     report = run_nightly(store, MarketData.from_env(store), with_ledger, today)
+    replay = report.pop("gex_replay_full", None)
     print(json.dumps(report, default=str, indent=2))
+    if replay and today.weekday() == 4:
+        _gex_replay_email(replay, today)
     try:
         with_ledger(lambda led: led.set_kv("nightly_report", {"date": today.isoformat(), **report}))
     except Exception:  # noqa: BLE001 - the report is also in the job log
@@ -207,6 +210,25 @@ def cmd_nightly() -> int:
                                  "<pre>" + json.dumps(report, default=str, indent=2) + "</pre>",
                                  dedupe_key=f"nightly:{today.isoformat()}")
     return 0
+
+
+def _gex_replay_email(rep: dict, today: date) -> None:
+    """Friday: the week's GEX ideas replay (what the GEX tab would have suggested, and how it went)."""
+    from .alerts.notifier import table
+
+    week = (today - timedelta(days=6)).isoformat()
+    trades = [t for t in rep.get("trades", []) if t["date"] >= week]
+    tot = rep.get("total") or {}
+    body = (f"<p>Replayed {rep.get('ticker_days', 0)} ticker-days ({', '.join(rep.get('tickers', []))}) over the last "
+            f"{len(rep.get('days', []))} sessions. All-window: {tot.get('ideas', 0)} ACTIVE ideas, "
+            f"{tot.get('win_R_%', 0)}% won on the underlying, option P&L ${tot.get('opt_pnl_$', 0):,.0f} "
+            f"(1 contract, SPY/QQQ priced).</p>"
+            "<h3>This week's ACTIVE ideas</h3>" + (table([{k: t.get(k) for k in (
+                "date", "ticker", "time", "side", "setup", "rate", "reason", "R", "contract", "pnl")} for t in trades])
+                if trades else "<p>None.</p>")
+            + "<h3>Every trigger by convergence rate</h3>" + table(rep.get("by_bucket") or []))
+    Notifier.from_env().send(f"🧲 GEX ideas weekly replay {today:%b %d}: {len(trades)} ideas this week", body,
+                             dedupe_key=f"gexreplay:{today.isoformat()}")
 
 
 def cmd_backtest(tickers: list[str], start: date, end: date, capital: float, gex: str = "none") -> int:

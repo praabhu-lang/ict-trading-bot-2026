@@ -219,6 +219,109 @@ def idea_card(r: dict) -> None:
             st.dataframe(factor_table(conf), hide_index=True, width="stretch")
 
 
+FACTOR_RULES = {
+    "gex_level": ("Price is inside the zone", "Price is inside the zone"),
+    "structure_30m": ("30-min swings HH + HL, or a close above the last swing high (break of structure up)",
+                      "30-min swings LH + LL, or a close below the last swing low (break of structure down)"),
+    "structure_5m": ("Same on 5-min candles", "Same on 5-min candles"),
+    "momentum_30m": ("30-min close > EMA9 > EMA21 and EMA9 rising", "30-min close < EMA9 < EMA21 and EMA9 falling"),
+    "momentum_5m": ("Same on 5-min, and price above VWAP", "Same on 5-min, and price below VWAP"),
+    "wall_reaction": ("A 5-min bar in the last 3 tagged the wall and closed up, above it (closing through = against)",
+                      "A 5-min bar in the last 3 tagged the wall and closed down, below it (closing through = against)"),
+    "volume_profile": ("At/above today's POC, or sitting on the VAL", "At/below today's POC, or sitting on the VAH"),
+    "options_flow": ("Put/call volume on the expiry below 0.8", "Put/call volume on the expiry above 1.2"),
+    "llm_news": ("LLM news sentiment +0.3 or better", "LLM news sentiment -0.3 or worse"),
+}
+
+
+def rules_guide() -> None:
+    """The page's rules, generated from the constants the code uses (gex_plan), so it cannot drift."""
+    w = gp.CONV_WEIGHTS
+    with st.expander("📘 Rules: how to read and use this page", expanded=False):
+        st.markdown(f"""
+**What this page is.** Our own dealer gamma exposure (GEX) from Schwab option chains, plus price structure, turned
+into a CALL or PUT idea per ticker. **Suggestions only - nothing places orders.** Use 🟢 ACTIVE ideas; everything
+else is a map of where an idea could appear.
+
+**Step by step**
+1. Pick a ticker (SPY / SPX / QQQ + today's 10 most traded), the expiry and the gamma weighting.
+2. Scan the table: *Gamma* (regime), *Best zone* (highest convergence right now), *30m structure*.
+3. On the chart, shaded bands are the zones where a trade can trigger; the % on each is its convergence **now**.
+4. Wait for price to reach a zone **and** the idea box to turn 🟢 ACTIVE. Buy the shown contract near the ask;
+   manage it on the **underlying**: out at the stop or target line, or at 15:45 ET.
+
+**The levels**
+- **Call wall** - strike with the most call gamma: resistance / magnet. **Put wall** - most put gamma: support.
+- **Gamma flip** - where dealer gamma turns from negative to positive. **Above it (positive gamma)** dealers sell
+  rallies and buy dips: price pins between the walls, fade the edges. **Below it (negative gamma)** dealers chase the
+  move: trends run, trade with momentum.
+- **Expected move (±)** - the ATM straddle price for the expiry. **Near** a level = within
+  max(¼ expected move, 0.1% of price): the zone height on the chart.
+- **VWAP, POC / VAH / VAL** - today's volume-weighted price and volume profile (value area = 70% of volume).
+- Open interest is yesterday's positioning (Schwab updates it overnight). SPX has no OI from Schwab, so it is
+  weighted by today's volume automatically. Gamma is re-priced from each contract's IV at the current price.
+
+**The setups (triggers)**
+
+| Setup | Regime | Trade | When | Stop (underlying) | Target |
+|---|---|---|---|---|---|
+| Put-wall bounce | positive | CALL | price within *near* above the put wall | put wall − near | halfway to the call wall (or +½ exp. move) |
+| Call-wall fade | positive | PUT | price within *near* below the call wall | call wall + near | halfway to the put wall (or −½ exp. move) |
+| Gamma-flip reclaim | positive | CALL | just above the flip and the last 3 bars rising | flip − near | call wall (or +1 exp. move) |
+| Rejected at gamma flip | negative | PUT | just below the flip and the last 3 bars falling | flip + near | put wall (or −1 exp. move) |
+| Momentum, negative gamma | negative | PUT | falling, below the flip, more than 2× near above the put wall | ½ exp. move above, capped at flip + near | put wall (or −1 exp. move) |
+
+**Convergence rate (0-100)** - how much agrees with trading that zone right now. Unknown factors score 0 (never
+rescaled), so missing data can only lower the rate.
+
+| Factor | Points | Agrees with a CALL when | Agrees with a PUT when |
+|---|---|---|---|
+""" + "\n".join(f"| {k.replace('_', ' ').replace('5m', '5-min').replace('30m', '30-min')} | {w[k]} | {c} | {p} |"
+                for k, (c, p) in FACTOR_RULES.items()) + f"""
+
+- **🟢 ACTIVE** = a setup triggered **and** convergence ≥ **{gp.MIN_CONVERGENCE}%** **and** at most
+  **{gp.MAX_AGAINST}** points disagree. The 30-min structure is worth {w["structure_30m"]}, so a 30-min trend against
+  the trade always blocks it. Grade **A** ≥ 75%, **B** ≥ {gp.MIN_CONVERGENCE}%.
+- An LLM news **block** (halt, M&A, guidance...) cancels every idea on that ticker: the levels stop working on
+  news-driven tape.
+
+**The contract**
+- Expiry: *Auto* = 0DTE until {gp.AUTO_1DTE_AFTER:%H:%M} ET, then the next expiry (late-day 0DTE gamma and premium
+  collapse). Stocks without daily expiries use their next one.
+- Delta closest to {gp.TARGET_DELTA:.2f}, bid/ask spread at most {gp.MAX_SPREAD:.0%} of the mid.
+- Ideas only between {gp.FIRST_IDEA:%H:%M} and {gp.LAST_IDEA:%H:%M} ET; one open idea per ticker.
+
+**How far to trust it.** These rules are new and not proven. Two independent checks run automatically:
+the engine paper-trades every ACTIVE idea live (*Paper tracking* below) and the nightly job replays the rules over
+every saved chain (*Replay backtest* below). Your VRZ backtests found 0DTE options lost money - wait until both show
+an edge over a few weeks (20+ ideas) before trading real size.
+""")
+
+
+def replay_panel(rep: dict | None) -> None:
+    st.subheader("Replay backtest (nightly, automatic)")
+    if not rep or not rep.get("ticker_days"):
+        st.caption("The nightly job (18:15 ET) replays these rules over every saved end-of-day Schwab chain and shows "
+                   "the results here. Nothing yet.")
+        return
+    tot = rep.get("total") or {}
+    c = st.columns(4)
+    c[0].metric("Ticker-days replayed", rep["ticker_days"], help=", ".join(rep.get("tickers", [])))
+    c[1].metric("ACTIVE ideas", tot.get("ideas", 0))
+    c[2].metric("Won on the underlying", f"{tot.get('win_R_%', 0)}%", help=f"average {tot.get('avg_R', 0)} R")
+    c[3].metric("Option P&L (1 contract)", f"${tot.get('opt_pnl_$', 0):,.0f}",
+                help=f"{tot.get('priced', 0)} priced from real Alpaca option bars (SPY / QQQ); stocks show R only")
+    st.caption(f"Sessions {rep['days'][0]} to {rep['days'][-1]} · updated {rep.get('generated', '')[:16]} · the replay "
+               "cannot see LLM news or same-day put/call volume, so live rates run up to 10 points higher.")
+    if rep.get("by_bucket"):
+        st.markdown("**Every trigger by convergence rate** - a higher rate should mean better results:")
+        st.dataframe(pd.DataFrame(rep["by_bucket"]), hide_index=True, width="stretch")
+    if rep.get("trades"):
+        st.dataframe(pd.DataFrame(rep["trades"])[["date", "ticker", "time", "side", "setup", "rate", "reason", "R",
+                                                  "contract", "opt_entry", "opt_exit", "pnl"]],
+                     hide_index=True, width="stretch")
+
+
 def tracker(led) -> None:
     log = (led.get_kv("gex_ideas_log") if led else None) or []
     open_ = (led.get_kv("gex_ideas_open") if led else None) or []
@@ -245,11 +348,12 @@ def tracker(led) -> None:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
 
 
-def gex_page(market, news, led, now: datetime) -> None:
+def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> None:
     st.caption("Our own dealer gamma exposure from Schwab option chains (dealers long calls / short puts). "
                "**Suggestions only - no orders are placed.** Not backtested (no historical open interest): the "
                "engine paper-tracks every ACTIVE idea below. Your VRZ backtests found 0DTE options lost money, "
                "so treat these as untested until the tracker says otherwise.")
+    rules_guide()
     if market is None or market.schwab is None:
         st.error("Schwab is not configured - no option chains.")
         return
@@ -303,3 +407,4 @@ def gex_page(market, news, led, now: datetime) -> None:
                                        "Put OI": [p.put_oi.get(k, 0) for k in ks]}), hide_index=True, width="stretch")
     st.caption(f"Live · price every 30 s, option chains every 60 s · {now:%H:%M:%S} ET")
     tracker(led)
+    replay_panel(replay)

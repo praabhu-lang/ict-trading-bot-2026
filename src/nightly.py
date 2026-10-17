@@ -8,6 +8,8 @@ strategy's monitor.
    -> chain_snapshots
 3b. housekeeping: ledger gex_levels older than LEDGER_GEX_DAYS -> market DB, ledger prune; raw chains older than
    market_db.RAW_CHAIN_DAYS rolled up per strike (gex_strikes); incremental vacuum
+3c. replay the GEX ideas tab over the saved chains (src/backtest_gex_ideas.py, incremental: only new ticker-days)
+   -> research/gex_ideas_backtest.json (dashboard GEX tab; weekly email on Fridays)
 4. re-run the smart first-candle backtest from the database (Feb 2024 -> today, real option prices):
    every signal's option return -> ledger kv 'fc_shadow' (monitor C + half-size kill switch) and
    research/smart_rule.json (dashboard Research page)
@@ -30,6 +32,7 @@ log = logging.getLogger(__name__)
 SRC = Path(__file__).resolve().parent
 DB_OBJECT = "marketdb/market_data.db"
 RESEARCH_OBJECT = "research/smart_rule.json"
+GEX_REPLAY_OBJECT = "research/gex_ideas_backtest.json"
 STOCKS = ("NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "GOOGL", "AMD", "AVGO", "NFLX")
 CAP = 10_000.0
 LEDGER_GEX_DAYS = 10       # intraday GEX levels stay this long in the (dashboard-downloaded) ledger
@@ -136,6 +139,15 @@ def run_nightly(store, market, ledger_fn, today: date) -> dict:
     have = store.download(DB_OBJECT)
     report = {"db_downloaded": have}
     report["updates"] = update_database(market, today)
+    try:
+        import backtest_gex_ideas as gexbt
+        rep = gexbt.nightly_replay(mdb.DB_PATH, today, ["SPY", "QQQ"] + list(STOCKS))
+        store.put_bytes(GEX_REPLAY_OBJECT, json.dumps(rep, default=str).encode(), "application/json")
+        report["gex_replay"] = {k: rep.get(k) for k in ("ticker_days", "new_trades", "total")}
+        report["gex_replay_full"] = rep
+    except Exception as exc:  # noqa: BLE001
+        log.exception("GEX ideas replay failed")
+        report["gex_replay"] = f"FAILED: {exc}"[:300]
     try:
         shadow, summary = smart_rule_research(today)
         report["shadow_signals"] = len(shadow)

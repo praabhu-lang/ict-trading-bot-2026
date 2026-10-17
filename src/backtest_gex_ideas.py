@@ -16,6 +16,10 @@ Calibration: every trigger (any rate), simulated the same way, bucketed by conve
 
   python src/backtest_gex_ideas.py                       # every day with a prior chain snapshot, SPY + QQQ
   python src/backtest_gex_ideas.py --tickers SPY --start 2026-10-14
+
+Automated: the nightly job calls nightly_replay() - incremental (each finished ticker-day is stored in the market DB
+tables gex_replay / gex_replay_days and never recomputed unless REPLAY_VERSION changes) - and saves report() to
+research/gex_ideas_backtest.json for the dashboard's GEX tab (weekly email on Fridays).
 """
 from __future__ import annotations
 
@@ -40,11 +44,22 @@ DB = REPO / "data" / "marketdb" / "market_data.db"
 EXIT_AT = time(15, 45)
 SLIP = 0.02          # $ per share per side over the bar price (spread)
 OUT = REPO / "results" / "gex_ideas_backtest.csv"
+REPLAY_VERSION = 1   # bump when gex_plan rules change: every stored day is replayed again
+COLS = ["date", "ticker", "kind", "time", "side", "setup", "rate", "against", "grade", "dte", "level", "stop", "target",
+        "entry_spot", "exit_spot", "exit_time", "reason", "R", "contract", "opt_entry", "opt_exit", "pnl"]
+SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS gex_replay ({", ".join(c + (" REAL" if c in ("rate", "against", "level", "stop", "target",
+    "entry_spot", "exit_spot", "R", "opt_entry", "opt_exit", "pnl", "dte") else " TEXT") for c in COLS)},
+    PRIMARY KEY (date, ticker, kind, setup)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gex_replay_days (date TEXT, ticker TEXT, version INTEGER, PRIMARY KEY (date, ticker)) WITHOUT ROWID;
+"""
 
 
-def load_bars(con, symbol: str) -> pd.DataFrame:
-    df = pd.read_sql("SELECT ts, open, high, low, close, volume FROM bars_5m WHERE symbol = ? ORDER BY ts",
-                     con, params=(symbol,))
+def load_bars(con, symbol: str, since: date | None = None) -> pd.DataFrame:
+    """Regular-session 5-min bars from `since` (minus 2 weeks for the 30-min structure look-back)."""
+    start = int(datetime.combine((since or date(2000, 1, 1)) - timedelta(days=14), time(0), tzinfo=ET).timestamp())
+    df = pd.read_sql("SELECT ts, open, high, low, close, volume FROM bars_5m WHERE symbol = ? AND ts >= ? ORDER BY ts",
+                     con, params=(symbol, start))
     df.index = pd.to_datetime(df.pop("ts"), unit="s", utc=True).dt.tz_convert(ET)
     t = df.index.time
     return df[(t >= time(9, 30)) & (t < time(16, 0))]
@@ -135,67 +150,143 @@ def simulate(idea, t: datetime, day_bars: pd.DataFrame, chain, obars: OptionBars
     return out
 
 
-def run(tickers: list[str], start: date | None, end: date | None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    con = sqlite3.connect(DB)
+def replay_day(tk: str, d: date, chain: OptionChain, bars: pd.DataFrame, sessions: list, obars: OptionBars
+               ) -> tuple[list[dict], list[dict]]:
+    """(trades, triggers) for one ticker-day."""
+    trades, triggers = [], []
+    day_bars = bars[bars.index.date == d]
+    hist = bars[bars.index.date <= d]
+    hist = hist[hist.index.date >= sessions[max(0, sessions.index(d) - 6)]]
+    busy_until, seen_trade, seen_trig = None, set(), set()
+    for ts in day_bars.index:
+        now = ts + timedelta(minutes=5)              # bar closed
+        if not gp.FIRST_IDEA <= now.time() <= gp.LAST_IDEA:
+            continue
+        upto = hist[hist.index < now]
+        spot = float(upto["close"].iloc[-1])
+        p = gp.profile(replace(chain, spot=spot), now, "auto", "oi")
+        if p is None:
+            continue
+        idea = gp.build_idea(p, replace(chain, spot=spot), gp.intraday(upto, d), None, now, gp.market_structure(upto, d))
+        if not idea.side:
+            continue
+        key = idea.setup
+        rec = {"date": d.isoformat(), "ticker": tk, "time": f"{now:%H:%M}", "side": idea.side, "setup": idea.setup,
+               "rate": idea.rate, "against": idea.against, "grade": idea.grade, "dte": idea.dte, "level": idea.level,
+               "stop": idea.stop, "target": idea.target}
+        if key not in seen_trig:
+            seen_trig.add(key)
+            triggers.append({**rec, **simulate(idea, now, day_bars, chain, obars), "kind": "trigger"})
+        if idea.grade in ("A", "B") and key not in seen_trade and (busy_until is None or now >= busy_until):
+            seen_trade.add(key)
+            res = simulate(idea, now, day_bars, chain, obars)
+            trades.append({**rec, **res, "kind": "trade"})
+            h, m = map(int, res["exit_time"].split(":"))
+            busy_until = datetime.combine(d, time(h, m), tzinfo=ET) + timedelta(minutes=5)
+    return trades, triggers
+
+
+def _days(con, tk: str, bars: pd.DataFrame) -> list[tuple[str, date]]:
+    """(snapshot date, the session it is used for) - only sessions whose bars are complete (a 15:55 bar)."""
+    snaps = [r[0] for r in con.execute("SELECT DISTINCT date FROM chain_snapshots WHERE underlying = ? ORDER BY date", (tk,))]
+    last_bar = pd.Series(bars.index, index=bars.index).groupby(bars.index.date).max()
+    closes = {d for d, ts in last_bar.items() if ts.time() >= time(15, 50)}
+    out = []
+    for snap in snaps:
+        later = sorted(x for x in closes if x > date.fromisoformat(snap))
+        if later:
+            out.append((snap, later[0]))
+    return out
+
+
+def run(tickers: list[str], start: date | None, end: date | None, db: Path = DB, store_results: bool = False
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Replay. store_results=True: skip ticker-days already stored at this REPLAY_VERSION, save new ones."""
+    con = sqlite3.connect(db, timeout=60)
+    con.executescript(SCHEMA)
     obars = OptionBars(con)
     trades, triggers = [], []
+    done = {(d, t) for d, t, v in con.execute("SELECT date, ticker, version FROM gex_replay_days") if v == REPLAY_VERSION}
     for tk in tickers:
-        bars = load_bars(con, tk)
-        snaps = [r[0] for r in con.execute("SELECT DISTINCT date FROM chain_snapshots WHERE underlying = ? ORDER BY date",
-                                           (tk,))]
+        if not con.execute("SELECT 1 FROM chain_snapshots WHERE underlying = ? LIMIT 1", (tk,)).fetchone():
+            continue                                  # no saved chains for this ticker yet
+        bars = load_bars(con, tk, start)
+        if bars.empty:
+            continue
         sessions = sorted(set(bars.index.date))
-        for snap in snaps:
-            later = [d for d in sessions if d > date.fromisoformat(snap)]
-            if not later:
-                continue
-            d = later[0]
-            if (start and d < start) or (end and d > end):
+        for snap, d in _days(con, tk, bars):
+            if (start and d < start) or (end and d > end) or (store_results and (d.isoformat(), tk) in done):
                 continue
             chain = load_chain(con, tk, snap, d)
             if chain is None:
                 continue
-            day_bars = bars[bars.index.date == d]
-            hist = bars[bars.index.date <= d]
-            hist = hist[hist.index.date >= sessions[max(0, sessions.index(d) - 6)]]
-            busy_until, seen_trade, seen_trig = None, set(), set()
-            for ts in day_bars.index:
-                now = ts + timedelta(minutes=5)              # bar closed
-                if not gp.FIRST_IDEA <= now.time() <= gp.LAST_IDEA:
-                    continue
-                upto = hist[hist.index < now]
-                spot = float(upto["close"].iloc[-1])
-                p = gp.profile(replace(chain, spot=spot), now, "auto", "oi")
-                if p is None:
-                    continue
-                idea = gp.build_idea(p, replace(chain, spot=spot), gp.intraday(upto, d), None, now,
-                                     gp.market_structure(upto, d))
-                if not idea.side:
-                    continue
-                key = (idea.setup,)
-                rec = {"date": d.isoformat(), "ticker": tk, "time": f"{now:%H:%M}", "side": idea.side,
-                       "setup": idea.setup, "rate": idea.rate, "against": idea.against, "grade": idea.grade,
-                       "dte": idea.dte, "level": idea.level, "stop": idea.stop, "target": idea.target}
-                if key not in seen_trig:
-                    seen_trig.add(key)
-                    triggers.append({**rec, **simulate(idea, now, day_bars, chain, obars)})
-                active = idea.grade in ("A", "B")
-                if active and key not in seen_trade and (busy_until is None or now >= busy_until):
-                    seen_trade.add(key)
-                    res = simulate(idea, now, day_bars, chain, obars)
-                    trades.append({**rec, **res})
-                    h, m = map(int, res["exit_time"].split(":"))
-                    busy_until = datetime.combine(d, time(h, m), tzinfo=ET) + timedelta(minutes=5)
+            tr, tg = replay_day(tk, d, chain, bars, sessions, obars)
+            trades += tr
+            triggers += tg
+            if store_results:
+                con.execute("DELETE FROM gex_replay WHERE date = ? AND ticker = ?", (d.isoformat(), tk))
+                con.executemany(f"INSERT OR REPLACE INTO gex_replay VALUES ({', '.join('?' * len(COLS))})",
+                                [tuple(r.get(c) for c in COLS) for r in tr + tg])
+                con.execute("INSERT OR REPLACE INTO gex_replay_days VALUES (?, ?, ?)", (d.isoformat(), tk, REPLAY_VERSION))
+                con.commit()
+    con.close()
     return pd.DataFrame(trades), pd.DataFrame(triggers)
 
 
+def stored(db: Path = DB, since: date | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    con = sqlite3.connect(db, timeout=60)
+    con.executescript(SCHEMA)
+    df = pd.read_sql("SELECT * FROM gex_replay WHERE date >= ? ORDER BY date, time", con,
+                     params=((since or date(2000, 1, 1)).isoformat(),))
+    con.close()
+    return df[df["kind"] == "trade"].reset_index(drop=True), df[df["kind"] == "trigger"].reset_index(drop=True)
+
+
+def report(trades: pd.DataFrame, triggers: pd.DataFrame) -> dict:
+    """JSON for the dashboard / email."""
+    out = {"generated": datetime.now(ET).isoformat(timespec="seconds"), "version": REPLAY_VERSION,
+           "days": sorted(set(triggers["date"])) if not triggers.empty else [], "trades": [], "by_ticker": [],
+           "by_bucket": [], "total": {}}
+    if not trades.empty:
+        t = trades.where(pd.notna(trades), None)
+        out["trades"] = t.sort_values(["date", "time"], ascending=False).head(200).to_dict("records")
+        out["by_ticker"] = summary(trades, "ticker").to_dict("records")
+        priced = trades["pnl"].notna()
+        out["total"] = {"ideas": int(len(trades)), "win_R_%": round(float((trades["R"] > 0).mean() * 100)),
+                        "avg_R": round(float(trades["R"].mean()), 2), "priced": int(priced.sum()),
+                        "opt_pnl_$": round(float(trades.loc[priced, "pnl"].sum()), 0)}
+    if not triggers.empty:
+        tg = triggers.assign(bucket=pd.cut(triggers["rate"], [-1, 39, 59, 74, 100],
+                                           labels=["<40", "40-59", "60-74", "75+"]).astype(str))
+        out["by_bucket"] = summary(tg, "bucket").to_dict("records")
+    return out
+
+
+def nightly_replay(db: Path, today: date, tickers: list[str], window_days: int = 45) -> dict:
+    """Replay any new ticker-days, then report the last `window_days` from the stored results."""
+    new_trades, new_triggers = run(tickers, today - timedelta(days=window_days), today, db, store_results=True)
+    trades, triggers = stored(db, today - timedelta(days=window_days))
+    rep = report(trades, triggers)
+    con = sqlite3.connect(db, timeout=60)
+    replayed = con.execute("SELECT date, ticker FROM gex_replay_days WHERE date >= ? AND version = ?",
+                           ((today - timedelta(days=window_days)).isoformat(), REPLAY_VERSION)).fetchall()
+    con.close()
+    rep["days"] = sorted({d for d, _ in replayed})
+    rep["ticker_days"] = len(replayed)
+    rep["tickers"] = sorted({t for _, t in replayed})
+    rep["new_trades"] = int(len(new_trades))
+    return rep
+
+
 def summary(df: pd.DataFrame, by: str | list[str]) -> pd.DataFrame:
+    df = df.assign(R=pd.to_numeric(df["R"]), pnl=pd.to_numeric(df["pnl"]))
     priced = df[df["pnl"].notna()]
-    g = df.groupby(by)
+    g = df.groupby(by, observed=True)
     out = pd.DataFrame({"n": g.size(), "win_R": g["R"].apply(lambda s: round((s > 0).mean() * 100)),
                         "avg_R": g["R"].mean().round(2), "targets": g["reason"].apply(lambda s: (s == "TARGET").sum()),
                         "stops": g["reason"].apply(lambda s: (s == "STOP").sum())})
     if not priced.empty:
-        pg = priced.groupby(by)
+        pg = priced.groupby(by, observed=True)
         out["opt_win_%"] = pg["pnl"].apply(lambda s: round((s > 0).mean() * 100))
         out["opt_pnl_$"] = pg["pnl"].sum().round(0)
     return out.reset_index()

@@ -279,11 +279,16 @@ def gex_sources():
         return None, news
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def gex_replay() -> dict:
+    return store.read_json("research/gex_ideas_backtest.json", {}) or {}
+
+
 with tab_gex:
     @st.fragment(run_every="30s")
     def gex_live():
         market, news = gex_sources()
-        gex_tab.gex_page(market, news, get_ledger(), Clock().now())
+        gex_tab.gex_page(market, news, get_ledger(), Clock().now(), gex_replay())
 
     gex_live()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 
+import numpy as np
 import pandas as pd
 
 from src.core.clock import ET
@@ -205,3 +206,39 @@ def test_zone_rates_cover_each_zone():
     call = next(z for z in zones if z["label"] == "CALL at put wall")
     put = next(z for z in zones if z["label"] == "PUT at call wall")
     assert call["rate"] >= 40 and put["against"] >= 20       # 30m up structure helps the call, vetoes the put
+
+
+def test_nightly_replay_is_incremental_and_reports(tmp_path):
+    from datetime import date
+
+    from src import backtest_gex_ideas as bt
+    from src import market_db as mdb
+
+    mdb.DB_PATH, mdb._CONN = tmp_path / "m.db", None
+    con = mdb.connect()
+    days = [date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7)]
+    rows = []
+    for d in days:      # full sessions 9:30-15:55, gently falling so the structure has swings
+        idx = pd.date_range(datetime.combine(d, time(9, 30), tzinfo=ET), periods=78, freq="5min")
+        for i, ts in enumerate(idx):
+            px = 101.5 - 0.01 * i + 0.3 * np.sin(i / 4)
+            rows.append(("SPY", int(ts.timestamp()), px, px + 0.1, px - 0.1, px, 1000.0))
+    con.executemany("INSERT INTO bars_5m VALUES (?,?,?,?,?,?,?)", rows)
+    mdb.save_chain_snapshot(make_chain(100.5, today=days[1], dtes=(1, 2)), days[1], "ts")
+    con.commit()
+    mdb._CONN.close()
+    mdb._CONN = None
+    first = bt.nightly_replay(tmp_path / "m.db", date(2026, 10, 8), ["SPY", "QQQ"])
+    assert first["ticker_days"] == 1 and first["days"] == ["2026-10-07"] and first["tickers"] == ["SPY"]
+    again = bt.nightly_replay(tmp_path / "m.db", date(2026, 10, 8), ["SPY"])
+    assert again["ticker_days"] == 1 and again["new_trades"] == 0 and again["total"] == first["total"]
+
+
+def test_replay_report_shapes():
+    from src import backtest_gex_ideas as bt
+
+    tr = pd.DataFrame([{"date": "2026-10-14", "ticker": "QQQ", "time": "10:40", "kind": "trade", "R": 1.2, "pnl": 400.0,
+                        "reason": "TARGET", "rate": 60}])
+    rep = bt.report(tr, tr.assign(kind="trigger"))
+    assert rep["total"] == {"ideas": 1, "win_R_%": 100, "avg_R": 1.2, "priced": 1, "opt_pnl_$": 400.0}
+    assert rep["by_bucket"][0]["bucket"] == "60-74" and rep["trades"][0]["ticker"] == "QQQ"
