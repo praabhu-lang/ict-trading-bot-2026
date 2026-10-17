@@ -26,8 +26,9 @@ from src.brokers.platforms import PLATFORMS, CredentialStore  # noqa: E402
 from src.core.clock import Clock  # noqa: E402
 from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
+from src import dashboard_gex as gex_tab  # noqa: E402
 from src import dashboard_pages as pages  # noqa: E402
-from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, LIVE_BROKERS, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
+from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -229,8 +230,8 @@ with st.sidebar:
 st.title("📈 ICT Trading Bot")
 st.caption("First 5-minute candle on SPY/QQQ options · " + ("🧪 paper" if settings.broker == "alpaca_paper" else "💵 live")
            + f" · {settings.strategy} / {settings.fc_mode}")
-(tab_today, tab_perf, tab_trades, tab_levels, tab_how, tab_research, tab_bt, tab_set, tab_plat, tab_log) = st.tabs(
-    ["🏠 Today", "📈 Performance", "🧾 Trades", "📡 Signals & levels", "📘 How it works", "🔬 Research",
+(tab_today, tab_perf, tab_trades, tab_levels, tab_gex, tab_how, tab_research, tab_bt, tab_set, tab_plat, tab_log) = st.tabs(
+    ["🏠 Today", "📈 Performance", "🧾 Trades", "📡 Signals & levels", "🧲 GEX ideas", "📘 How it works", "🔬 Research",
      "🧪 Backtest (first candle)", "⚙️ Settings", "🔌 Platforms", "🪵 Logs"])
 
 
@@ -262,6 +263,29 @@ with tab_perf:
 
 with tab_trades:
     pages.trades_page(led)
+
+
+@st.cache_resource(show_spinner=False)
+def gex_sources():
+    """One MarketData (60 s chain cache) and one NewsAgent (30 min news/LLM cache) shared by all reruns."""
+    from src.agents.llm import NvidiaLLM
+    from src.agents.news_agent import NewsAgent
+    from src.data.market import MarketData
+
+    news = NewsAgent(llm=NvidiaLLM(timeout=20))   # a slow LLM must not hold the page; no verdict = neutral
+    try:
+        return MarketData.from_env(store), news
+    except Exception:  # noqa: BLE001 - shown as "Schwab is not configured"
+        return None, news
+
+
+with tab_gex:
+    @st.fragment(run_every="30s")
+    def gex_live():
+        market, news = gex_sources()
+        gex_tab.gex_page(market, news, get_ledger(), Clock().now())
+
+    gex_live()
 
 with tab_how:
     pages.how_page(settings, research_summary())
@@ -504,6 +528,11 @@ with tab_set:
         auto_trade = st.toggle("Auto-trade (off = email alerts only)", settings.auto_trade)
         universe = st.multiselect("Universe", sorted(set(DEFAULT_UNIVERSE) | set(settings.universe)),
                                   default=settings.universe)
+        news_llm = st.selectbox("LLM news judge (NVIDIA)", list(NEWS_LLM_MODES),
+                                index=list(NEWS_LLM_MODES).index(settings.news_llm_mode), format_func=NEWS_LLM_MODES.get,
+                                help="An NVIDIA-hosted LLM reads the Tavily headlines for each signal. It can only block, "
+                                "never add points. Shadow logs what it would have blocked; switch to Veto once that "
+                                "log shows it avoids losers." + ("" if env("NVIDIA_API_KEY") else " NVIDIA_API_KEY is not set."))
         st.subheader("Strategy")
         strat = st.selectbox("Strategy", list(STRATEGIES), index=list(STRATEGIES).index(settings.strategy),
                              format_func=STRATEGIES.get)
@@ -604,7 +633,7 @@ with tab_set:
                            "name": str(r["name"])}
                           for r in ev_df.dropna(subset=["date", "name"]).to_dict("records")]
                 save_control({
-                    "broker": broker_choice, "auto_trade": auto_trade, "universe": universe,
+                    "broker": broker_choice, "auto_trade": auto_trade, "universe": universe, "news_llm_mode": news_llm,
                     "starting_capital": float(start_cap), "stock_capital": float(stock_cap),
                     "reserve_capital": float(reserve_cap),
                     "risk_per_trade_pct": risk / 100, "options_allocation_pct": pool / 100,

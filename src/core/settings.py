@@ -37,6 +37,8 @@ LIVE_BROKERS = {"alpaca_live", "ibkr"}
 STRATEGIES = {"vrz": "VRZ sweep-and-reject (universe)", "first_candle": "First 5-min candle breakout (SPY/QQQ options)"}
 FC_MODES = {"smart": "Smart rule (gap-graded 0DTE/1DTE, phases, monitor)", "classic": "Classic (one size, fixed delta)"}
 FC_EXIT_MODES = {"target": "3x target + break-even", "trail": "No target, trail 1x range off the best (variant G)"}
+NEWS_LLM_MODES = {"off": "Off (keywords only)", "shadow": "Shadow (log the LLM verdict, never block)",
+                  "veto": "Veto (LLM can block an entry)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -108,6 +110,11 @@ class Settings:
     trail_giveback_pct: float = 0.15
     momentum_exit: bool = True
 
+    # --- LLM news judge (NVIDIA_API_KEY, src/agents/llm.py) ---
+    # shadow: verdicts logged next to each signal (kv news_llm_log) for review; veto: a "block" verdict, or
+    # sentiment >= 0.5 against the trade, blocks the entry. Not backtestable (no historical news), so shadow first.
+    news_llm_mode: str = "shadow"
+
     # --- stock fallback ---
     allow_short_stock: bool = True
 
@@ -176,6 +183,9 @@ class Settings:
 
     # --- VRZ universe scan as PAPER trades while first_candle is the strategy (simulated stock trades) ---
     vrz_paper: bool = True
+
+    # --- GEX ideas (dashboard tab): PAPER tracking of every ACTIVE call/put idea (src/strategy/gex_plan.py) ---
+    gex_ideas: bool = True
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -291,6 +301,8 @@ class Settings:
             s.fc_mode = "smart"
         if s.fc_exit_mode not in FC_EXIT_MODES:
             s.fc_exit_mode = "target"
+        if s.news_llm_mode not in NEWS_LLM_MODES:
+            s.news_llm_mode = "shadow"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

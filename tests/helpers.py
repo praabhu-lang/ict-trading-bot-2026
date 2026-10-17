@@ -151,11 +151,11 @@ class FakeMarket:
 
 
 class FakeNews:
-    def __init__(self, ok=True):
-        self.ok = ok
+    def __init__(self, ok=True, llm=None):
+        self.ok, self.llm = ok, llm
 
     def check(self, ticker):
-        return NewsResult(ok=self.ok)
+        return NewsResult(ok=self.ok, llm=self.llm)
 
     def market_shock(self):
         return NewsResult(ok=True)

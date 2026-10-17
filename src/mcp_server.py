@@ -101,7 +101,7 @@ def analyze_ticker(ticker: str) -> str:
 
 @mcp.tool()
 def news_check(ticker: str) -> str:
-    """Tavily news scan for a ticker (block keywords, headlines)."""
+    """Tavily news scan for a ticker (block keywords, headlines, NVIDIA LLM verdict)."""
     r = NewsAgent().check(ticker.upper())
     return json.dumps(r.__dict__, default=str, indent=2)
 

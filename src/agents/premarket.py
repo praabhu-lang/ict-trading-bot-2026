@@ -63,6 +63,7 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
             quotes = market.schwab.quotes(s.universe)
         except MarketDataUnavailable as exc:
             log.warning("Quotes failed: %s", exc)
+    news.check_many(s.universe)          # Tavily + LLM verdicts in parallel; the loop below reads the cache
     for ticker in s.universe:
         try:
             bars = market.bars(ticker, now, days=3)
@@ -96,6 +97,8 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
             "Call wall": gex.call_wall if gex else None, "Put wall": gex.put_wall if gex else None,
             "Flags": "; ".join(x for x in ("EARNINGS" if ticker in earn else "",
                                             n.reason if n.blocked else "") if x),
+            "News (LLM)": (f"{n.llm['risk'].upper()} {n.llm['sentiment']:+.1f}: {n.llm['reason']}"[:140]
+                           if n.llm else ""),
         })
         ledger.upsert_levels(
             d, ticker, table="premarket_levels", spot=last, prior_close=prior_close, gap_pct=round(gap, 2),

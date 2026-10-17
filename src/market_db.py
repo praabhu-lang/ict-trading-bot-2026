@@ -14,6 +14,13 @@ Tables
   events       date, event, ticker, detail, source                   market-moving days: NFP / CPI / PPI (official BLS dates),
                                                                      FOMC decisions, monthly opex / quad witching, earnings reactions
   vol_forecast symbol, date, model, vol                              annualized % vol forecast FOR that date (known at the prior close)
+  gex_levels   trade_date, ticker, ts, flip/walls/net GEX, ...       intraday GEX levels per 5-min scan (archived from the ledger)
+  gex_strikes  date, underlying, expiry, strike, call/put GEX, OI, volume
+                                                                     chain_snapshots older than RAW_CHAIN_DAYS rolled up per strike
+
+Retention (nightly `maintenance`): raw chain_snapshots are kept RAW_CHAIN_DAYS, then rolled up into gex_strikes
+(~10x smaller, enough to rebuild GEX walls/flip by day) and deleted; freed pages are returned with an incremental
+vacuum. Run `python src/market_db.py compact` ONCE locally to switch the file to incremental auto-vacuum.
 
 `option_bars()` is a read-through cache: backtests call it like the Alpaca API and only missing days are downloaded.
 
@@ -25,6 +32,7 @@ CLI:
   python src/market_db.py events                      # event calendar (BLS, FOMC, opex, earnings)
   python src/market_db.py all                         # everything above
   python src/market_db.py info                        # row counts and date ranges
+  python src/market_db.py compact                     # one-time: incremental auto-vacuum + full VACUUM (needs ~2x disk)
 """
 
 import argparse
@@ -59,7 +67,14 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (date TEXT, ts TEXT, underlying TEXT,
     strike REAL, spot REAL, bid REAL, ask REAL, last REAL, iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL,
     oi INTEGER, volume INTEGER, PRIMARY KEY (date, symbol)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS vol_forecast (symbol TEXT, date TEXT, model TEXT, vol REAL, PRIMARY KEY (symbol, date, model)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gex_levels (trade_date TEXT, ticker TEXT, ts TEXT, expiry TEXT, weight TEXT, spot REAL,
+    gamma_flip REAL, put_wall REAL, call_wall REAL, net_gex REAL, expected_move REAL, pc_volume REAL, idea TEXT,
+    PRIMARY KEY (trade_date, ticker, ts)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gex_strikes (date TEXT, underlying TEXT, expiry TEXT, strike REAL, spot REAL,
+    call_gex REAL, put_gex REAL, call_oi INTEGER, put_oi INTEGER, call_vol INTEGER, put_vol INTEGER,
+    PRIMARY KEY (date, underlying, expiry, strike)) WITHOUT ROWID;
 """
+RAW_CHAIN_DAYS = 60
 _CONN = None
 
 
@@ -408,6 +423,67 @@ def save_chain_snapshot(chain, d: date, ts: str) -> int:
     return len(rows)
 
 
+GEX_LEVEL_COLS = ("trade_date", "ticker", "ts", "expiry", "weight", "spot", "gamma_flip", "put_wall", "call_wall",
+                  "net_gex", "expected_move", "pc_volume", "idea")
+
+
+def archive_gex_levels(rows: list[dict]) -> int:
+    """Ledger gex_levels rows -> market DB (idempotent)."""
+    con = connect()
+    con.executemany(f"INSERT OR IGNORE INTO gex_levels VALUES ({', '.join('?' * len(GEX_LEVEL_COLS))})",
+                    [tuple(r.get(c) for c in GEX_LEVEL_COLS) for r in rows])
+    con.commit()
+    return len(rows)
+
+
+def rollup_chain_snapshots(before: date) -> int:
+    """Raw chain rows dated before `before` -> one gex_strikes row per (date, underlying, expiry, strike), then delete
+    the raw rows. GEX = gamma x OI x 100 x spot^2 x 1% (calls +, puts -), the same convention as src/strategy/gex.py."""
+    con = connect()
+    cutoff = before.isoformat()
+    n = con.execute("SELECT COUNT(*) FROM chain_snapshots WHERE date < ?", (cutoff,)).fetchone()[0]
+    if not n:
+        return 0
+    con.execute("""
+        INSERT OR REPLACE INTO gex_strikes
+        SELECT date, underlying, expiry, strike, MAX(spot),
+               SUM(CASE WHEN cp = 'C' THEN gamma * oi * 100 * spot * spot * 0.01 ELSE 0 END),
+               -SUM(CASE WHEN cp = 'P' THEN gamma * oi * 100 * spot * spot * 0.01 ELSE 0 END),
+               SUM(CASE WHEN cp = 'C' THEN oi ELSE 0 END), SUM(CASE WHEN cp = 'P' THEN oi ELSE 0 END),
+               SUM(CASE WHEN cp = 'C' THEN volume ELSE 0 END), SUM(CASE WHEN cp = 'P' THEN volume ELSE 0 END)
+        FROM chain_snapshots WHERE date < ? GROUP BY date, underlying, expiry, strike""", (cutoff,))
+    con.execute("DELETE FROM chain_snapshots WHERE date < ?", (cutoff,))
+    con.commit()
+    return n
+
+
+def maintenance(today: date) -> dict:
+    """Nightly: roll up old raw chains, give freed pages back (incremental vacuum - cheap, no full rewrite), and
+    refresh the query planner statistics."""
+    con = connect()
+    out = {"chain_rows_rolled_up": rollup_chain_snapshots(today - timedelta(days=RAW_CHAIN_DAYS))}
+    if con.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:          # INCREMENTAL (set by `compact`)
+        free = con.execute("PRAGMA freelist_count").fetchone()[0]
+        con.execute("PRAGMA incremental_vacuum")
+        out["pages_freed"] = free
+    else:
+        out["pages_freed"] = "n/a - run `python src/market_db.py compact` once"
+    con.execute("PRAGMA optimize")
+    return out
+
+
+def compact() -> None:
+    """One-time: switch to incremental auto-vacuum and rewrite the file (a full VACUUM needs ~2x the file on disk,
+    so run it on a machine with room, not in the Cloud Run job)."""
+    con = connect()
+    before = DB_PATH.stat().st_size
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    con.execute("VACUUM")
+    print(f"   {before / 1e6:.0f} MB -> {DB_PATH.stat().st_size / 1e6:.0f} MB, auto_vacuum = "
+          f"{con.execute('PRAGMA auto_vacuum').fetchone()[0]} (2 = incremental)")
+
+
 def last_option_day(underlying: str):
     row = connect().execute("SELECT MAX(d.date) FROM option_days d JOIN contracts c ON c.id = d.cid "
                             "WHERE c.underlying = ? AND c.expiry = d.date", (underlying,)).fetchone()
@@ -422,7 +498,9 @@ def info():
               "SELECT symbol, model, COUNT(*), MIN(date), MAX(date) FROM vol_forecast GROUP BY symbol, model",
               "SELECT event, COUNT(*), MIN(date), MAX(date) FROM events GROUP BY event",
               "SELECT underlying, COUNT(DISTINCT date), COUNT(*), MIN(date), MAX(date) FROM chain_snapshots GROUP BY underlying",
-              "SELECT underlying, COUNT(*), MIN(expiry), MAX(expiry) FROM listings GROUP BY underlying"):
+              "SELECT underlying, COUNT(*), MIN(expiry), MAX(expiry) FROM listings GROUP BY underlying",
+              "SELECT ticker, COUNT(*), MIN(trade_date), MAX(trade_date) FROM gex_levels GROUP BY ticker",
+              "SELECT underlying, COUNT(DISTINCT date), COUNT(*), MIN(date), MAX(date) FROM gex_strikes GROUP BY underlying"):
         for row in con.execute(q):
             print("  ", row)
     print(f"   size: {DB_PATH.stat().st_size / 1e6:.0f} MB")
@@ -430,11 +508,13 @@ def info():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Local market-data database for backtests")
-    ap.add_argument("what", choices=["daily", "bars", "options", "garch", "events", "all", "info"])
+    ap.add_argument("what", choices=["daily", "bars", "options", "garch", "events", "all", "info", "compact"])
     ap.add_argument("--start", type=date.fromisoformat)
     ap.add_argument("--end", type=date.fromisoformat)
     ap.add_argument("--strikes", type=int, default=12, help="options: $1 strikes each side of the open")
     a = ap.parse_args()
+    if a.what == "compact":
+        compact()
     if a.what in ("daily", "all"):
         update_daily()
     if a.what in ("bars", "all"):

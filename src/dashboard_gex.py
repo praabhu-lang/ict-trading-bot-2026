@@ -1,0 +1,258 @@
+"""Dashboard GEX tab: our own gamma exposure from Schwab chains, confluence, and a call/put suggestion per ticker.
+
+Suggestions only - no orders. The engine paper-tracks every ACTIVE idea (kv gex_ideas_log), shown at the bottom.
+Charts use the dashboard palette: call gamma blue, put gamma red (diverging pair), levels in text inks.
+"""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from src.dashboard_pages import palette
+from src.strategy import gex_plan as gp
+
+def tickers(market) -> tuple[list[str], str]:
+    """gp.universe, cached 5 min per browser session."""
+    key = int(datetime.now().timestamp() // 300)
+    hit = st.session_state.get("gex_movers")
+    if not hit or hit[0] != key:
+        hit = (key, *gp.universe(market.schwab))
+        st.session_state["gex_movers"] = hit
+    return hit[1], hit[2]
+
+
+def summary_row(r: dict, live: dict) -> dict:
+    if "error" in r:
+        return {"Ticker": r["ticker"], "Idea": "data error", "Why": r["error"]}
+    p, i = r["profile"], r["idea"]
+    g = p.gex
+    regime = "Positive" if (p.spot > g.gamma_flip if g.gamma_flip else g.net_gex >= 0) else "Negative"
+    q = live.get(p.ticker)
+    return {
+        "Ticker": p.ticker, "Live": round(q["price"], 2) if q else None, "Src": q["source"] if q else "",
+        "Spot (chain)": round(p.spot, 2), "Expiry": f"{p.dte}DTE", "Gamma": regime,
+        "Flip": g.gamma_flip and round(g.gamma_flip, 2), "Put wall": g.put_wall, "Call wall": g.call_wall,
+        "Exp. move ±": round(p.expected_move, 2), "P/C vol": p.pc_volume, "Weighted by": p.weight,
+        "Idea": f"{'🟢' if i.status == 'ACTIVE' else '⚪'} {i.side or 'WAIT'}" + (f" {i.grade}" if i.grade else ""),
+        "Contract": f"{i.strike:g}{'C' if i.side == 'CALL' else 'P'} @ {i.mid:.2f}" if i.contract else "",
+        "Stop": i.stop, "Target": i.target, "Why": i.reason,
+    }
+
+
+def _levels(fig, p: gp.Profile, ctx: dict, idea: gp.Idea, colors: dict) -> list[tuple[float, str]]:
+    """Draw every level across both panels; return (price, label) for the right-hand label gutter."""
+    g = p.gex
+    lines = [(g.call_wall, "Call wall", colors["gain"], "dash"), (g.put_wall, "Put wall", colors["loss"], "dash"),
+             (g.gamma_flip, "Gamma flip", colors["text"], "dot")]
+    if ctx:
+        lines += [(ctx["poc"], "POC", colors["muted"], "dot"), (ctx["vah"], "VAH", colors["muted"], "dot"),
+                  (ctx["val"], "VAL", colors["muted"], "dot")]
+    if idea.status == "ACTIVE":
+        lines += [(idea.stop, "Stop", colors["loss"], "solid"), (idea.target, "Target", colors["gain"], "solid")]
+    out = []
+    for y, name, color, dash in lines:
+        if y:
+            fig.add_hline(y=y, line=dict(color=color, width=1, dash=dash), row=1, col="all")
+            out.append((y, f"{name} {y:,.2f}"))
+    return out
+
+
+def _gutter(fig, labels: list[tuple[float, str]], lo: float, hi: float, colors: dict) -> None:
+    """Level names in the right margin, nudged apart so close levels never print on top of each other.
+    A thin leader line ties a nudged label back to its level."""
+    labels = sorted((y, t) for y, t in labels if lo <= y <= hi)
+    gap = (hi - lo) * 0.04
+    placed: list[float] = []
+    for y, _ in labels:
+        placed.append(max(y, placed[-1] + gap) if placed else y)
+    if placed and placed[-1] > hi:              # ran off the top: shift the stack down
+        shift = placed[-1] - hi
+        placed = [max(v - shift, lo) for v in placed]
+    for (y, text), ly in zip(labels, placed):
+        bold = text.startswith("Live")
+        fig.add_annotation(x=1.0, xref="paper", y=ly, yref="y", text=f"<b>{text}</b>" if bold else text,
+                           showarrow=False, xanchor="left", xshift=6, font=dict(color=colors["text"], size=11))
+        if abs(ly - y) > 1e-9:
+            fig.add_shape(type="line", xref="paper", yref="y", x0=1.0, x1=1.004, y0=y, y1=ly,
+                          line=dict(color=colors["axis"], width=1))
+
+
+def chart(r: dict, show: str, now: datetime, quote: dict | None = None) -> go.Figure:
+    """Left: today's 5-min candles + VWAP and every level. Right: GEX / open interest / volume by strike on the
+    same price axis, so a wall on the right lines up with price on the left."""
+    c = palette()
+    p, ctx, idea = r["profile"], r["ctx"], r["idea"]
+    price = quote["price"] if quote else p.spot
+    span = max(3 * p.expected_move, p.spot * 0.015)
+    lo, hi = min(p.spot, price) - span, max(p.spot, price) + span
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.66, 0.34], horizontal_spacing=0.02)
+
+    bars = r["bars"]
+    today = bars[bars.index.date == now.date()] if bars is not None and not bars.empty else None
+    if today is not None and not today.empty:
+        fig.add_trace(go.Candlestick(
+            x=today.index, open=today["open"], high=today["high"], low=today["low"], close=today["close"],
+            increasing=dict(line=dict(color=c["gain"], width=1), fillcolor=c["gain"]),
+            decreasing=dict(line=dict(color=c["loss"], width=1), fillcolor=c["loss"]), name="Price",
+            showlegend=False), row=1, col=1)
+        vw = (today["close"] * today["volume"]).cumsum() / today["volume"].cumsum().where(lambda v: v > 0)
+        fig.add_trace(go.Scatter(x=today.index, y=vw, mode="lines", name="VWAP",
+                                 line=dict(color=c["text"], width=2), hovertemplate="VWAP %{y:,.2f}<extra></extra>"),
+                      row=1, col=1)
+        lo, hi = min(lo, float(today["low"].min())), max(hi, float(today["high"].max()))
+    if quote:   # the live print, after the last closed 5-min bar
+        x = quote["ts"] or now
+        fig.add_trace(go.Scatter(x=[x], y=[price], mode="markers", name="Live",
+                                 marker=dict(size=10, color=c["text"], line=dict(width=2, color=c["axis"])),
+                                 hovertemplate=f"Live %{{y:,.2f}} · {quote['source']} %{{x|%H:%M:%S}}<extra></extra>"),
+                      row=1, col=1)
+    else:
+        fig.add_annotation(text="No intraday bars yet", x=0.3, y=p.spot, xref="paper", showarrow=False,
+                           font=dict(color=c["muted"]))
+
+    strikes = sorted(k for k in set(p.calls) | set(p.puts) if lo <= k <= hi)
+    if show == "Open interest":
+        cy, py, unit = [p.call_oi.get(k, 0) for k in strikes], [-p.put_oi.get(k, 0) for k in strikes], "contracts"
+    elif show == "Volume":
+        vol = {}
+        for o in r["chain"].for_expiry(p.expiry):
+            vol[(o.strike, o.put_call)] = vol.get((o.strike, o.put_call), 0) + o.volume
+        cy, py, unit = [vol.get((k, "C"), 0) for k in strikes], [-vol.get((k, "P"), 0) for k in strikes], "contracts"
+    else:
+        cy, py, unit = [p.calls.get(k, 0) / 1e6 for k in strikes], [p.puts.get(k, 0) / 1e6 for k in strikes], "$M per 1%"
+    for name, xs, color in (("Calls", cy, c["gain"]), ("Puts", py, c["loss"])):
+        fig.add_trace(go.Bar(y=strikes, x=xs, orientation="h", name=name, marker=dict(color=color, line=dict(width=0)),
+                             hovertemplate=f"{name} %{{y:g}}: %{{x:,.1f}} {unit}<extra></extra>"), row=1, col=2)
+    fig.add_hline(y=price, line=dict(color=c["text"], width=2), row=1, col="all")
+    for z in gp.plan_zones(p):   # where a call / put would trigger, shaded across both panels
+        color = c["gain"] if z["side"] == "CALL" else c["loss"]
+        fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor=color, opacity=0.12, line_width=0, row=1, col="all")
+        if not lo <= (z["low"] + z["high"]) / 2 <= hi:
+            continue
+        fig.add_annotation(x=0.01, xref="x domain", y=(z["low"] + z["high"]) / 2, yref="y", text=z["label"],
+                           showarrow=False, xanchor="left", font=dict(color=c["text"], size=11),
+                           bgcolor=c["surface"])
+    if idea.status == "ACTIVE":  # point at the live price with the suggested contract
+        fig.add_annotation(x=(quote or {}).get("ts") or now, y=price, xref="x", yref="y",
+                           text=f"<b>BUY {idea.side} {idea.strike:g}</b> @ {idea.ask:.2f}", showarrow=True,
+                           arrowhead=2, arrowcolor=c["gain"] if idea.side == "CALL" else c["loss"],
+                           ax=-90, ay=-40 if idea.side == "CALL" else 40, font=dict(color=c["text"], size=12),
+                           bgcolor=c["surface"])
+    labels = _levels(fig, p, ctx, idea, c)
+    labels.append((price, f"{'Live' if quote else 'Spot'} {price:,.2f}" + (f" {quote['source']}" if quote else "")))
+    _gutter(fig, labels, lo, hi, c)
+
+    fig.update_layout(height=580, barmode="relative", bargap=0.15, margin=dict(l=64, r=150, t=40, b=56),
+                      title=dict(text=f"{p.ticker} · {p.expiry:%b %d} ({p.dte}DTE) · {show} by strike", font=dict(size=14)),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="closest",
+                      legend=dict(orientation="h", y=-0.1, x=0, xanchor="left", font=dict(color=c["text"])),
+                      font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color=c["text"]),
+                      xaxis=dict(rangeslider=dict(visible=False)))
+    fig.update_xaxes(showgrid=False, linecolor=c["axis"], tickfont=dict(color=c["muted"]))
+    fig.update_xaxes(title=dict(text=unit, font=dict(color=c["muted"], size=11)), row=1, col=2,
+                     zeroline=True, zerolinecolor=c["axis"])
+    fig.update_yaxes(range=[lo, hi], gridcolor=c["grid"], tickfont=dict(color=c["muted"]), tickformat=",.2f")
+    return fig
+
+
+def idea_card(r: dict) -> None:
+    i, p = r["idea"], r["profile"]
+    if i.status == "ACTIVE":
+        tone = st.success if i.side == "CALL" else st.error
+        tone(f"**{i.side} {p.ticker} {i.strike:g} {i.expiry:%b %d} ({i.dte}DTE)** · grade {i.grade} · "
+             f"mid {i.mid:.2f}, ask {i.ask:.2f}, delta {i.delta:+.2f}  \n"
+             f"Underlying stop **{i.stop:,.2f}** · target **{i.target:,.2f}** · {i.reason}")
+    else:
+        st.info(f"**{p.ticker}: WAIT** · {i.reason}")
+    if i.confluence:
+        icon = {1: "✅ agrees", -1: "❌ against", 0: "➖ neutral"}
+        st.dataframe(pd.DataFrame([{"Factor": k.replace("_", " ").title(), "Vote": icon[v["score"]], "Detail": v["note"]}
+                                   for k, v in i.confluence.items()]), hide_index=True, width="stretch")
+
+
+def tracker(led) -> None:
+    log = (led.get_kv("gex_ideas_log") if led else None) or []
+    open_ = (led.get_kv("gex_ideas_open") if led else None) or []
+    st.subheader("Paper tracking of ACTIVE ideas")
+    if not log and not open_:
+        st.caption("The engine logs every ACTIVE idea during the session as a 1-contract paper trade (entry at the ask, "
+                   "exit at the bid on stop / target / 15:45 ET). Nothing yet.")
+        return
+    df = pd.DataFrame(log)
+    if not df.empty:
+        df = df[df["pnl"].notna()]      # UNQUOTED closes (contract vanished from the chain) have no price
+    if not df.empty:
+        wins = (df["pnl"] > 0).mean() * 100
+        c = st.columns(4)
+        c[0].metric("Ideas closed", len(df))
+        c[1].metric("Win rate", f"{wins:.0f}%")
+        c[2].metric("P&L (1 contract each)", f"${df['pnl'].sum():,.0f}")
+        c[3].metric("Open now", len(open_))
+        by = df.groupby(["setup", "grade"]).agg(n=("pnl", "size"), win_pct=("pnl", lambda s: round((s > 0).mean() * 100)),
+                                                pnl=("pnl", "sum")).reset_index()
+        st.dataframe(by, hide_index=True, width="stretch")
+        st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
+    if open_:
+        st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
+
+
+def gex_page(market, news, led, now: datetime) -> None:
+    st.caption("Our own dealer gamma exposure from Schwab option chains (dealers long calls / short puts). "
+               "**Suggestions only - no orders are placed.** Not backtested (no historical open interest): the "
+               "engine paper-tracks every ACTIVE idea below. Your VRZ backtests found 0DTE options lost money, "
+               "so treat these as untested until the tracker says otherwise.")
+    if market is None or market.schwab is None:
+        st.error("Schwab is not configured - no option chains.")
+        return
+    names, source = tickers(market)
+    c = st.columns([2, 2, 2, 1])
+    pick = c[0].selectbox("Ticker", names, key="gex_pick", help=f"SPY / SPX / QQQ + {source}")
+    mode = c[1].selectbox("Expiry", list(gp.EXPIRY_MODES), format_func=gp.EXPIRY_MODES.get, key="gex_mode")
+    weight = c[2].selectbox("Gamma weighted by", list(gp.WEIGHTS), format_func=gp.WEIGHTS.get, key="gex_weight",
+                            help="Open interest is yesterday's positioning (Schwab updates it overnight); today's "
+                                 "volume shows where 0DTE flow is building intraday.")
+    with_news = c[3].toggle("LLM news", True, key="gex_news", help="NVIDIA LLM verdict on Tavily headlines "
+                            "(for the selected ticker and any ticker at a GEX level; ~10 s the first time, cached 30 min)")
+
+    run = lambda t: gp.analyse(market, news, t, now, mode, weight, with_news, pick)  # noqa: E731
+    rows = [run(names[0])]                  # first call refreshes the Schwab token once, then fan out
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        rows += list(pool.map(run, names[1:]))
+    if all("error" in r for r in rows):
+        st.error(f"No option chains from Schwab: {rows[0]['error']}. If the login expired: Settings → Schwab connection.")
+        return
+
+    try:
+        live = market.live_prices(names)
+    except Exception:  # noqa: BLE001 - the chain spot (<= 60 s old) is still shown
+        live = {}
+    st.dataframe(pd.DataFrame([summary_row(r, live) for r in rows]), hide_index=True, width="stretch")
+    r = next(x for x in rows if x["ticker"] == pick)
+    if "error" in r:
+        st.warning(f"{pick}: {r['error']}")
+    else:
+        q = live.get(pick)
+        c = st.columns(4)
+        c[0].metric(f"{pick} live", f"{q['price']:,.2f}" if q else f"{r['profile'].spot:,.2f}",
+                    help="Schwab quote (Alpaca latest trade if Schwab misses it); otherwise the chain's spot")
+        c[1].metric("Source", f"{q['source']} {q['ts']:%H:%M:%S}" if q and q["ts"] else (q["source"] if q else "chain"))
+        g = r["profile"].gex
+        c[2].metric("Gamma flip", f"{g.gamma_flip:,.2f}" if g.gamma_flip else "—")
+        c[3].metric("Expected move ±", f"{r['profile'].expected_move:,.2f}")
+        idea_card(r)
+        show = st.radio("Right panel", ["GEX", "Open interest", "Volume"], horizontal=True, key="gex_show")
+        st.plotly_chart(chart(r, show, now, q), width="stretch", key="gex_chart")
+        with st.expander(f"{pick} by strike (table)"):
+            p = r["profile"]
+            ks = sorted(set(p.calls) | set(p.puts))
+            st.dataframe(pd.DataFrame({"Strike": ks, "Call GEX $M": [round(p.calls.get(k, 0) / 1e6, 2) for k in ks],
+                                       "Put GEX $M": [round(p.puts.get(k, 0) / 1e6, 2) for k in ks],
+                                       "Call OI": [p.call_oi.get(k, 0) for k in ks],
+                                       "Put OI": [p.put_oi.get(k, 0) for k in ks]}), hide_index=True, width="stretch")
+    st.caption(f"Live · price every 30 s, option chains every 60 s · {now:%H:%M:%S} ET")
+    tracker(led)

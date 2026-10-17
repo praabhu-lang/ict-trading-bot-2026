@@ -15,9 +15,9 @@ from src.core.clock import ET
 from src.core.events import FOMC_DECISION_DAYS, EventCalendar, fomc_adjacent
 
 LIGHT = {"gain": "#2a78d6", "loss": "#e34948", "line": "#2a78d6", "grid": "#e1e0d9", "axis": "#c3c2b7",
-         "muted": "#898781", "text": "#52514e"}
+         "muted": "#898781", "text": "#52514e", "surface": "rgba(252,252,251,0.85)"}
 DARK = {"gain": "#3987e5", "loss": "#e66767", "line": "#3987e5", "grid": "#2c2c2a", "axis": "#383835",
-        "muted": "#898781", "text": "#c3c2b7"}
+        "muted": "#898781", "text": "#c3c2b7", "surface": "rgba(26,26,25,0.85)"}
 PERIOD_SPLIT = date(2026, 6, 4)          # PDT-rule change: always shown as its own period
 
 

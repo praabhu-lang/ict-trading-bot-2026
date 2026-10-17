@@ -198,6 +198,12 @@ class SchwabClient:
         df.index = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(ET)
         return df[["open", "high", "low", "close", "volume"]].astype(float)
 
+    def movers(self, index: str = "$SPX", sort: str = "VOLUME") -> list[dict]:
+        """Today's top movers of an index ($SPX, $COMPX, $DJI, NYSE, NASDAQ, ...): symbol, lastPrice, volume,
+        netPercentChange, ... sorted by `sort` (VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN)."""
+        data = self._get_json(f"/marketdata/v1/movers/{index}", {"sort": sort, "frequency": 0})
+        return list(data.get("screeners") or []) if isinstance(data, dict) else []
+
     def quotes(self, symbols: list[str], fundamental: bool = False) -> dict[str, dict]:
         """Quote fields per symbol; with fundamental=True also the fundamental (avg10DaysVolume, ...) and regular-session
         (regularMarketLastPrice, ...) fields merged in."""

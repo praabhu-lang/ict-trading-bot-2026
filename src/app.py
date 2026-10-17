@@ -191,15 +191,19 @@ def cmd_nightly() -> int:
             store.download(LEDGER)
             ledger = Ledger(store.local_path(LEDGER))
             fn(ledger)
-            ledger.log("INFO", "Nightly: smart-rule shadow list updated")
+            ledger.log("INFO", "Nightly: ledger updated")
             store.upload(LEDGER)
             ledger.close()
 
     report = run_nightly(store, MarketData.from_env(store), with_ledger, today)
     print(json.dumps(report, default=str, indent=2))
+    try:
+        with_ledger(lambda led: led.set_kv("nightly_report", {"date": today.isoformat(), **report}))
+    except Exception:  # noqa: BLE001 - the report is also in the job log
+        pass
     failed = {k: v for k, v in (report.get("updates") or {}).items() if str(v).startswith("FAILED")}
-    if failed or "research" in report:
-        Notifier.from_env().send("⚠️ Nightly database update had failures",
+    if failed or "research" in report or "housekeeping" in report or report.get("space_warnings"):
+        Notifier.from_env().send("⚠️ Nightly database update needs attention",
                                  "<pre>" + json.dumps(report, default=str, indent=2) + "</pre>",
                                  dedupe_key=f"nightly:{today.isoformat()}")
     return 0

@@ -9,7 +9,7 @@ from ..data.models import MarketDataUnavailable, OptionChain
 from ..strategy.analyzer import Analysis, analyze
 from ..strategy.gex import compute_gex
 from .execution_agent import FALLBACK_DAYS
-from .news_agent import NewsAgent, NewsResult
+from .news_agent import NewsAgent, NewsResult, llm_veto
 
 GEX_MAX_DTE = 7
 
@@ -41,11 +41,16 @@ class MarketAnalystAgent:
         news = None
         if result and result.signal:
             news = self.news.check(ticker)
-            if news.blocked:
-                result.snapshot["news"] = news.reason
+            sig = result.signal
+            judged = {"news_llm": news.llm,
+                      "news_signal": {"direction": sig.direction, "score": sig.score, "entry": sig.entry}}
+            veto = llm_veto(news.llm, sig.direction, s.news_llm_mode)
+            if news.blocked or veto:
+                result.snapshot["news"] = news.reason or veto
                 result.signal = None
             else:
                 result = analyze(ticker, bars, now.date(), s, gex=gex, news_ok=news.ok, **context)
+            result.snapshot.update(judged)
         return result, chain, news
 
     def context(self, ticker: str, bars, now: datetime) -> dict:

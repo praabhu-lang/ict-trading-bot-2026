@@ -68,6 +68,15 @@ class AlpacaBars:
         df.index = pd.to_datetime(df.index, utc=True).tz_convert(ET)
         return df[["open", "high", "low", "close", "volume"]].astype(float)
 
+    def latest(self, symbols: list[str]) -> dict[str, tuple[float, datetime]]:
+        """Latest trade price and time per symbol."""
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        trades = self.client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbols,
+                                                                            feed=DataFeed(self.feed)))
+        return {s: (float(t.price), t.timestamp.astimezone(ET)) for s, t in trades.items() if t and t.price}
+
 
 class MarketData:
     def __init__(self, schwab: SchwabClient | None, alpaca: AlpacaBars | None = None, gexbot=None):
@@ -161,6 +170,32 @@ class MarketData:
                 raise
 
         return self._cached(("chain", symbol, today, max_dte), 60, fetch)
+
+    def live_prices(self, symbols: list[str]) -> dict[str, dict]:
+        """{symbol: {price, source, ts}} from one Schwab quotes call; symbols Schwab misses fall back to Alpaca's
+        latest trade (stocks/ETFs only - Alpaca has no index quotes). Not cached: it is the live price."""
+        out: dict[str, dict] = {}
+        if self.schwab is not None:
+            try:
+                data = self.schwab.quotes([DATA_SYMBOL.get(s, s) for s in symbols])
+                back = {DATA_SYMBOL.get(s, s): s for s in symbols}
+                for key, q in data.items():
+                    px = float(q.get("lastPrice") or q.get("mark") or 0)
+                    ms = q.get("tradeTime") or q.get("quoteTime")
+                    if px > 0 and key in back:
+                        ts = datetime.fromtimestamp(ms / 1000, ET) if ms else None
+                        out[back[key]] = {"price": px, "source": "Schwab", "ts": ts}
+                self.health["quotes:schwab"] = "ok"
+            except Exception as exc:  # noqa: BLE001 - fall back to Alpaca
+                self.health["quotes:schwab"] = f"error: {exc}"[:200]
+        missing = [s for s in symbols if s not in out and s not in OPTIONS_ONLY and s not in DATA_SYMBOL]
+        if missing and self.alpaca is not None:
+            try:
+                for s, (px, ts) in self.alpaca.latest(missing).items():
+                    out[s] = {"price": px, "source": "Alpaca", "ts": ts}
+            except Exception as exc:  # noqa: BLE001
+                self.health["quotes:alpaca"] = f"error: {exc}"[:200]
+        return out
 
     def option_quote(self, symbol: str) -> tuple[float, float]:
         """Live Schwab (bid, ask) for one option contract (OCC symbol). Not cached: used to price orders."""

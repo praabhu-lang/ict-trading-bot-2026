@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS premarket_levels (
     PRIMARY KEY (trade_date, ticker)
 );
 
+-- Compact GEX levels per ticker per 5-min scan (GEX ideas tab). Kept LEDGER_GEX_DAYS here, then the nightly job
+-- moves them to the market database (gex_levels) so this file - downloaded by the dashboard every 15 s - stays small.
+CREATE TABLE IF NOT EXISTS gex_levels (
+    trade_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    expiry TEXT, weight TEXT,
+    spot REAL, gamma_flip REAL, put_wall REAL, call_wall REAL, net_gex REAL, expected_move REAL, pc_volume REAL,
+    idea TEXT,
+    PRIMARY KEY (trade_date, ticker, ts)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS alerts (key TEXT PRIMARY KEY, ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_log (
@@ -202,12 +214,53 @@ class Ledger:
         return [dict(r) for r in self.conn.execute(
             f"SELECT * FROM {table} WHERE trade_date = ? ORDER BY ticker", (d.isoformat(),))]
 
+    # ---------- GEX levels ----------
+    GEX_COLS = ("trade_date", "ticker", "ts", "expiry", "weight", "spot", "gamma_flip", "put_wall", "call_wall",
+                "net_gex", "expected_move", "pc_volume", "idea")
+
+    def record_gex_levels(self, rows: list[dict]) -> None:
+        self.conn.executemany(
+            f"INSERT OR REPLACE INTO gex_levels ({', '.join(self.GEX_COLS)}) VALUES ({', '.join('?' * len(self.GEX_COLS))})",
+            [tuple(r.get(c) for c in self.GEX_COLS) for r in rows])
+        self.conn.commit()
+
+    def gex_levels_before(self, d: date) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM gex_levels WHERE trade_date < ?", (d.isoformat(),))]
+
+    # ---------- housekeeping ----------
+    def prune(self, gex_before: date, alerts_before: date, max_log_rows: int = 5000) -> dict:
+        """Delete GEX levels before `gex_before` (archive them first: gex_levels_before), dated alert-dedupe keys
+        before `alerts_before` (keys without ':' are one-time milestones and stay), and cap the JSON paper logs.
+        VACUUMs when a quarter of the file is free pages (the ledger is small, so this takes milliseconds)."""
+        out = {
+            "gex_levels": self.conn.execute("DELETE FROM gex_levels WHERE trade_date < ?",
+                                            (gex_before.isoformat(),)).rowcount,
+            "alerts": self.conn.execute("DELETE FROM alerts WHERE ts < ? AND key LIKE '%:%'",
+                                        (alerts_before.isoformat(),)).rowcount,
+        }
+        self.conn.commit()
+        for key in ("gex_ideas_log", "news_llm_log"):
+            rows = self.get_kv(key)
+            if isinstance(rows, list) and len(rows) > max_log_rows:
+                self.set_kv(key, rows[-max_log_rows:])
+                out[key] = len(rows) - max_log_rows
+        pages = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        free = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        if pages and free / pages > 0.25:
+            self.conn.execute("VACUUM")
+            out["vacuum"] = f"{free}/{pages} pages freed"
+        self.conn.execute("PRAGMA optimize")
+        return out
+
     # ---------- alerts / kv / log ----------
     def alert_once(self, key: str) -> bool:
         """True the first time a key is seen (caller should send), False afterwards."""
         cur = self.conn.execute("INSERT OR IGNORE INTO alerts (key, ts) VALUES (?, ?)", (key, _now()))
         self.conn.commit()
         return cur.rowcount == 1
+
+    def alert_seen(self, key: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM alerts WHERE key = ?", (key,)).fetchone() is not None
 
     def set_kv(self, key: str, value) -> None:
         self.conn.execute(

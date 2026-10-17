@@ -31,7 +31,7 @@ from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
 from .monitor_agent import momentum_against, option_exit_reason, stock_exit_reason
-from .news_agent import NewsAgent
+from .news_agent import NewsAgent, llm_veto
 from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_room, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ class TradingEngine:
             if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
                 self.status[key] = previous[key]
         for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now),
-                     lambda: self.vrz_paper_manage(now)):
+                     lambda: self.vrz_paper_manage(now), lambda: self.gex_ideas(now, scan)):
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - one failing step must not stop exit management
@@ -302,6 +302,8 @@ class TradingEngine:
         shock = self.news.market_shock()
         if shock.blocked:
             reasons.append(shock.reason)
+        elif veto := llm_veto(shock.llm, None, self.s.news_llm_mode):
+            reasons.append(veto)
         self.status.update({"account_equity": acct.equity, "trading_equity": equity,
                             "buying_power": acct.buying_power, "bot_day_pnl": day_pnl})
         return Gate(not reasons, reasons)
@@ -359,6 +361,16 @@ class TradingEngine:
                 return analysed  # one new position per cycle
         return analysed
 
+    def _log_news_llm(self, now: datetime, ticker: str, snap: dict, keep: int = 1000) -> None:
+        """LLM verdict next to the signal it judged, so shadow-mode calls can be checked against outcomes."""
+        sig = snap["news_signal"]
+        would = llm_veto(snap["news_llm"], sig["direction"], "veto")
+        entry = {"ts": now.isoformat(timespec="seconds"), "ticker": ticker, **sig, **snap["news_llm"],
+                 "mode": self.s.news_llm_mode, "would_block": would,
+                 "blocked": bool(would) and self.s.news_llm_mode == "veto"}
+        log_ = self.ledger.get_kv("news_llm_log") or []
+        self.ledger.set_kv("news_llm_log", (log_ + [entry])[-keep:])
+
     def _vrz_candidates(self, now: datetime, require_chain: bool) -> tuple[list, int, int]:
         """Analyse the universe (VRZ sweep-and-reject); refresh levels. (candidates >= min_convergence, analysed, failed)."""
         candidates = []
@@ -382,6 +394,8 @@ class TradingEngine:
                 put_wall=snap.get("put_wall"), gex_regime=snap.get("gex_regime"), zones=snap["zones"],
                 best_score=sig.score if sig else snap.get("candidate_score"), news=(news.headlines[:3] if news else None),
             )
+            if snap.get("news_llm") and snap.get("news_signal"):
+                self._log_news_llm(now, ticker, snap)
             if sig and sig.score >= self.s.min_convergence:
                 candidates.append((sig, chain))
 
@@ -963,6 +977,78 @@ class TradingEngine:
                 dedupe_key=f"vrz_paper_close:{rec['id']}",
             )
 
+    # ------------------------------------------------------------- GEX ideas (paper)
+    def gex_ideas(self, now: datetime, scan: bool) -> None:
+        """Paper-track the GEX tab's ACTIVE ideas: 1 contract at the ask, out at the bid when the underlying hits the
+        stop or target, or at the flatten time. Open ideas every cycle; new ones on each 5-min scan. Never orders."""
+        if not self.s.gex_ideas or not is_trading_day(now.date()):
+            return
+        from ..strategy import gex_plan as gp
+
+        today = now.date().isoformat()
+        book = self.ledger.get_kv("gex_ideas_open") or []
+        keep, closed = [], []
+        for rec in book:
+            try:
+                chain = self.market.chain(rec["ticker"], now.date(), max_dte=gp.CHAIN_DAYS)
+            except MarketDataUnavailable:
+                keep.append(rec)
+                continue
+            spot = chain.spot
+            o = next((x for x in chain.options if x.symbol == rec["contract"]), None)
+            call = rec["side"] == "CALL"
+            hit_stop = spot <= rec["stop"] if call else spot >= rec["stop"]
+            hit_target = spot >= rec["target"] if call else spot <= rec["target"]
+            reason = "STOP" if hit_stop else "TARGET" if hit_target else "TIME" if now >= flatten_time(now, self.s) else ""
+            if o is None and (reason == "TIME" or rec["date"] != today):
+                # contract no longer quoted (expired 0DTE, chain window moved): close without a price
+                closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": None, "exit_spot": spot,
+                               "reason": "UNQUOTED", "pnl": None})
+                continue
+            if not reason or o is None:
+                keep.append(rec)
+                continue
+            closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": o.bid, "exit_spot": spot,
+                           "reason": reason, "pnl": round((o.bid - rec["entry"]) * 100, 2)})
+        if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
+            names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
+            busy = {r["ticker"] for r in keep}
+            levels = []
+            for ticker in names:
+                r = gp.analyse(self.market, self.news, ticker, now)
+                idea = r.get("idea")
+                if not idea:
+                    continue
+                p = r["profile"]
+                levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
+                               "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
+                               "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
+                               "net_gex": p.gex.net_gex, "expected_move": p.expected_move, "pc_volume": p.pc_volume,
+                               "idea": f"{idea.status} {idea.side or ''} {idea.grade}".strip()})
+                if idea.status != "ACTIVE" or ticker in busy:
+                    continue
+                if not self.ledger.alert_once(f"gex_idea:{today}:{ticker}:{idea.setup}"):
+                    continue
+                keep.append({"id": f"{today}:{ticker}:{idea.setup}", "date": today, "ticker": ticker,
+                             "opened": now.isoformat(timespec="seconds"), "side": idea.side, "setup": idea.setup,
+                             "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
+                             "spot": r["profile"].spot, "stop": idea.stop, "target": idea.target,
+                             "votes": {k: v["score"] for k, v in idea.confluence.items()}})
+            self.ledger.record_gex_levels(levels)
+        self.ledger.set_kv("gex_ideas_open", keep)
+        if closed:
+            self.ledger.set_kv("gex_ideas_log", (self.ledger.get_kv("gex_ideas_log") or []) + closed)
+        self.status["gex_ideas_open"] = len(keep)
+
+    def _llm_recap(self, now: datetime, closed, total, month, sigs, plan, vrz, gex) -> str | None:
+        llm = getattr(self.news, "llm", None)
+        if llm is None or not llm.enabled:
+            return None
+        import json
+
+        facts = _recap_facts(closed, total, month, sigs, plan, vrz, gex)
+        return llm.write(RECAP_PROMPT.format(facts=json.dumps(facts, default=str)), "day recap")
+
     def _data_outage(self, now: datetime) -> None:
         detail = "; ".join(f"{k}: {v}" for k, v in self.market.health.items() if "error" in str(v) or k.startswith("scan:"))
         self.status.setdefault("gates", []).append("MARKET DATA UNAVAILABLE - entries blocked")
@@ -1018,6 +1104,8 @@ class TradingEngine:
         )
 
     def daily_summary(self, now: datetime) -> None:
+        if self.ledger.alert_seen(f"summary:{now.date().isoformat()}"):
+            return      # already sent (this runs every cycle after the flatten time)
         trades = [t for t in self.ledger.trades_on(now.date())]
         closed = [t for t in trades if t["status"] == "CLOSED"]
         total = sum(float(t["realized_pnl"] or 0) for t in closed)
@@ -1042,6 +1130,14 @@ class TradingEngine:
                 "Status": fomc.get("status"), "Signal": fomc.get("signal", ""), "Contract": fomc.get("contract", ""),
                 "Entry": fomc.get("entry", ""), "Exit": fomc.get("exit", ""), "Reason": fomc.get("exit_reason") or fomc.get("reason", ""),
                 "P&L $": fomc.get("pnl", "")}])
+        gex_today = [x for x in (self.ledger.get_kv("gex_ideas_log") or []) if x["date"] == now.date().isoformat()]
+        if gex_today:
+            plan_html += "<h3>GEX ideas (paper, 1 contract)</h3>" + table([{
+                "Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"], "Grade": x["grade"],
+                "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"], "P&L $": x["pnl"]} for x in gex_today])
+        recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
+        if recap:
+            plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html
         self.notifier.send(
             f"📊 Day summary {now:%a %b %d}: {len(closed)} trades, P&L {total:+,.2f}",
             plan_html + f"<p>Month to date: <b>{month:+,.2f}</b> · bot total: <b>{self.ledger.total_realized_pnl():+,.2f}</b></p>" +
@@ -1051,6 +1147,26 @@ class TradingEngine:
               f"blocked {sum(1 for s in sigs if s['action'] == 'BLOCKED')}).</p>",
             dedupe_key=f"summary:{now.date().isoformat()}",
         )
+
+
+RECAP_PROMPT = """Write a 3-5 sentence plain-English recap of this trading bot's day for its owner.
+Use ONLY the facts in the JSON below - do not invent numbers, do not give advice to change risk or settings.
+Mention P&L, what traded and why it exited, anything blocked, and the paper-tracked ideas if any.
+Plain text, no markdown, no preamble.
+
+{facts}"""
+
+
+def _recap_facts(closed, total, month, sigs, plan, vrz, gex) -> dict:
+    return {
+        "realized_pnl_today": round(total, 2), "month_to_date": round(month, 2),
+        "trades": [{k: t[k] for k in ("symbol", "direction", "entry_price", "exit_price", "exit_reason", "realized_pnl")}
+                   for t in closed],
+        "signals": len(sigs), "signals_blocked": [s["reason"] for s in sigs if s["action"] == "BLOCKED"][:5],
+        "strategy_decision": {k: plan.get(k) for k in ("decision", "reason")} if plan else None,
+        "vrz_paper": [{k: x.get(k) for k in ("ticker", "direction", "exit_reason", "pnl")} for x in vrz],
+        "gex_ideas_paper": [{k: x.get(k) for k in ("ticker", "side", "setup", "grade", "reason", "pnl")} for x in gex],
+    }
 
 
 def _json_list(raw) -> list:

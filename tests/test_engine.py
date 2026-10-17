@@ -30,14 +30,14 @@ def ledger(tmp_path):
     led.close()
 
 
-def make_engine(ledger, now, *, settings=None, chain=None, market_fail=False, broker=None):
+def make_engine(ledger, now, *, settings=None, chain=None, market_fail=False, broker=None, news=None):
     bars = bear_setup_bars()
     chains = {"SPY": chain if chain is not None else make_chain(101.6, dtes=(0, 14))}
     market = FakeMarket({"SPY": bars}, chains, fail=market_fail)
     broker = broker or FakeBroker()
     s = settings or S()
     notifier = FakeNotifier()
-    engine = TradingEngine(s, ledger, broker, market, FakeNews(), notifier, FixedClock(now),
+    engine = TradingEngine(s, ledger, broker, market, news or FakeNews(), notifier, FixedClock(now),
                            ExecutionAgent(broker, wait_seconds=0, poll_seconds=0, sleep=lambda _: None))
     return engine, broker, notifier
 
@@ -344,3 +344,30 @@ def test_reserve_caps_both_pools_and_counts_every_broker_position():
     assert s.trading_equity(85_000, 0) == 5_000 and s.stock_equity(85_000, 0) == 5_000   # losses shrink, reserve holds
     pos = [Position("MPC", 6, 478.0, 480.0, 12.0, "stock"), Position("QQQ261019P00700000", 2, 1.0, 1.5, 100.0, "option")]
     assert reserve_room(s, 99_288, pos) == 99_288 - 80_000 - 2_880 - 300
+
+
+BULLISH = {"sentiment": 0.8, "risk": "caution", "reason": "upgrade", "model": "m"}
+
+
+def test_llm_veto_blocks_trade_against_the_news_and_logs_it(ledger):
+    engine, _, _ = make_engine(ledger, at(11, 0, 30), settings=S(news_llm_mode="veto"), news=FakeNews(llm=BULLISH))
+    engine.run_cycle(scan=True)
+    assert not ledger.open_trades()
+    entry = ledger.get_kv("news_llm_log")[-1]
+    assert entry["ticker"] == "SPY" and entry["direction"] == "bear" and entry["blocked"]
+
+
+def test_llm_shadow_mode_trades_and_records_what_it_would_block(ledger):
+    engine, _, _ = make_engine(ledger, at(11, 0, 30), news=FakeNews(llm=BULLISH))
+    engine.run_cycle(scan=True)
+    assert len(ledger.open_trades()) == 1
+    entry = ledger.get_kv("news_llm_log")[-1]
+    assert entry["mode"] == "shadow" and entry["would_block"] and not entry["blocked"]
+
+
+def test_engine_records_gex_levels_each_scan(ledger):
+    engine, _, _ = make_engine(ledger, at(11, 0, 30))
+    engine.run_cycle(scan=True)
+    rows = ledger.gex_levels_before(TODAY + timedelta(days=1))
+    assert [r["ticker"] for r in rows] == ["SPY"] and rows[0]["put_wall"] and rows[0]["idea"]
+    assert not engine.status["errors"]

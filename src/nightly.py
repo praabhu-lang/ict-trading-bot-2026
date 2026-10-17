@@ -4,7 +4,10 @@ strategy's monitor.
 1. download data/marketdb/market_data.db from the state bucket (marketdb/market_data.db; built by src/market_db.py)
 2. update: daily bars, 5-minute bars (SPY, QQQ, top-10 stocks), SPY/QQQ same-day and next-expiry option bars
    (+/-12 strikes around the open), event calendar (Mondays)
-3. save today's end-of-day Schwab option chains with greeks (SPY, QQQ, expiries 0-7 days) -> chain_snapshots
+3. save today's end-of-day Schwab option chains with greeks (SPY, SPX, QQQ + STOCKS, expiries 0-7 days)
+   -> chain_snapshots
+3b. housekeeping: ledger gex_levels older than LEDGER_GEX_DAYS -> market DB, ledger prune; raw chains older than
+   market_db.RAW_CHAIN_DAYS rolled up per strike (gex_strikes); incremental vacuum
 4. re-run the smart first-candle backtest from the database (Feb 2024 -> today, real option prices):
    every signal's option return -> ledger kv 'fc_shadow' (monitor C + half-size kill switch) and
    research/smart_rule.json (dashboard Research page)
@@ -17,7 +20,7 @@ import io
 import json
 import logging
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,10 @@ DB_OBJECT = "marketdb/market_data.db"
 RESEARCH_OBJECT = "research/smart_rule.json"
 STOCKS = ("NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "GOOGL", "AMD", "AVGO", "NFLX")
 CAP = 10_000.0
+LEDGER_GEX_DAYS = 10       # intraday GEX levels stay this long in the (dashboard-downloaded) ledger
+ALERT_DAYS = 60            # alert de-duplication keys
+DB_WARN_MB = 3000          # email when the market database passes this (Cloud Run nightly job has 4 GiB)
+LEDGER_WARN_MB = 25        # the dashboard downloads the ledger every 15 s
 
 
 def _research_modules():
@@ -66,7 +73,7 @@ def update_database(market, today: date) -> dict:
             log.exception("nightly %s failed", name)
             done[name] = f"FAILED: {exc}"[:300]
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for t in ("SPY", "QQQ"):
+    for t in ("SPY", "SPX", "QQQ") + STOCKS:
         try:
             chain = market.chain(t, today, max_dte=7)
             done[f"greeks:{t}"] = f"{mdb.save_chain_snapshot(chain, today, ts)} contracts"
@@ -138,10 +145,34 @@ def run_nightly(store, market, ledger_fn, today: date) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.exception("nightly research failed")
         report["research"] = f"FAILED: {exc}"[:300]
+    try:
+        cutoff = today - timedelta(days=LEDGER_GEX_DAYS)
+
+        def housekeeping(led):
+            report["gex_levels_archived"] = mdb.archive_gex_levels(led.gex_levels_before(cutoff))
+            report["ledger_prune"] = led.prune(cutoff, today - timedelta(days=ALERT_DAYS))
+            report["ledger_size_mb"] = round(Path(led.path).stat().st_size / 1e6, 1)
+
+        ledger_fn(housekeeping)
+        report["db_maintenance"] = mdb.maintenance(today)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("nightly housekeeping failed")
+        report["housekeeping"] = f"FAILED: {exc}"[:300]
     if mdb._CONN is not None:                      # closing the last connection folds the WAL into the file
         mdb._CONN.commit()
         mdb._CONN.close()
         mdb._CONN = None
     store.upload(DB_OBJECT)
     report["db_size_mb"] = round(mdb.DB_PATH.stat().st_size / 1e6) if mdb.DB_PATH.exists() else 0
+    report["space_warnings"] = space_warnings(report)
     return report
+
+
+def space_warnings(report: dict) -> list[str]:
+    out = []
+    if report.get("db_size_mb", 0) > DB_WARN_MB:
+        out.append(f"market database is {report['db_size_mb']} MB (> {DB_WARN_MB}): run `python src/market_db.py compact`, "
+                   "or lower RAW_CHAIN_DAYS")
+    if report.get("ledger_size_mb", 0) > LEDGER_WARN_MB:
+        out.append(f"ledger is {report['ledger_size_mb']} MB (> {LEDGER_WARN_MB}): lower LEDGER_GEX_DAYS")
+    return out
