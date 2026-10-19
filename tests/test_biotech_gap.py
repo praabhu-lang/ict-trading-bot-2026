@@ -3,6 +3,7 @@ from datetime import date, datetime, time
 import pytest
 
 from src.agents.biotech_scanner import run_biotech_scan
+from src.agents.llm import NvidiaLLM, parse_catalyst
 from src.agents.news_agent import NewsResult
 from src.core.clock import ET
 from src.core.ledger import Ledger
@@ -33,8 +34,8 @@ class Schwab:
 
 
 class News:
-    def __init__(self, titles, ok=True, blocked=False):
-        self.titles, self.ok, self.blocked = titles, ok, blocked
+    def __init__(self, titles, ok=True, blocked=False, llm=None):
+        self.titles, self.ok, self.blocked, self.llm = titles, ok, blocked, llm
 
     def check(self, ticker):
         return NewsResult(ok=self.ok, blocked=self.blocked, reason="blocked" if self.blocked else "",
@@ -100,3 +101,61 @@ def test_exit_on_bar_gap_through_stop_fills_at_open():
     assert bg.exit_on_bar(pos, 6.0, 7.0, 5.5, 6.5, s) == (6.0, "STOP_GAP")
     assert bg.exit_on_bar({**pos, "held": 19}, 10, 11, 9, 10.5, s) == (10.5, "TIME")
     assert bg.exit_on_bar(pos, 10, 11, 9, 10.5, s) is None
+
+
+class StubLLM(NvidiaLLM):
+    def __init__(self, reply):
+        super().__init__(api_key="test")
+        self.reply, self.prompts = reply, []
+
+    def _complete(self, prompt):
+        self.prompts.append(prompt)
+        return self.reply
+
+
+WEBCAST = '{"kind": "scheduled", "outcome": "positive", "reason": "only a webcast is announced"}'
+RESULTS = '{"kind": "released", "outcome": "positive", "reason": "Phase 3 met all endpoints"}'
+
+
+def test_parse_catalyst():
+    v = parse_catalyst(WEBCAST, "m")
+    assert v.kind == "scheduled" and v.outcome == "unknown" and not v.confirmed     # outcome only counts once out
+    assert parse_catalyst(RESULTS, "m").confirmed
+    assert parse_catalyst('{"kind": "maybe", "outcome": "positive"}', "m") is None
+    assert parse_catalyst("no json", "m") is None
+
+
+def test_shadow_mode_records_llm_but_still_trades(ledger):
+    llm = StubLLM(WEBCAST)
+    n = FakeNotifier()
+    news = News(["IRON sets APOLLO Phase 3 results webcast"], llm=llm)
+    r = run_biotech_scan(Settings(), ledger, Schwab({"IRON": {**gapper(), "description": "DISC MEDICINE INC"}}), news,
+                         n, at(7, 30))
+    assert r["opened"] == ["IRON"]
+    pos = ledger.get_kv("bio_paper_open")[0]
+    assert pos["llm"]["kind"] == "scheduled" and pos["llm"]["confirmed"] is False
+    assert ledger.get_kv(f"bio_scan:{DAY.isoformat()}")["IRON"]["llm"] == pos["llm"]
+    assert "IRON (DISC MEDICINE INC)" in llm.prompts[0] and "IRON sets APOLLO Phase 3 results webcast" in llm.prompts[0]
+
+
+def test_veto_mode_skips_unconfirmed_and_off_mode_skips_llm(ledger):
+    q = Schwab({"IRON": gapper()})
+    titles = ["IRON sets APOLLO Phase 3 results webcast"]
+    r = run_biotech_scan(Settings(bio_llm_mode="veto"), ledger, q, News(titles, llm=StubLLM(WEBCAST)),
+                         FakeNotifier(), at(7, 0))
+    assert r["opened"] == []
+    assert ledger.get_kv(f"bio_scan:{DAY.isoformat()}")["IRON"]["decision"].startswith("skip: LLM scheduled")
+    ledger.set_kv(f"bio_scan:{DAY.isoformat()}", {})
+    r = run_biotech_scan(Settings(bio_llm_mode="veto"), ledger, q, News(titles, llm=StubLLM(RESULTS)),
+                         FakeNotifier(), at(7, 30))
+    assert r["opened"] == ["IRON"]
+    ledger.set_kv(f"bio_scan:{DAY.isoformat()}", {})
+    ledger.set_kv("bio_paper_open", [])
+    off = StubLLM(RESULTS)
+    run_biotech_scan(Settings(bio_llm_mode="off"), ledger, q, News(titles, llm=off), FakeNotifier(), at(8, 0))
+    assert not off.prompts and ledger.get_kv("bio_paper_open")[0]["llm"] is None
+
+
+def test_bio_llm_mode_validated():
+    assert Settings.from_overrides({"bio_llm_mode": "yolo"}).bio_llm_mode == "shadow"
+    assert Settings.from_overrides({"bio_llm_mode": "veto"}).bio_llm_mode == "veto"

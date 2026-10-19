@@ -105,7 +105,8 @@ class NewsAgent:
         except Exception as exc:  # noqa: BLE001
             log.warning("Tavily search failed for %s: %s", ticker, exc)
             return NewsResult(ok=None, reason=f"Tavily error: {exc}"[:200])
-        headlines = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in results]
+        headlines = [{"title": r.get("title", ""), "url": r.get("url", ""),
+                      "snippet": (r.get("content") or "").strip()[:160]} for r in results]
         for r in results:
             title = (r.get("title") or "").lower()
             for kw in TICKER_BLOCK + EARNINGS:

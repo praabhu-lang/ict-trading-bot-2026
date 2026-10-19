@@ -205,14 +205,14 @@ class SchwabClient:
         return list(data.get("screeners") or []) if isinstance(data, dict) else []
 
     def quotes(self, symbols: list[str], fundamental: bool = False) -> dict[str, dict]:
-        """Quote fields per symbol; with fundamental=True also the fundamental (avg10DaysVolume, ...) and regular-session
-        (regularMarketLastPrice, ...) fields merged in."""
-        data = self._get_json("/marketdata/v1/quotes", {"symbols": ",".join(symbols),
-                                                        "fields": "quote,fundamental,regular" if fundamental else "quote"})
+        """Quote fields per symbol; with fundamental=True also the reference (description = company name), fundamental
+        (avg10DaysVolume, ...) and regular-session (regularMarketLastPrice, ...) fields merged in."""
+        fields = "quote,fundamental,regular,reference" if fundamental else "quote"
+        data = self._get_json("/marketdata/v1/quotes", {"symbols": ",".join(symbols), "fields": fields})
         if not fundamental:
             return {k: (v or {}).get("quote", {}) for k, v in data.items()}
-        return {k: {**(v or {}).get("fundamental", {}), **(v or {}).get("regular", {}), **(v or {}).get("quote", {})}
-                for k, v in data.items()}
+        return {k: {**(v or {}).get("reference", {}), **(v or {}).get("fundamental", {}), **(v or {}).get("regular", {}),
+                    **(v or {}).get("quote", {})} for k, v in data.items()}
 
 
 def _num(value) -> float:

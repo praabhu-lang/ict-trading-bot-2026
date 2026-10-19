@@ -170,6 +170,10 @@ class Settings:
     bio_max_hold: int = 20               # sessions
     bio_max_open: int = 2
     bio_slip: float = 0.01               # paid over the pre-market ask
+    # LLM catalyst check (src/agents/llm.py judge_catalyst): are results / an FDA decision actually out, or only a
+    # webcast or PDUFA date ahead? shadow: verdict stored on the decision and the paper trade; veto: skip unless
+    # it confirms positive released news. Shadow first, to compare its calls with the paper trades' outcomes.
+    bio_llm_mode: str = "shadow"
 
     # --- FOMC reaction trade: PAPER ONLY, simulated on live Schwab quotes (src/strategy/fomc_react.py) ---
     fomc_paper: bool = True
@@ -303,6 +307,8 @@ class Settings:
             s.fc_exit_mode = "target"
         if s.news_llm_mode not in NEWS_LLM_MODES:
             s.news_llm_mode = "shadow"
+        if s.bio_llm_mode not in NEWS_LLM_MODES:
+            s.bio_llm_mode = "shadow"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

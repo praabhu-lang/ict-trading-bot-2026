@@ -1,7 +1,9 @@
 """Biotech pre-market gap scanner, PAPER ONLY (src/strategy/biotech_gap.py). Never places broker orders.
 
 Morning runs (before 09:30 ET): scan the universe on Schwab quotes, confirm the catalyst with Tavily, open simulated
-positions at the pre-market ask. Evening runs (after 16:00 ET): settle open positions on today's regular-session bar.
+positions at the pre-market ask. The NVIDIA LLM also judges whether results are actually out or only scheduled
+(settings.bio_llm_mode: shadow = stored on the decision and the trade, veto = skip unless it confirms).
+Evening runs (after 16:00 ET): settle open positions on today's regular-session bar.
 State: ledger kv bio_paper_open (list), bio_paper_log (closed trades), bio_scan:<date> (today's candidates).
 """
 from __future__ import annotations
@@ -44,6 +46,21 @@ def run_biotech_scan(s: Settings, ledger: Ledger, schwab, news: NewsAgent, notif
     return _scan(s, ledger, schwab, news, notifier, now)
 
 
+def _catalyst(s, news, ticker: str, company: str, headlines: list[dict]) -> dict | None:
+    """LLM catalyst verdict as a dict, or None (mode off, no LLM key, or the call failed)."""
+    llm = getattr(news, "llm", None)
+    if s.bio_llm_mode == "off" or llm is None:
+        return None
+    lines = [f"{h.get('title', '')} — {h['snippet']}" if h.get("snippet") else h.get("title", "")
+             for h in headlines if h.get("title")]
+    v = llm.judge_catalyst(ticker, lines, company)
+    return v.as_dict() if v else None
+
+
+def _llm_text(v: dict | None) -> str:
+    return f"{v['kind']}/{v['outcome']}: {v['reason']}" if v else "-"
+
+
 def _scan(s, ledger, schwab, news, notifier, now) -> dict:
     d = now.date()
     key = f"bio_scan:{d.isoformat()}"
@@ -82,8 +99,11 @@ def _scan(s, ledger, schwab, news, notifier, now) -> dict:
             else:
                 ok, why = bg.news_verdict([h.get("title", "") for h in nr.headlines])
                 rec["news"] = why
+                rec["llm"] = _catalyst(s, news, t, str(q.get("description") or ""), nr.headlines)
                 if not ok:
                     rec["decision"] = f"skip: {why}"
+                elif s.bio_llm_mode == "veto" and rec["llm"] and not rec["llm"]["confirmed"]:
+                    rec["decision"] = f"skip: LLM {_llm_text(rec['llm'])}"
                 else:
                     ask = _num(q, "askPrice", "lastPrice")
                     entry = round(ask * (1 + s.bio_slip), 2)
@@ -94,7 +114,8 @@ def _scan(s, ledger, schwab, news, notifier, now) -> dict:
                     else:
                         stop, target = bg.levels(entry, s)
                         pos = {"ticker": t, "entry_date": d.isoformat(), "entry_time": rec["time"], "entry": entry,
-                               "shares": sh, "stop": stop, "target": target, "held": 0, "gap": rec["gap"], "news": why}
+                               "shares": sh, "stop": stop, "target": target, "held": 0, "gap": rec["gap"], "news": why,
+                               "llm": rec["llm"]}
                         open_pos.append(pos)
                         opened.append(pos)
                         rec["decision"] = f"PAPER BUY {sh} @ {entry:.2f} (stop {stop:.2f}, target {target:.2f})"
@@ -104,7 +125,8 @@ def _scan(s, ledger, schwab, news, notifier, now) -> dict:
     ledger.set_kv("bio_paper_open", open_pos)
     for p in opened:
         notifier.send(f"🧪 PAPER biotech gap: {p['ticker']} +{p['gap']:.0%} pre-market, bought {p['shares']} @ {p['entry']:.2f}",
-                      table([{k: p[k] for k in ("ticker", "entry", "shares", "stop", "target", "news")}])
+                      table([{**{k: p[k] for k in ("ticker", "entry", "shares", "stop", "target", "news")},
+                              "llm": _llm_text(p.get("llm"))}])
                       + "<p>Paper only - no order was sent.</p>", dedupe_key=f"bio_open:{d.isoformat()}:{p['ticker']}")
     return {"candidates": len(cands), "opened": [p["ticker"] for p in opened], "open": len(open_pos)}
 
@@ -139,7 +161,8 @@ def _settle(s, ledger, schwab, notifier, d) -> list[dict]:
     ledger.set_kv("bio_paper_open", still)
     for t in closed:
         notifier.send(f"🧪 PAPER biotech exit: {t['ticker']} {t['reason']} {t['pnl']:+,.0f}",
-                      table([{k: t[k] for k in ("ticker", "entry", "exit", "shares", "reason", "pnl")}])
+                      table([{**{k: t[k] for k in ("ticker", "entry", "exit", "shares", "reason", "pnl")},
+                              "llm": _llm_text(t.get("llm"))}])
                       + f"<p>Paper running total: {sum(r['pnl'] for r in log_rows):+,.0f} over {len(log_rows)} trades.</p>",
                       dedupe_key=f"bio_exit:{d.isoformat()}:{t['ticker']}")
     return closed
