@@ -14,6 +14,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from src.dashboard_pages import palette
+from src.strategy import gex_learn as gl
 from src.strategy import gex_plan as gp
 
 def tickers(market) -> tuple[list[str], str]:
@@ -293,6 +294,12 @@ rescaled), so missing data can only lower the rate.
 - An LLM news **block** (halt, M&A, guidance...) cancels every idea on that ticker: the levels stop working on
   news-driven tape.
 
+**Strict flip rules** (Settings → gamma-flip rules; shadow by default). The classic flip setups fire on 15 minutes
+of drift next to the flip. Strict needs the flip *tested* (a 5-min wick within a quarter of the band), a candle that
+*rejects* it (closes back below, bearish) or *reclaims* it (closes above after a close below), a later close beyond
+that candle's low / high, and 5-min EMA9 vs EMA21 plus VWAP agreeing. Stop just past the rejection wick. In shadow
+they are tracked aside (*Strict flip rules* below and in the day summary) so the two can be compared in R.
+
 **The contract**
 - Expiry: *Auto* = 0DTE until {gp.AUTO_1DTE_AFTER:%H:%M} ET, then the next expiry (late-day 0DTE gamma and premium
   collapse). Stocks without daily expiries use their next one.
@@ -330,27 +337,82 @@ def replay_panel(rep: dict | None) -> None:
                      hide_index=True, width="stretch")
 
 
+def learning_panel(rep: dict | None) -> None:
+    st.subheader("What the engine has learned (nightly)")
+    lc = (rep or {}).get("learning") or {}
+    if not lc.get("n"):
+        st.caption("Each night the live paper ideas and the replay are scored in R (option P&L / planned risk) by setup, "
+                   "grade, gamma regime and time of day. Nothing yet.")
+        return
+    gates = ((rep or {}).get("gate") or {}).get("gates") or {}
+    off = [k for k, g in gates.items() if not g["on"]]
+    st.caption(f"{lc['n']} closed ideas, average {lc['avg_R']:+.2f}R. A setup (or setup · grade) switches off with "
+               f"{gl.GATE_MIN_N}+ results and a negative average over its last {gl.GATE_WINDOW}; it switches back on "
+               "when that recovers. Settings → GEX gate: shadow records what it would skip, enforce sizes those to 0.")
+    if off:
+        st.warning("Gate OFF: " + "; ".join(f"{k} ({gates[k]['exp_R']:+.2f}R over {gates[k]['n']})" for k in off))
+    tabs = st.tabs(["Setup", "Setup · grade", "Regime", "Grade", "Time of day"])
+    for t, key in zip(tabs, ("by_setup", "by_setup_grade", "by_regime", "by_grade", "by_tod")):
+        with t:
+            st.dataframe(pd.DataFrame(lc.get(key) or []), hide_index=True, width="stretch")
+
+
 def tracker(led) -> None:
     log = (led.get_kv("gex_ideas_log") if led else None) or []
     open_ = (led.get_kv("gex_ideas_open") if led else None) or []
     st.subheader("Paper tracking of ACTIVE ideas")
     if not log and not open_:
-        st.caption("The engine logs every ACTIVE idea during the session as a 1-contract paper trade (entry at the ask, "
-                   "exit at the bid on stop / target / 15:45 ET). Nothing yet.")
+        st.caption("The engine logs every ACTIVE idea during the session as a paper trade sized to the GEX risk budget "
+                   "(entry at the ask, exit at the bid on stop / target / 15:45 ET). Nothing yet.")
+        strict_tracker(led, pd.DataFrame())
         return
     df = pd.DataFrame(log)
     if not df.empty:
         df = df[df["pnl"].notna()]      # UNQUOTED closes (contract vanished from the chain) have no price
     if not df.empty:
+        none = pd.Series(float("nan"), index=df.index)        # ideas from before sizing: 1 contract, no R
+        df = df.assign(R=pd.to_numeric(df.get("R", none), errors="coerce"),
+                       pnl_sized=pd.to_numeric(df.get("pnl_sized", none), errors="coerce").fillna(df["pnl"]))
         wins = (df["pnl"] > 0).mean() * 100
         c = st.columns(4)
         c[0].metric("Ideas closed", len(df))
         c[1].metric("Win rate", f"{wins:.0f}%")
-        c[2].metric("P&L (1 contract each)", f"${df['pnl'].sum():,.0f}")
+        c[2].metric("P&L (risk-sized)", f"${df['pnl_sized'].sum():,.0f}",
+                    help=f"1 contract each: ${df['pnl'].sum():,.0f}. Ideas before risk sizing count as 1 contract.")
         c[3].metric("Open now", len(open_))
         by = df.groupby(["setup", "grade"]).agg(n=("pnl", "size"), win_pct=("pnl", lambda s: round((s > 0).mean() * 100)),
-                                                pnl=("pnl", "sum")).reset_index()
+                                                avg_R=("R", "mean"), pnl_1c=("pnl", "sum"),
+                                                pnl_sized=("pnl_sized", "sum")).round(2).reset_index()
         st.dataframe(by, hide_index=True, width="stretch")
+        st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
+    if open_:
+        st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
+    strict_tracker(led, df)
+
+
+def strict_tracker(led, main: pd.DataFrame) -> None:
+    """The strict flip rules' shadow book next to the classic flip setups from the main book."""
+    log = (led.get_kv("gex_strict_log") if led else None) or []
+    open_ = (led.get_kv("gex_strict_open") if led else None) or []
+    if not log and not open_:
+        return
+    st.subheader("Strict flip rules (shadow)")
+    st.caption("Flip tested, a rejection / reclaim candle, a confirming close beyond it and 5-min momentum agreeing - "
+               "tracked aside while the classic flip setups trade. Compare R before switching Settings to strict.")
+    df = pd.DataFrame(log)
+    rows = []
+    if not df.empty and df["pnl"].notna().any():
+        df = df[df["pnl"].notna()]
+        rows.append({"rules": "strict", "n": len(df), "win_%": round(float((df["pnl"] > 0).mean() * 100)),
+                     "avg_R": round(float(pd.to_numeric(df["R"], errors="coerce").mean()), 2),
+                     "pnl_sized": round(float(df["pnl_sized"].sum()), 0)})
+    classic = main[main["setup"].isin(gp.CLASSIC_FLIP)] if not main.empty and "setup" in main else pd.DataFrame()
+    if not classic.empty:
+        rows.append({"rules": "classic", "n": len(classic), "win_%": round(float((classic["pnl"] > 0).mean() * 100)),
+                     "avg_R": round(float(classic["R"].mean()), 2), "pnl_sized": round(float(classic["pnl_sized"].sum()), 0)})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    if not df.empty:
         st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
     if open_:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
@@ -416,3 +478,4 @@ def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> No
     st.caption(f"Live · price every 30 s, option chains every 60 s · {now:%H:%M:%S} ET")
     tracker(led)
     replay_panel(replay)
+    learning_panel(replay)

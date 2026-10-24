@@ -239,7 +239,7 @@ class Ledger:
                                         (alerts_before.isoformat(),)).rowcount,
         }
         self.conn.commit()
-        for key in ("gex_ideas_log", "news_llm_log"):
+        for key in ("gex_ideas_log", "gex_strict_log", "news_llm_log"):
             rows = self.get_kv(key)
             if isinstance(rows, list) and len(rows) > max_log_rows:
                 self.set_kv(key, rows[-max_log_rows:])

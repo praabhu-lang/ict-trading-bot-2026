@@ -25,6 +25,18 @@ against) or is unknown (0, never rescaled):
   options_flow 5    put/call volume on the expiry: CALL < 0.8, PUT > 1.2
   llm_news 5        LLM sentiment >= +0.3 (CALL) / <= -0.3 (PUT); an LLM "block" cancels the idea
 ACTIVE = trigger + rate >= MIN_CONVERGENCE + at most MAX_AGAINST points disagreeing. Grade A >= 75, B >= 60.
+
+Strict flip rules (strict_idea; settings.gex_flip_rules: classic | shadow | strict). The classic flip setups fire on
+15 minutes of drift next to the flip; the strict ones need the level to be tested and the reaction confirmed, on the
+last STRICT_BARS closed 5-min bars:
+  PUT  rejection: a bearish candle wicked to within STRICT_TAG x near of the flip and closed below it, no close back
+       above since, and a later close below that candle's low; 5-min EMA9 < EMA21 and price below VWAP;
+       spot below the flip by at most 2 x near. Stop above the highest high since the rejection candle.
+  CALL reclaim: a close below the flip, then a bullish candle closing above it, no close back below since, and a later
+       close above that candle's high; EMA9 > EMA21 and price above VWAP; spot above the flip by at most 2 x near.
+       Stop below the lowest low from the last close under the flip.
+  Stop buffer 0.1 x near; targets as classic. Convergence is recorded (grade A >= 75, else B) but only the 30m
+  structure veto (> MAX_AGAINST against) blocks - the confirmation replaces the score.
 """
 from __future__ import annotations
 
@@ -53,6 +65,11 @@ CONV_WEIGHTS = {"gex_level": 20, "structure_30m": 20, "structure_5m": 15, "momen
 MIN_CONVERGENCE = 60
 MAX_AGAINST = 15          # 30m structure against (20) is therefore always a veto
 SWING_K = 2               # a swing high/low is the extreme of 2 bars either side
+STRICT_BARS = 6           # strict flip rules look at the last 30 minutes
+STRICT_TAG = 0.25         # within this x near of the flip counts as a test
+STRICT_PUT = "Rejected at gamma flip, confirmed (negative gamma)"
+STRICT_CALL = "Gamma-flip reclaim, confirmed"
+CLASSIC_FLIP = ("Rejected at gamma flip (negative gamma)", "Gamma-flip reclaim")
 EXPIRY_MODES = {"auto": "Auto (0DTE until 2 pm ET, then 1DTE)", "0dte": "0DTE", "1dte": "1DTE"}
 WEIGHTS = {"oi": "Open interest (yesterday's positioning)", "volume": "Today's volume (intraday flow)"}
 
@@ -456,6 +473,83 @@ def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now
     return idea
 
 
+def strict_flip(p: Profile, ctx: dict, mtf: dict) -> tuple[tuple[str, str, float, float, float] | None, str]:
+    """((side, setup, level, stop, target) | None, why) - the strict flip rules (module docstring)."""
+    g, spot, em = p.gex, p.spot, p.expected_move
+    flip = g.gamma_flip
+    today = (mtf or {}).get("today")
+    m5 = ((mtf or {}).get(5) or {}).get("candles")
+    if not flip or not ctx or today is None or len(today) < 3 or m5 is None or len(m5) < 21:
+        return None, "no flip or not enough 5-min bars"
+    near = near_band(p)
+    tag, buf = STRICT_TAG * near, 0.1 * near
+    bars = today.tail(STRICT_BARS)
+    last = bars.iloc[-1]
+    e9 = float(m5["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+    e21 = float(m5["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+    if spot < flip:
+        if flip - spot > 2 * near:
+            return None, "too far below the flip"
+        rej = next((i for i in range(len(bars) - 2, -1, -1) if bars["high"].iloc[i] >= flip - tag
+                    and bars["close"].iloc[i] < bars["open"].iloc[i] and bars["close"].iloc[i] < flip), None)
+        if rej is None:
+            return None, "no rejection candle at the flip"
+        if (bars["close"].iloc[rej + 1:] > flip).any():
+            return None, "closed back above the flip"
+        if not last["close"] < bars["low"].iloc[rej]:
+            return None, f"waiting for a close below the rejection low {bars['low'].iloc[rej]:.2f}"
+        if not (e9 < e21 and spot < ctx["vwap"]):
+            return None, "5-min momentum not down (EMA9 < EMA21, below VWAP)"
+        pw = g.put_wall
+        return ("PUT", STRICT_PUT, flip, float(bars["high"].iloc[rej:].max()) + buf,
+                pw if pw and pw < spot - near else spot - em), "confirmed"
+    if spot - flip > 2 * near:
+        return None, "too far above the flip"
+    rec = next((i for i in range(len(bars) - 2, 0, -1) if bars["close"].iloc[i] > flip
+                and bars["close"].iloc[i] > bars["open"].iloc[i] and (bars["close"].iloc[:i] < flip).any()), None)
+    if rec is None:
+        return None, "no reclaim of the flip"
+    if (bars["close"].iloc[rec + 1:] < flip).any():
+        return None, "lost the flip again"
+    if not last["close"] > bars["high"].iloc[rec]:
+        return None, f"waiting for a close above the reclaim high {bars['high'].iloc[rec]:.2f}"
+    if not (e9 > e21 and spot > ctx["vwap"]):
+        return None, "5-min momentum not up (EMA9 > EMA21, above VWAP)"
+    below = max(i for i in range(rec) if bars["close"].iloc[i] < flip)
+    cw = g.call_wall
+    return ("CALL", STRICT_CALL, flip, float(bars["low"].iloc[below:].min()) - buf,
+            cw if cw and cw > spot + near else spot + em), "confirmed"
+
+
+def strict_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime, mtf: dict) -> Idea:
+    """The strict flip rules as an Idea (ACTIVE when confirmed), same contract choice as build_idea."""
+    base = Idea(p.ticker, "WAIT", expiry=p.expiry, dte=p.dte)
+    if not FIRST_IDEA <= now.astimezone(ET).time() <= LAST_IDEA:
+        base.reason = "Ideas only 9:45-15:30 ET"
+        return base
+    if news and news.get("risk") == "block":
+        base.reason = "News-driven tape"
+        return base
+    trig, why = strict_flip(p, ctx, mtf)
+    if trig is None:
+        base.reason = f"Strict flip: {why}"
+        return base
+    side, setup, level, stop, target = trig
+    rate, against, conf = convergence(side, level, p, ctx, mtf, news)
+    idea = replace(base, side=side, setup=setup, level=round(level, 2), stop=round(stop, 2), target=round(target, 2),
+                   grade="C" if against > MAX_AGAINST else "A" if rate >= 75 else "B", rate=rate, against=against,
+                   confluence=conf)
+    o = choose_contract(chain.for_expiry(p.expiry), side)
+    if idea.grade == "C":
+        idea.reason = f"{setup}, but {against} pts against (30m structure veto)"
+    elif not o:
+        idea.reason = f"{setup}: no {side.lower()} with a tight enough spread"
+    else:
+        idea = replace(idea, contract=o.symbol, strike=o.strike, mid=o.mid, ask=o.ask, delta=round(o.delta, 2),
+                       status="ACTIVE", reason=f"{setup}; convergence {rate}%")
+    return idea
+
+
 # ------------------------------------------------------------------ one ticker end to end
 def analyse(market, news, ticker: str, now: datetime, mode: str = "auto", weight: str = "oi",
             with_news: bool = True, pick: str | None = None) -> dict:
@@ -484,4 +578,4 @@ def analyse(market, news, ticker: str, now: datetime, mode: str = "auto", weight
         if verdict:
             idea = build_idea(p, chain, ctx, verdict, now, mtf)
     return {"ticker": ticker, "chain": chain, "profile": p, "ctx": ctx, "bars": bars, "idea": idea, "news": verdict,
-            "mtf": mtf, "zones": zone_rates(p, ctx, mtf, verdict)}
+            "mtf": mtf, "zones": zone_rates(p, ctx, mtf, verdict), "strict": strict_idea(p, chain, ctx, verdict, now, mtf)}

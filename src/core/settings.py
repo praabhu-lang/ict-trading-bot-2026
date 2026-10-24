@@ -39,6 +39,10 @@ FC_MODES = {"smart": "Smart rule (gap-graded 0DTE/1DTE, phases, monitor)", "clas
 FC_EXIT_MODES = {"target": "3x target + break-even", "trail": "No target, trail 1x range off the best (variant G)"}
 NEWS_LLM_MODES = {"off": "Off (keywords only)", "shadow": "Shadow (log the LLM verdict, never block)",
                   "veto": "Veto (LLM can block an entry)"}
+GEX_GATE_MODES = {"off": "Off (trade every ACTIVE idea)", "shadow": "Shadow (record what the gate would skip)",
+                  "enforce": "Enforce (losing setups get 0 contracts, still tracked)"}
+GEX_FLIP_RULES = {"classic": "Classic (flip + 15 min drift)", "shadow": "Shadow (classic trades, strict tracked aside)",
+                  "strict": "Strict (test, rejection / reclaim close, confirmation bar, 5m momentum)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -190,6 +194,9 @@ class Settings:
 
     # --- GEX ideas (dashboard tab): PAPER tracking of every ACTIVE call/put idea (src/strategy/gex_plan.py) ---
     gex_ideas: bool = True
+    gex_risk_per_idea: float = 100.0     # $ each idea risks (stop on the underlying x delta + spread), not 1 contract
+    gex_gate_mode: str = "shadow"        # off | shadow | enforce - learned per-setup on/off (src/strategy/gex_learn.py)
+    gex_flip_rules: str = "shadow"       # classic | shadow | strict - confirmed flip rejection / reclaim (gex_plan)
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -229,6 +236,7 @@ class Settings:
         "trail_activate_pct": (0.05, 5.0),
         "trail_giveback_pct": (0.02, 1.0),
         "fc_premium_pct": (0.005, 0.20),
+        "gex_risk_per_idea": (10.0, 5_000.0),
         "fc_delta": (0.10, 0.80),
         "fc_friday_dte": (0, 3),
         "fc_target_mult": (0.5, 10.0),
@@ -309,6 +317,10 @@ class Settings:
             s.news_llm_mode = "shadow"
         if s.bio_llm_mode not in NEWS_LLM_MODES:
             s.bio_llm_mode = "shadow"
+        if s.gex_gate_mode not in GEX_GATE_MODES:
+            s.gex_gate_mode = "shadow"
+        if s.gex_flip_rules not in GEX_FLIP_RULES:
+            s.gex_flip_rules = "shadow"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

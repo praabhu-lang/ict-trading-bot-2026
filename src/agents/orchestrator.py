@@ -990,14 +990,56 @@ class TradingEngine:
 
     # ------------------------------------------------------------- GEX ideas (paper)
     def gex_ideas(self, now: datetime, scan: bool) -> None:
-        """Paper-track the GEX tab's ACTIVE ideas: 1 contract at the ask, out at the bid when the underlying hits the
-        stop or target, or at the flatten time. Open ideas every cycle; new ones on each 5-min scan. Never orders."""
+        """Paper-track the GEX tab's ACTIVE ideas: entry at the ask, out at the bid when the underlying hits the
+        stop or target, or at the flatten time. Open ideas every cycle; new ones on each 5-min scan. Never orders.
+        Sized to risk settings.gex_risk_per_idea; each record keeps the entry snapshot, R, the best / worst bid while
+        open and the learned gate's verdict (src/strategy/gex_learn.py).
+        settings.gex_flip_rules: classic (flip setups as before) | shadow (classic trades; the strict flip rules,
+        gex_plan.strict_idea, are tracked in their own book gex_strict_open / gex_strict_log) | strict (the classic
+        flip setups are dropped and the strict ones trade in the main book)."""
         if not self.s.gex_ideas or not is_trading_day(now.date()):
             return
         from ..strategy import gex_plan as gp
 
         today = now.date().isoformat()
-        book = self.ledger.get_kv("gex_ideas_open") or []
+        mode = self.s.gex_flip_rules
+        keep, closed = self._gex_manage(self.ledger.get_kv("gex_ideas_open") or [], now)
+        s_keep, s_closed = self._gex_manage(self.ledger.get_kv("gex_strict_open") or [], now)
+        if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
+            names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
+            levels, gates = [], self.ledger.get_kv("gex_gate") or {}
+            for ticker in names:
+                r = gp.analyse(self.market, self.news, ticker, now)
+                idea, strict = r.get("idea"), r.get("strict")
+                if not idea:
+                    continue
+                p = r["profile"]
+                levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
+                               "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
+                               "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
+                               "net_gex": p.gex.net_gex, "expected_move": p.expected_move, "pc_volume": p.pc_volume,
+                               "idea": f"{idea.status} {idea.side or ''} {idea.grade}".strip()})
+                main = [idea] if mode != "strict" or idea.setup not in gp.CLASSIC_FLIP else []
+                if strict is not None and mode == "strict":
+                    main.append(strict)
+                for x in main:
+                    self._gex_open(x, p, now, keep, gates, "gex_idea")
+                if strict is not None and mode == "shadow":
+                    self._gex_open(strict, p, now, s_keep, gates, "gex_strict")
+            self.ledger.record_gex_levels(levels)
+        self.ledger.set_kv("gex_ideas_open", keep)
+        if closed:
+            self.ledger.set_kv("gex_ideas_log", (self.ledger.get_kv("gex_ideas_log") or []) + closed)
+        self.ledger.set_kv("gex_strict_open", s_keep)
+        if s_closed:
+            self.ledger.set_kv("gex_strict_log", (self.ledger.get_kv("gex_strict_log") or []) + s_closed)
+        self.status["gex_ideas_open"] = len(keep)
+
+    def _gex_manage(self, book: list[dict], now: datetime) -> tuple[list[dict], list[dict]]:
+        """(still open, closed) for one book of GEX paper ideas."""
+        from ..strategy import gex_plan as gp
+
+        today = now.date().isoformat()
         keep, closed = [], []
         for rec in book:
             try:
@@ -1016,40 +1058,35 @@ class TradingEngine:
                 closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": None, "exit_spot": spot,
                                "reason": "UNQUOTED", "pnl": None})
                 continue
+            if o is not None:
+                rec = {**rec, "hi": max(rec.get("hi", o.bid), o.bid), "lo": min(rec.get("lo", o.bid), o.bid)}
             if not reason or o is None:
                 keep.append(rec)
                 continue
-            closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": o.bid, "exit_spot": spot,
-                           "reason": reason, "pnl": round((o.bid - rec["entry"]) * 100, 2)})
-        if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
-            names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
-            busy = {r["ticker"] for r in keep}
-            levels = []
-            for ticker in names:
-                r = gp.analyse(self.market, self.news, ticker, now)
-                idea = r.get("idea")
-                if not idea:
-                    continue
-                p = r["profile"]
-                levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
-                               "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
-                               "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
-                               "net_gex": p.gex.net_gex, "expected_move": p.expected_move, "pc_volume": p.pc_volume,
-                               "idea": f"{idea.status} {idea.side or ''} {idea.grade}".strip()})
-                if idea.status != "ACTIVE" or ticker in busy:
-                    continue
-                if not self.ledger.alert_once(f"gex_idea:{today}:{ticker}:{idea.setup}"):
-                    continue
-                keep.append({"id": f"{today}:{ticker}:{idea.setup}", "date": today, "ticker": ticker,
-                             "opened": now.isoformat(timespec="seconds"), "side": idea.side, "setup": idea.setup,
-                             "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
-                             "spot": r["profile"].spot, "stop": idea.stop, "target": idea.target,
-                             "votes": {k: v["score"] for k, v in idea.confluence.items()}})
-            self.ledger.record_gex_levels(levels)
-        self.ledger.set_kv("gex_ideas_open", keep)
-        if closed:
-            self.ledger.set_kv("gex_ideas_log", (self.ledger.get_kv("gex_ideas_log") or []) + closed)
-        self.status["gex_ideas_open"] = len(keep)
+            closed.append(_close_gex(rec, now, o.bid, spot, reason))
+        return keep, closed
+
+    def _gex_open(self, idea, p, now: datetime, book: list[dict], gates: dict, key: str) -> None:
+        """Append an ACTIVE idea to `book` (one open idea per ticker, first of each setup per day), risk-sized."""
+        from ..strategy import gex_learn as gl
+
+        today = now.date().isoformat()
+        if idea.status != "ACTIVE" or any(r["ticker"] == idea.ticker for r in book):
+            return
+        if not self.ledger.alert_once(f"{key}:{today}:{idea.ticker}:{idea.setup}"):
+            return
+        snap = gl.snapshot(idea, p, now.astimezone(ET))
+        risk_1c = gl.risk_per_contract(p.spot, idea.stop, idea.delta, snap["bid"], idea.ask)
+        qty = gl.contracts(self.s.gex_risk_per_idea, risk_1c)
+        gate = gl.verdict(gates.get("gates"), idea.setup, idea.grade) if self.s.gex_gate_mode != "off" else ""
+        if gate and self.s.gex_gate_mode == "enforce":
+            qty = 0
+        book.append({"id": f"{today}:{idea.ticker}:{idea.setup}", "date": today, "ticker": idea.ticker,
+                     "opened": now.isoformat(timespec="seconds"), "side": idea.side, "setup": idea.setup,
+                     "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
+                     "spot": p.spot, "stop": idea.stop, "target": idea.target, **snap,
+                     "risk_1c": risk_1c, "qty": qty, "gate": gate, "gate_mode": self.s.gex_gate_mode,
+                     "votes": {k: v["score"] for k, v in idea.confluence.items()}})
 
     def _llm_recap(self, now: datetime, closed, total, month, sigs, plan, vrz, gex) -> str | None:
         llm = getattr(self.news, "llm", None)
@@ -1143,17 +1180,42 @@ class TradingEngine:
                 "P&L $": fomc.get("pnl", "")}])
         gex_today = [x for x in (self.ledger.get_kv("gex_ideas_log") or []) if x["date"] == now.date().isoformat()]
         if gex_today:
-            plan_html += "<h3>GEX ideas (paper, 1 contract)</h3>" + table([{
+            sized = sum(float(x.get("pnl_sized", x["pnl"]) or 0) for x in gex_today)
+            one = sum(float(x["pnl"] or 0) for x in gex_today)
+            skipped = [x for x in gex_today if x.get("gate")]
+            plan_html += (f"<h3>GEX ideas (paper, ${self.s.gex_risk_per_idea:,.0f} risk each)</h3>" + table([{
                 "Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"], "Grade": x["grade"],
-                "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"], "P&L $": x["pnl"]} for x in gex_today])
+                "Qty": x.get("qty", 1), "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"], "R": x.get("R"),
+                "P&L $": x.get("pnl_sized", x["pnl"]), "Gate": x.get("gate", "")} for x in gex_today])
+                + f"<p>Sized P&L <b>{sized:+,.2f}</b> · {sum(float(x.get('R') or 0) for x in gex_today):+.1f}R "
+                  f"(1 contract each would be {one:+,.2f})"
+                + (f" · gate ({self.s.gex_gate_mode}) flags {len(skipped)}, their 1-contract P&L "
+                   f"{sum(float(x['pnl'] or 0) for x in skipped):+,.2f}" if skipped else "") + "</p>")
+        strict_today = [x for x in (self.ledger.get_kv("gex_strict_log") or []) if x["date"] == now.date().isoformat()]
+        if strict_today or (gex_today and self.s.gex_flip_rules == "shadow"):
+            from ..strategy.gex_plan import CLASSIC_FLIP
+            classic = [x for x in gex_today if x["setup"] in CLASSIC_FLIP]
+            plan_html += ("<h3>Strict flip rules (shadow, not in the totals above)</h3>"
+                          + (table([{"Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"],
+                                     "Time": str(x.get("opened", ""))[11:16], "Qty": x.get("qty"), "Entry": x["entry"],
+                                     "Exit": x["exit"], "Reason": x["reason"], "R": x.get("R"),
+                                     "P&L $": x.get("pnl_sized")} for x in strict_today])
+                             if strict_today else "<p>No confirmed flip rejection / reclaim today.</p>")
+                          + f"<p>Strict: {len(strict_today)} trades, "
+                            f"{sum(float(x.get('R') or 0) for x in strict_today):+.1f}R, "
+                            f"{sum(float(x.get('pnl_sized') or 0) for x in strict_today):+,.2f} · "
+                            f"classic flip: {len(classic)} trades, {sum(float(x.get('R') or 0) for x in classic):+.1f}R, "
+                            f"{sum(float(x.get('pnl_sized', x['pnl']) or 0) for x in classic):+,.2f}</p>")
         recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
         if recap:
             plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html
         self.notifier.send(
             f"📊 Day summary {now:%a %b %d}: {len(closed)} trades, P&L {total:+,.2f}",
-            plan_html + f"<p>Month to date: <b>{month:+,.2f}</b> · bot total: <b>{self.ledger.total_realized_pnl():+,.2f}</b></p>" +
-            table([{"Instrument": t["symbol"], "Side": t["direction"], "Qty": t["qty"], "Entry": t["entry_price"],
-                    "Exit": t["exit_price"], "Reason": t["exit_reason"], "P&L $": t["realized_pnl"]} for t in closed])
+            plan_html + "<h3>Bot trades (broker)</h3>"
+            + (table([{"Instrument": t["symbol"], "Side": t["direction"], "Qty": t["qty"], "Entry": t["entry_price"],
+                       "Exit": t["exit_price"], "Reason": t["exit_reason"], "P&L $": t["realized_pnl"]} for t in closed])
+               if closed else "<p>No bot trades today.</p>")
+            + f"<p>Month to date: <b>{month:+,.2f}</b> · bot total: <b>{self.ledger.total_realized_pnl():+,.2f}</b></p>"
             + f"<p>Signals today: {len(sigs)} (traded {sum(1 for s in sigs if s['action'].startswith('TRADED'))}, "
               f"blocked {sum(1 for s in sigs if s['action'] == 'BLOCKED')}).</p>",
             dedupe_key=f"summary:{now.date().isoformat()}",
@@ -1168,6 +1230,16 @@ Plain text, no markdown, no preamble.
 {facts}"""
 
 
+def _close_gex(rec: dict, now: datetime, bid: float, spot: float, reason: str) -> dict:
+    """A closed GEX paper idea: pnl per contract, R against the planned risk, sized P&L, best / worst R while open."""
+    pnl = round((bid - rec["entry"]) * 100, 2)
+    risk = rec.get("risk_1c")
+    r_of = (lambda px: round((px - rec["entry"]) * 100 / risk, 2)) if risk else (lambda px: None)
+    return {**rec, "closed": now.isoformat(timespec="seconds"), "exit": bid, "exit_spot": spot, "reason": reason,
+            "pnl": pnl, "R": r_of(bid), "best_R": r_of(rec.get("hi", bid)), "worst_R": r_of(rec.get("lo", bid)),
+            "pnl_sized": round(pnl * rec.get("qty", 1), 2)}
+
+
 def _recap_facts(closed, total, month, sigs, plan, vrz, gex) -> dict:
     return {
         "realized_pnl_today": round(total, 2), "month_to_date": round(month, 2),
@@ -1176,7 +1248,8 @@ def _recap_facts(closed, total, month, sigs, plan, vrz, gex) -> dict:
         "signals": len(sigs), "signals_blocked": [s["reason"] for s in sigs if s["action"] == "BLOCKED"][:5],
         "strategy_decision": {k: plan.get(k) for k in ("decision", "reason")} if plan else None,
         "vrz_paper": [{k: x.get(k) for k in ("ticker", "direction", "exit_reason", "pnl")} for x in vrz],
-        "gex_ideas_paper": [{k: x.get(k) for k in ("ticker", "side", "setup", "grade", "reason", "pnl")} for x in gex],
+        "gex_ideas_paper": [{k: x.get(k) for k in ("ticker", "side", "setup", "grade", "reason", "R", "qty",
+                                                    "pnl_sized", "gate")} for x in gex],
     }
 
 

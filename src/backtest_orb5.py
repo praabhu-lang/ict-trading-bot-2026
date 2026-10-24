@@ -64,6 +64,10 @@ CONFIG = {
     "trail_x": 0.5,
     "opt_trail_after": 0.0,       # >0: once the option's high is this fraction above entry, exit on a close `opt_trail_pct` below its peak
     "opt_trail_pct": 0.25,
+    "half_at": 0.0,               # >0: resting limit sells half when the option trades this fraction above entry;
+                                  #     the other half then gets a stop at the entry premium
+    "room_x": 0.0,                # >0: skip unless the 10-day low (puts) / high (calls) is >= room_x x range beyond the entry
+    "vwap_exit": False,           # True: exit on a 5-min close back across the session VWAP
     "time_stop_slot": 0,          # >0: at this bar, exit if the trade has not yet moved `time_stop_progress` x range our way
     "time_stop_progress": 0.5,
     "structure": "debit",         # debit: buy the call/put | credit: sell a 0DTE credit spread in the signal direction
@@ -260,6 +264,10 @@ def run(start: date, end: date, verbose=False):
                     j, rng, setup = i + 1, max(v['high'][:n]) - min(v['low'][:n]), "Opening range"   # enter at the next bar's open
                 cp, s = ("C", 1) if side == "LONG" else ("P", -1)
                 e_ts, S0 = v['ts'][j], v['open'][j]
+                if CONFIG['room_x']:                                        # market structure: room to the 10-day swing
+                    level = lv0['ChanLow'] if s == -1 else lv0['ChanHigh']
+                    if 0 <= s * (level - S0) < CONFIG['room_x'] * rng:
+                        rows.append({"Date": d, "Ticker": t, "Side": side, "Note": "no room to the 10-day swing"}); continue
                 if CONFIG['structure'] == "credit":
                     res = credit_trade(t, d, v, side, j, equity, h)
                     if res is None:
@@ -301,8 +309,15 @@ def run(start: date, end: date, verbose=False):
                 target = S0 + s * CONFIG['target_mult'] * rng
                 x_i, why, best, stop_fill, opt_peak = len(v['close']) - 1, "EOD", 0.0, None, 0.0
                 stop_lvl = o_entry * (1 - CONFIG['opt_stop'])
+                half_px, half_lvl = None, o_entry * (1 + CONFIG['half_at'])
                 for k in range(j, len(v['close'])):
                     c = v['close'][k]
+                    if CONFIG['half_at'] and v['ts'][k] in ob.index:
+                        ob_k = ob.loc[[v['ts'][k]]].iloc[0]
+                        if half_px is None and ob_k.h >= half_lvl + half_spread(half_lvl):
+                            half_px = half_lvl                              # limit filled; stop on the rest from the next bar
+                        elif half_px is not None and ob_k.l <= o_entry:
+                            x_i, why, stop_fill = k, "Rest at entry", min(o_entry, ob_k.o); break
                     if CONFIG['opt_stop'] and v['ts'][k] in ob.index:
                         ob_k = ob.loc[[v['ts'][k]]].iloc[0]
                         if ob_k.l <= stop_lvl:                              # filled at the stop, or the open if it gapped through
@@ -314,6 +329,8 @@ def run(start: date, end: date, verbose=False):
                             if CONFIG['be_on_option'] else s * (c - S0) <= 0
                         if back:
                             x_i, why = k, "Breakeven"; break                # was up >= be_after x range, came back
+                    if CONFIG['vwap_exit'] and s * (c - v['vwap'][k]) < 0:
+                        x_i, why = k, "VWAP"; break
                     if CONFIG['time_stop_slot'] and v['slot'][k] == CONFIG['time_stop_slot'] and best < CONFIG['time_stop_progress'] * rng:
                         x_i, why = k, "No progress"; break
                     best = max(best, s * ((v['high'][k] if s == 1 else v['low'][k]) - S0))
@@ -342,9 +359,10 @@ def run(start: date, end: date, verbose=False):
                 iv_in = implied_vol(o_mid_in, S0, K, t_in, cp)
                 iv_out = implied_vol(o_mid_out, S_out, K, t_out, cp) if stop_fill is None else np.nan
                 n = max(1, int(equity * CONFIG['premium_pct'] // (o_entry * 100))) if CONFIG['premium_pct'] else 1
-                pnl = ((o_exit - o_entry) * 100 - 2 * CONFIG['fee']) * n
+                nh = max(1, n // 2) if half_px is not None else 0          # contracts sold at the half target
+                pnl = (nh * (half_px or 0) + (n - nh) * o_exit - n * o_entry) * 100 - 2 * CONFIG['fee'] * n
                 equity += pnl
-                rows.append({"Date": d, "Setup": setup, "Ticker": t, "Side": side, "Option": f"{t} {exp} {K:g}{cp}", "Delta": round(dl, 2),
+                rows.append({"Date": d, "Setup": setup, "Half": nh, "Ticker": t, "Side": side, "Option": f"{t} {exp} {K:g}{cp}", "Delta": round(dl, 2),
                              "Entry": e_ts.strftime('%H:%M'), "Exit": v['ts'][x_i].strftime('%H:%M'), "Why": why,
                              "Contracts": n, "Opt entry": round(o_entry, 2), "Opt exit": round(o_exit, 2), "PnL ($)": round(pnl, 2),
                              "Equity": round(equity, 2),

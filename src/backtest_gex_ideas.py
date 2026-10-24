@@ -38,21 +38,33 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from src.core.clock import ET  # noqa: E402
 from src.data.models import OptionChain, OptionQuote  # noqa: E402
+from src.strategy import gex_learn as gl  # noqa: E402
 from src.strategy import gex_plan as gp  # noqa: E402
 
 DB = REPO / "data" / "marketdb" / "market_data.db"
 EXIT_AT = time(15, 45)
 SLIP = 0.02          # $ per share per side over the bar price (spread)
 OUT = REPO / "results" / "gex_ideas_backtest.csv"
-REPLAY_VERSION = 1   # bump when gex_plan rules change: every stored day is replayed again
+REPLAY_VERSION = 3   # bump when gex_plan rules change: every stored day is replayed again (2: risk_1c, opt_R; 3: strict)
 COLS = ["date", "ticker", "kind", "time", "side", "setup", "rate", "against", "grade", "dte", "level", "stop", "target",
-        "entry_spot", "exit_spot", "exit_time", "reason", "R", "contract", "opt_entry", "opt_exit", "pnl"]
+        "entry_spot", "exit_spot", "exit_time", "reason", "R", "contract", "opt_entry", "opt_exit", "pnl", "risk_1c",
+        "opt_R"]
+REAL_COLS = ("rate", "against", "level", "stop", "target", "entry_spot", "exit_spot", "R", "opt_entry", "opt_exit", "pnl",
+             "dte", "risk_1c", "opt_R")
 SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS gex_replay ({", ".join(c + (" REAL" if c in ("rate", "against", "level", "stop", "target",
-    "entry_spot", "exit_spot", "R", "opt_entry", "opt_exit", "pnl", "dte") else " TEXT") for c in COLS)},
+CREATE TABLE IF NOT EXISTS gex_replay ({", ".join(c + (" REAL" if c in REAL_COLS else " TEXT") for c in COLS)},
     PRIMARY KEY (date, ticker, kind, setup)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS gex_replay_days (date TEXT, ticker TEXT, version INTEGER, PRIMARY KEY (date, ticker)) WITHOUT ROWID;
 """
+
+
+def _schema(con) -> None:
+    """Create the replay tables; add columns a newer REPLAY_VERSION introduced to an existing table."""
+    con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(gex_replay)")}
+    for c in COLS:
+        if c not in have:
+            con.execute(f"ALTER TABLE gex_replay ADD COLUMN {c} {'REAL' if c in REAL_COLS else 'TEXT'}")
 
 
 def load_bars(con, symbol: str, since: date | None = None) -> pd.DataFrame:
@@ -135,7 +147,8 @@ def simulate(idea, t: datetime, day_bars: pd.DataFrame, chain, obars: OptionBars
     risk = abs(entry_px - idea.stop) or 1e-9
     r_mult = (exit_px - entry_px) / risk * (1 if call else -1)
     out = {"entry_spot": round(entry_px, 2), "exit_spot": round(exit_px, 2), "exit_time": f"{exit_ts:%H:%M}",
-           "reason": reason, "R": round(r_mult, 2), "contract": None, "opt_entry": None, "opt_exit": None, "pnl": None}
+           "reason": reason, "R": round(r_mult, 2), "contract": None, "opt_entry": None, "opt_exit": None, "pnl": None,
+           "risk_1c": None, "opt_R": None}
     pick = pick_contract(chain, idea.expiry, idea.side, entry_px, t, obars)
     if pick:
         o, d = pick
@@ -145,29 +158,47 @@ def simulate(idea, t: datetime, day_bars: pd.DataFrame, chain, obars: OptionBars
         if not ent.empty and not ext.empty and ext.index[-1] >= ent.index[0]:
             op_in = float(ent["o"].iloc[0]) + SLIP
             op_out = max(float(ext["c"].iloc[-1]) - SLIP, 0.0)
+            risk = gl.risk_per_contract(entry_px, idea.stop, d, op_in - 2 * SLIP, op_in)
             out.update(contract=f"{o.strike:g}{o.put_call} {o.expiry:%m-%d} d{d:.2f}", opt_entry=round(op_in, 2),
-                       opt_exit=round(op_out, 2), pnl=round((op_out - op_in) * 100, 2))
+                       opt_exit=round(op_out, 2), pnl=round((op_out - op_in) * 100, 2), risk_1c=risk,
+                       opt_R=round((op_out - op_in) * 100 / risk, 2))
     return out
 
 
-def replay_day(tk: str, d: date, chain: OptionChain, bars: pd.DataFrame, sessions: list, obars: OptionBars
-               ) -> tuple[list[dict], list[dict]]:
-    """(trades, triggers) for one ticker-day."""
+def replay_day(tk: str, d: date, chain: OptionChain | None, bars: pd.DataFrame, sessions: list, obars: OptionBars,
+               chain_at=None) -> tuple[list[dict], list[dict]]:
+    """(trades, triggers + strict flip trades) for one ticker-day. `chain_at(now, spot)` builds the chain per bar instead of re-pricing one
+    saved snapshot (src/backtest_gex_proxy.py: chains rebuilt from option bars)."""
     trades, triggers = [], []
     day_bars = bars[bars.index.date == d]
     hist = bars[bars.index.date <= d]
     hist = hist[hist.index.date >= sessions[max(0, sessions.index(d) - 6)]]
     busy_until, seen_trade, seen_trig = None, set(), set()
+    strict_busy, seen_strict = None, set()           # the strict flip rules' shadow book (kind "strict")
     for ts in day_bars.index:
         now = ts + timedelta(minutes=5)              # bar closed
         if not gp.FIRST_IDEA <= now.time() <= gp.LAST_IDEA:
             continue
         upto = hist[hist.index < now]
         spot = float(upto["close"].iloc[-1])
-        p = gp.profile(replace(chain, spot=spot), now, "auto", "oi")
+        ch = chain_at(now, spot) if chain_at else replace(chain, spot=spot)
+        if ch is None:
+            continue
+        p = gp.profile(ch, now, "auto", "oi")
         if p is None:
             continue
-        idea = gp.build_idea(p, replace(chain, spot=spot), gp.intraday(upto, d), None, now, gp.market_structure(upto, d))
+        ctx, mtf = gp.intraday(upto, d), gp.market_structure(upto, d)
+        strict = gp.strict_idea(p, ch, ctx, None, now, mtf)
+        if strict.status == "ACTIVE" and strict.setup not in seen_strict and (strict_busy is None or now >= strict_busy):
+            seen_strict.add(strict.setup)
+            res = simulate(strict, now, day_bars, ch, obars)
+            triggers.append({"date": d.isoformat(), "ticker": tk, "time": f"{now:%H:%M}", "side": strict.side,
+                             "setup": strict.setup, "rate": strict.rate, "against": strict.against,
+                             "grade": strict.grade, "dte": strict.dte, "level": strict.level, "stop": strict.stop,
+                             "target": strict.target, **res, "kind": "strict"})
+            h, m = map(int, res["exit_time"].split(":"))
+            strict_busy = datetime.combine(d, time(h, m), tzinfo=ET) + timedelta(minutes=5)
+        idea = gp.build_idea(p, ch, ctx, None, now, mtf)
         if not idea.side:
             continue
         key = idea.setup
@@ -176,10 +207,10 @@ def replay_day(tk: str, d: date, chain: OptionChain, bars: pd.DataFrame, session
                "stop": idea.stop, "target": idea.target}
         if key not in seen_trig:
             seen_trig.add(key)
-            triggers.append({**rec, **simulate(idea, now, day_bars, chain, obars), "kind": "trigger"})
+            triggers.append({**rec, **simulate(idea, now, day_bars, ch, obars), "kind": "trigger"})
         if idea.grade in ("A", "B") and key not in seen_trade and (busy_until is None or now >= busy_until):
             seen_trade.add(key)
-            res = simulate(idea, now, day_bars, chain, obars)
+            res = simulate(idea, now, day_bars, ch, obars)
             trades.append({**rec, **res, "kind": "trade"})
             h, m = map(int, res["exit_time"].split(":"))
             busy_until = datetime.combine(d, time(h, m), tzinfo=ET) + timedelta(minutes=5)
@@ -203,10 +234,16 @@ def run(tickers: list[str], start: date | None, end: date | None, db: Path = DB,
         ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Replay. store_results=True: skip ticker-days already stored at this REPLAY_VERSION, save new ones."""
     con = sqlite3.connect(db, timeout=60)
-    con.executescript(SCHEMA)
+    _schema(con)
     obars = OptionBars(con)
     trades, triggers = [], []
     done = {(d, t) for d, t, v in con.execute("SELECT date, ticker, version FROM gex_replay_days") if v == REPLAY_VERSION}
+    # Option bars for a session load the night after (market_db._last_session), so a day replayed that same evening has
+    # no option prices: it only counts as done once its option bars are in and its trades got a contract.
+    opt_days = set(con.execute("SELECT DISTINCT od.date, c.underlying FROM option_days od JOIN contracts c ON c.id = od.cid"))
+    opt_tickers = {u for _, u in opt_days}
+    unpriced = set(con.execute("SELECT DISTINCT date, ticker FROM gex_replay WHERE kind = 'trade' AND contract IS NULL"))
+    done = {(d, t) for d, t in done if t not in opt_tickers or ((d, t) in opt_days and (d, t) not in unpriced)}
     for tk in tickers:
         if not con.execute("SELECT 1 FROM chain_snapshots WHERE underlying = ? LIMIT 1", (tk,)).fetchone():
             continue                                  # no saved chains for this ticker yet
@@ -235,11 +272,11 @@ def run(tickers: list[str], start: date | None, end: date | None, db: Path = DB,
 
 def stored(db: Path = DB, since: date | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     con = sqlite3.connect(db, timeout=60)
-    con.executescript(SCHEMA)
+    _schema(con)
     df = pd.read_sql("SELECT * FROM gex_replay WHERE date >= ? ORDER BY date, time", con,
                      params=((since or date(2000, 1, 1)).isoformat(),))
     con.close()
-    return df[df["kind"] == "trade"].reset_index(drop=True), df[df["kind"] == "trigger"].reset_index(drop=True)
+    return df[df["kind"] == "trade"].reset_index(drop=True), df[df["kind"].isin(["trigger", "strict"])].reset_index(drop=True)
 
 
 def report(trades: pd.DataFrame, triggers: pd.DataFrame) -> dict:
@@ -255,6 +292,10 @@ def report(trades: pd.DataFrame, triggers: pd.DataFrame) -> dict:
         out["total"] = {"ideas": int(len(trades)), "win_R_%": round(float((trades["R"] > 0).mean() * 100)),
                         "avg_R": round(float(trades["R"].mean()), 2), "priced": int(priced.sum()),
                         "opt_pnl_$": round(float(trades.loc[priced, "pnl"].sum()), 0)}
+    if not triggers.empty and "kind" in triggers:
+        strict = triggers[triggers["kind"] == "strict"]
+        triggers = triggers[triggers["kind"] == "trigger"]
+        out["strict_vs_classic"] = strict_vs_classic(trades, strict)
     if not triggers.empty:
         tg = triggers.assign(bucket=pd.cut(triggers["rate"], [-1, 39, 59, 74, 100],
                                            labels=["<40", "40-59", "60-74", "75+"]).astype(str))
@@ -262,11 +303,33 @@ def report(trades: pd.DataFrame, triggers: pd.DataFrame) -> dict:
     return out
 
 
-def nightly_replay(db: Path, today: date, tickers: list[str], window_days: int = 45) -> dict:
-    """Replay any new ticker-days, then report the last `window_days` from the stored results."""
+def strict_vs_classic(trades: pd.DataFrame, strict: pd.DataFrame) -> list[dict]:
+    """The strict flip rules against the classic flip setups they replace, in R (option R where priced)."""
+    rows = []
+    classic = trades[trades["setup"].isin(gp.CLASSIC_FLIP)] if "setup" in trades else trades.iloc[:0]
+    for name, df in (("classic flip", classic), ("strict flip", strict)):
+        if df.empty:
+            rows.append({"rules": name, "n": 0})
+            continue
+        r = pd.to_numeric(df.get("opt_R"), errors="coerce").fillna(pd.to_numeric(df["R"], errors="coerce"))
+        rows.append({"rules": name, "n": int(len(df)), "win_%": round(float((r > 0).mean() * 100)),
+                     "avg_R": round(float(r.mean()), 2), "sum_R": round(float(r.sum()), 1),
+                     "opt_$_1c": round(float(pd.to_numeric(df["pnl"], errors="coerce").sum()), 0),
+                     "stops": int((df["reason"] == "STOP").sum()), "targets": int((df["reason"] == "TARGET").sum())})
+    return rows
+
+
+def nightly_replay(db: Path, today: date, tickers: list[str], window_days: int = 45, live: list[dict] | None = None
+                   ) -> dict:
+    """Replay any new ticker-days, then report the last `window_days` from the stored results. `live` (the engine's
+    closed paper ideas) joins the replay trades in the learned scorecard and gate (rep['learning'], rep['gate'])."""
     new_trades, new_triggers = run(tickers, today - timedelta(days=window_days), today, db, store_results=True)
     trades, triggers = stored(db, today - timedelta(days=window_days))
     rep = report(trades, triggers)
+    res = gl.results(live or [], trades)
+    rep["learning"] = gl.scorecard(res)
+    rep["gate"] = {"generated": rep["generated"], "min_n": gl.GATE_MIN_N, "window": gl.GATE_WINDOW,
+                   "gates": gl.gate(res)}
     con = sqlite3.connect(db, timeout=60)
     replayed = con.execute("SELECT date, ticker FROM gex_replay_days WHERE date >= ? AND version = ?",
                            ((today - timedelta(days=window_days)).isoformat(), REPLAY_VERSION)).fetchall()
@@ -311,9 +374,12 @@ if __name__ == "__main__":
         print(f"\nTotal: {len(trades)} ideas, option P&L ${trades['pnl'].sum():,.0f} (1 contract each, "
               f"{trades['pnl'].notna().sum()} priced)")
     if not triggers.empty:
-        triggers["bucket"] = pd.cut(triggers["rate"], [-1, 39, 59, 74, 100], labels=["<40", "40-59", "60-74", "75+"])
+        strict = triggers[triggers["kind"] == "strict"]
+        tg = triggers[triggers["kind"] == "trigger"].copy()
+        tg["bucket"] = pd.cut(tg["rate"], [-1, 39, 59, 74, 100], labels=["<40", "40-59", "60-74", "75+"])
         print("\nEvery trigger by convergence rate (is a higher rate better?):\n"
-              + summary(triggers, "bucket").to_string(index=False))
+              + summary(tg, "bucket").to_string(index=False))
+        print("\nStrict vs classic flip rules:\n" + pd.DataFrame(strict_vs_classic(trades, strict)).to_string(index=False))
         OUT.parent.mkdir(exist_ok=True)
-        pd.concat([trades.assign(kind="trade"), triggers.assign(kind="trigger")]).to_csv(OUT, index=False)
+        pd.concat([trades.assign(kind="trade"), triggers]).to_csv(OUT, index=False)
         print(f"\nSaved {OUT.relative_to(REPO)}")

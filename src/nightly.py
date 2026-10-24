@@ -9,7 +9,8 @@ strategy's monitor.
 3b. housekeeping: ledger gex_levels older than LEDGER_GEX_DAYS -> market DB, ledger prune; raw chains older than
    market_db.RAW_CHAIN_DAYS rolled up per strike (gex_strikes); incremental vacuum
 3c. replay the GEX ideas tab over the saved chains (src/backtest_gex_ideas.py, incremental: only new ticker-days)
-   -> research/gex_ideas_backtest.json (dashboard GEX tab; weekly email on Fridays)
+   -> research/gex_ideas_backtest.json (dashboard GEX tab; weekly email on Fridays); with the engine's live paper
+   log it learns the per-setup scorecard and on/off gate (src/strategy/gex_learn.py) -> ledger kv 'gex_gate'
 4. re-run the smart first-candle backtest from the database (Feb 2024 -> today, real option prices):
    every signal's option return -> ledger kv 'fc_shadow' (monitor C + half-size kill switch) and
    research/smart_rule.json (dashboard Research page)
@@ -141,9 +142,13 @@ def run_nightly(store, market, ledger_fn, today: date) -> dict:
     report["updates"] = update_database(market, today)
     try:
         import backtest_gex_ideas as gexbt
-        rep = gexbt.nightly_replay(mdb.DB_PATH, today, ["SPY", "QQQ"] + list(STOCKS))
+        live: list[dict] = []
+        ledger_fn(lambda led: live.extend(led.get_kv("gex_ideas_log") or []))
+        rep = gexbt.nightly_replay(mdb.DB_PATH, today, ["SPY", "QQQ"] + list(STOCKS), live=live)
         store.put_bytes(GEX_REPLAY_OBJECT, json.dumps(rep, default=str).encode(), "application/json")
+        ledger_fn(lambda led: led.set_kv("gex_gate", rep["gate"]))
         report["gex_replay"] = {k: rep.get(k) for k in ("ticker_days", "new_trades", "total")}
+        report["gex_gate_off"] = [k for k, g in rep["gate"]["gates"].items() if not g["on"]]
         report["gex_replay_full"] = rep
     except Exception as exc:  # noqa: BLE001
         log.exception("GEX ideas replay failed")

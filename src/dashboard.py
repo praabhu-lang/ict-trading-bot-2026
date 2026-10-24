@@ -28,7 +28,7 @@ from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
 from src import dashboard_gex as gex_tab  # noqa: E402
 from src import dashboard_pages as pages  # noqa: E402
-from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
+from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -538,6 +538,19 @@ with tab_set:
                                 help="An NVIDIA-hosted LLM reads the Tavily headlines for each signal. It can only block, "
                                 "never add points. Shadow logs what it would have blocked; switch to Veto once that "
                                 "log shows it avoids losers." + ("" if env("NVIDIA_API_KEY") else " NVIDIA_API_KEY is not set."))
+        c = st.columns(3)
+        gex_risk = c[0].number_input("GEX ideas: $ risk per idea (paper)", 10.0, 5_000.0, settings.gex_risk_per_idea, 25.0,
+                                     help="Contracts = this / (stop distance x delta + spread) x 100. 0 contracts when "
+                                     "one already risks more (still tracked in R).")
+        gex_gate = c[1].selectbox("GEX ideas: learned gate", list(GEX_GATE_MODES),
+                                  index=list(GEX_GATE_MODES).index(settings.gex_gate_mode), format_func=GEX_GATE_MODES.get,
+                                  help="Nightly: a setup with 30+ results and a negative average R over its last 30 "
+                                  "switches off. Shadow only records it; enforce sizes those ideas to 0.")
+        gex_flip = c[2].selectbox("GEX ideas: gamma-flip rules", list(GEX_FLIP_RULES),
+                                  index=list(GEX_FLIP_RULES).index(settings.gex_flip_rules), format_func=GEX_FLIP_RULES.get,
+                                  help="Strict: the flip must be tested, a candle must reject (or reclaim) it, the next "
+                                  "close must confirm, and 5-min momentum must agree. Shadow trades classic and tracks "
+                                  "strict on the side (GEX tab, day summary).")
         st.subheader("Strategy")
         strat = st.selectbox("Strategy", list(STRATEGIES), index=list(STRATEGIES).index(settings.strategy),
                              format_func=STRATEGIES.get)
@@ -639,6 +652,7 @@ with tab_set:
                           for r in ev_df.dropna(subset=["date", "name"]).to_dict("records")]
                 save_control({
                     "broker": broker_choice, "auto_trade": auto_trade, "universe": universe, "news_llm_mode": news_llm,
+                    "gex_risk_per_idea": float(gex_risk), "gex_gate_mode": gex_gate, "gex_flip_rules": gex_flip,
                     "starting_capital": float(start_cap), "stock_capital": float(stock_cap),
                     "reserve_capital": float(reserve_cap),
                     "risk_per_trade_pct": risk / 100, "options_allocation_pct": pool / 100,

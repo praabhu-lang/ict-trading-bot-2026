@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.core.clock import ET
 from src.strategy import gex_plan as gp
@@ -242,3 +243,54 @@ def test_replay_report_shapes():
     rep = bt.report(tr, tr.assign(kind="trigger"))
     assert rep["total"] == {"ideas": 1, "win_R_%": 100, "avg_R": 1.2, "priced": 1, "opt_pnl_$": 400.0}
     assert rep["by_bucket"][0]["bucket"] == "60-74" and rep["trades"][0]["ticker"] == "QQQ"
+
+
+# ------------------------------------------------------------------ strict flip rules
+def _ohlc(rows, end_hh=10, end_mm=30):
+    """[(o, h, l, c)] -> 5-min bars ending at end_hh:end_mm."""
+    idx = pd.date_range(end=at(end_hh, end_mm), periods=len(rows), freq="5min")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx).assign(volume=1000.0)
+
+
+def _strict_mtf(today, up: bool):
+    closes = np.linspace(99.2, 100.6, 30) if up else np.linspace(101.0, 99.7, 30)
+    m5 = pd.DataFrame({"close": closes}, index=pd.date_range(end=at(10, 30), periods=30, freq="5min"))
+    tf = {"candles": m5, "structure": {"trend": 1 if up else -1, "note": "", "swings": []}, "momentum": (0, "")}
+    return {30: tf, 5: tf, "today": today}
+
+
+REJECT = [(99.80, 99.85, 99.70, 99.75), (99.75, 99.90, 99.72, 99.88), (99.88, 99.98, 99.80, 99.82)]
+
+
+def test_strict_put_needs_test_rejection_confirmation_and_momentum():
+    p = prof(spot=99.72, flip=100.0, pw=99.0, net=-1e6)
+    confirmed = _ohlc(REJECT + [(99.82, 99.84, 99.70, 99.72)])
+    trig, why = gp.strict_flip(p, {"vwap": 100.2}, _strict_mtf(confirmed, up=False))
+    assert why == "confirmed" and trig[:2] == ("PUT", gp.STRICT_PUT)
+    assert trig[3] == pytest.approx(99.98 + 0.025) and trig[4] == 99.0          # above the wick; put wall target
+    waiting = _ohlc(REJECT + [(99.82, 99.84, 99.79, 99.81)])
+    assert gp.strict_flip(replace(p, spot=99.81), {"vwap": 100.2}, _strict_mtf(waiting, False))[1].startswith("waiting")
+    assert "momentum" in gp.strict_flip(p, {"vwap": 99.5}, _strict_mtf(confirmed, False))[1]    # above VWAP
+    back = _ohlc(REJECT + [(99.82, 100.10, 99.80, 100.05), (100.05, 100.06, 99.65, 99.70)])
+    assert gp.strict_flip(replace(p, spot=99.70), {"vwap": 100.2}, _strict_mtf(back, False))[1] == "closed back above the flip"
+    drift = _ohlc([(99.85, 99.88, 99.78, 99.80), (99.80, 99.82, 99.70, 99.75), (99.75, 99.77, 99.65, 99.70)])
+    assert gp.strict_flip(replace(p, spot=99.70), {"vwap": 100.2}, _strict_mtf(drift, False))[1] == \
+        "no rejection candle at the flip"                                      # the classic rule's drift, never tested
+
+
+def test_strict_call_needs_reclaim_and_hold():
+    p = prof(spot=100.14, flip=100.0, cw=101.0)
+    reclaim = _ohlc([(99.95, 99.98, 99.85, 99.90), (99.90, 100.10, 99.88, 100.06), (100.06, 100.15, 100.03, 100.14)])
+    trig, why = gp.strict_flip(p, {"vwap": 99.9}, _strict_mtf(reclaim, up=True))
+    assert why == "confirmed" and trig[:2] == ("CALL", gp.STRICT_CALL)
+    assert trig[3] == pytest.approx(99.85 - 0.025) and trig[4] == 101.0
+    never_below = _ohlc([(100.02, 100.08, 100.01, 100.05), (100.05, 100.12, 100.04, 100.10), (100.10, 100.16, 100.08, 100.14)])
+    assert gp.strict_flip(p, {"vwap": 99.9}, _strict_mtf(never_below, True))[1] == "no reclaim of the flip"
+
+
+def test_strict_idea_is_active_with_a_contract():
+    p = prof(spot=99.72, flip=100.0, pw=99.0, net=-1e6)
+    today = _ohlc(REJECT + [(99.82, 99.84, 99.70, 99.72)])
+    idea = gp.strict_idea(p, make_chain(99.72, dtes=(0,)), {"vwap": 100.2, "poc": 100.0, "vah": 100.3, "val": 99.6},
+                          None, at(10, 30), _strict_mtf(today, up=False))
+    assert idea.status == "ACTIVE" and idea.side == "PUT" and idea.contract and idea.grade in ("A", "B")
