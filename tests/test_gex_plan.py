@@ -234,6 +234,35 @@ def test_nightly_replay_is_incremental_and_reports(tmp_path):
     assert again["ticker_days"] == 1 and again["new_trades"] == 0 and again["total"] == first["total"]
 
 
+def test_nightly_replay_waits_for_option_bars(tmp_path, monkeypatch):
+    """Option bars land the night after; a day replayed before they exist is redone once they do."""
+    from datetime import date
+
+    from src import backtest_gex_ideas as bt
+    from src import market_db as mdb
+
+    test_nightly_replay_is_incremental_and_reports(tmp_path)        # 2026-10-07 stored, no option bars
+    con = mdb.connect()
+    con.execute("INSERT INTO contracts VALUES (1, 'SPY261006C00100000', 'SPY', '2026-10-06', 'C', 100.0)")
+    con.execute("INSERT INTO option_days VALUES (1, '2026-10-06')")   # SPY is option-priced, but not on the 7th yet
+    con.commit()
+    mdb._CONN.close()
+    mdb._CONN = None
+    calls = []
+    real = bt.replay_day
+    monkeypatch.setattr(bt, "replay_day", lambda *a, **k: calls.append(a[1]) or real(*a, **k))
+    bt.nightly_replay(tmp_path / "m.db", date(2026, 10, 8), ["SPY"])
+    assert calls == [date(2026, 10, 7)]
+    con = mdb.connect()
+    con.execute("INSERT INTO option_days VALUES (1, '2026-10-07')")
+    con.execute("UPDATE gex_replay SET contract = '100C 10-07' WHERE kind = 'trade'")   # as if it priced
+    con.commit()
+    mdb._CONN.close()
+    mdb._CONN = None
+    bt.nightly_replay(tmp_path / "m.db", date(2026, 10, 8), ["SPY"])
+    assert calls == [date(2026, 10, 7)]                              # bars in and priced: final
+
+
 def test_replay_report_shapes():
     from src import backtest_gex_ideas as bt
 

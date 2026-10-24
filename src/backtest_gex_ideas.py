@@ -207,6 +207,12 @@ def run(tickers: list[str], start: date | None, end: date | None, db: Path = DB,
     obars = OptionBars(con)
     trades, triggers = [], []
     done = {(d, t) for d, t, v in con.execute("SELECT date, ticker, version FROM gex_replay_days") if v == REPLAY_VERSION}
+    # Option bars for a session load the night after (market_db._last_session), so a day replayed that same evening has
+    # no option prices: it only counts as done once its option bars are in and its trades got a contract.
+    opt_days = set(con.execute("SELECT DISTINCT od.date, c.underlying FROM option_days od JOIN contracts c ON c.id = od.cid"))
+    opt_tickers = {u for _, u in opt_days}
+    unpriced = set(con.execute("SELECT DISTINCT date, ticker FROM gex_replay WHERE kind = 'trade' AND contract IS NULL"))
+    done = {(d, t) for d, t in done if t not in opt_tickers or ((d, t) in opt_days and (d, t) not in unpriced)}
     for tk in tickers:
         if not con.execute("SELECT 1 FROM chain_snapshots WHERE underlying = ? LIMIT 1", (tk,)).fetchone():
             continue                                  # no saved chains for this ticker yet
