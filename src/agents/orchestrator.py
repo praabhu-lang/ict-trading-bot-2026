@@ -989,13 +989,61 @@ class TradingEngine:
     # ------------------------------------------------------------- GEX ideas (paper)
     def gex_ideas(self, now: datetime, scan: bool) -> None:
         """Paper-track the GEX tab's ACTIVE ideas: 1 contract at the ask, out at the bid when the underlying hits the
-        stop or target, or at the flatten time. Open ideas every cycle; new ones on each 5-min scan. Never orders."""
+        stop or target, or at the flatten time. Open ideas every cycle; new ones on each 5-min scan. Never orders.
+        Shadow book (kv gex_v2_open / gex_v2_log): every trigger the setup-aware rule passes (gex_plan.setup_aware),
+        whatever its grade, tracked the same way so the two scorings compare like for like."""
         if not self.s.gex_ideas or not is_trading_day(now.date()):
             return
         from ..strategy import gex_plan as gp
 
         today = now.date().isoformat()
-        book = self.ledger.get_kv("gex_ideas_open") or []
+        keep, closed = self._gex_manage(self.ledger.get_kv("gex_ideas_open") or [], now)
+        v2_keep, v2_closed = self._gex_manage(self.ledger.get_kv("gex_v2_open") or [], now)
+        if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
+            names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
+            busy = {r["ticker"] for r in keep}
+            v2_busy = {r["ticker"] for r in v2_keep}
+            levels = []
+            for ticker in names:
+                r = gp.analyse(self.market, self.news, ticker, now)
+                idea = r.get("idea")
+                if not idea:
+                    continue
+                p = r["profile"]
+                levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
+                               "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
+                               "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
+                               "net_gex": p.gex.net_gex, "expected_move": p.expected_move, "pc_volume": p.pc_volume,
+                               "idea": f"{idea.status} {idea.side or ''} {idea.grade}".strip()})
+                ok, why = gp.setup_aware(idea)
+                if ok and idea.contract and idea.ask and ticker not in v2_busy \
+                        and self.ledger.alert_once(f"gex_v2:{today}:{ticker}:{idea.setup}"):
+                    v2_keep.append({**self._gex_record(today, ticker, now, idea, p.spot), "why": why})
+                if idea.status != "ACTIVE" or ticker in busy:
+                    continue
+                if not self.ledger.alert_once(f"gex_idea:{today}:{ticker}:{idea.setup}"):
+                    continue
+                keep.append(self._gex_record(today, ticker, now, idea, p.spot))
+            self.ledger.record_gex_levels(levels)
+        for key, book, done in (("gex_ideas", keep, closed), ("gex_v2", v2_keep, v2_closed)):
+            self.ledger.set_kv(f"{key}_open", book)
+            if done:
+                self.ledger.set_kv(f"{key}_log", (self.ledger.get_kv(f"{key}_log") or []) + done)
+        self.status["gex_ideas_open"] = len(keep)
+
+    @staticmethod
+    def _gex_record(today: str, ticker: str, now: datetime, idea, spot: float) -> dict:
+        return {"id": f"{today}:{ticker}:{idea.setup}", "date": today, "ticker": ticker,
+                "opened": now.isoformat(timespec="seconds"), "side": idea.side, "setup": idea.setup,
+                "grade": idea.grade, "rate": idea.rate, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
+                "spot": spot, "stop": idea.stop, "target": idea.target,
+                "votes": {k: v["score"] for k, v in idea.confluence.items()}}
+
+    def _gex_manage(self, book: list[dict], now: datetime) -> tuple[list[dict], list[dict]]:
+        """(still open, closed) for a GEX paper book: out at the bid on the underlying's stop / target or at flatten."""
+        from ..strategy import gex_plan as gp
+
+        today = now.date().isoformat()
         keep, closed = [], []
         for rec in book:
             try:
@@ -1019,35 +1067,7 @@ class TradingEngine:
                 continue
             closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": o.bid, "exit_spot": spot,
                            "reason": reason, "pnl": round((o.bid - rec["entry"]) * 100, 2)})
-        if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
-            names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
-            busy = {r["ticker"] for r in keep}
-            levels = []
-            for ticker in names:
-                r = gp.analyse(self.market, self.news, ticker, now)
-                idea = r.get("idea")
-                if not idea:
-                    continue
-                p = r["profile"]
-                levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
-                               "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
-                               "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
-                               "net_gex": p.gex.net_gex, "expected_move": p.expected_move, "pc_volume": p.pc_volume,
-                               "idea": f"{idea.status} {idea.side or ''} {idea.grade}".strip()})
-                if idea.status != "ACTIVE" or ticker in busy:
-                    continue
-                if not self.ledger.alert_once(f"gex_idea:{today}:{ticker}:{idea.setup}"):
-                    continue
-                keep.append({"id": f"{today}:{ticker}:{idea.setup}", "date": today, "ticker": ticker,
-                             "opened": now.isoformat(timespec="seconds"), "side": idea.side, "setup": idea.setup,
-                             "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
-                             "spot": r["profile"].spot, "stop": idea.stop, "target": idea.target,
-                             "votes": {k: v["score"] for k, v in idea.confluence.items()}})
-            self.ledger.record_gex_levels(levels)
-        self.ledger.set_kv("gex_ideas_open", keep)
-        if closed:
-            self.ledger.set_kv("gex_ideas_log", (self.ledger.get_kv("gex_ideas_log") or []) + closed)
-        self.status["gex_ideas_open"] = len(keep)
+        return keep, closed
 
     def _llm_recap(self, now: datetime, closed, total, month, sigs, plan, vrz, gex) -> str | None:
         llm = getattr(self.news, "llm", None)
@@ -1140,10 +1160,14 @@ class TradingEngine:
                 "Entry": fomc.get("entry", ""), "Exit": fomc.get("exit", ""), "Reason": fomc.get("exit_reason") or fomc.get("reason", ""),
                 "P&L $": fomc.get("pnl", "")}])
         gex_today = [x for x in (self.ledger.get_kv("gex_ideas_log") or []) if x["date"] == now.date().isoformat()]
-        if gex_today:
-            plan_html += "<h3>GEX ideas (paper, 1 contract)</h3>" + table([{
-                "Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"], "Grade": x["grade"],
-                "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"], "P&L $": x["pnl"]} for x in gex_today])
+        v2_today = [x for x in (self.ledger.get_kv("gex_v2_log") or []) if x["date"] == now.date().isoformat()]
+        for title, rows in (("GEX ideas (paper, 1 contract)", gex_today),
+                            ("GEX ideas, setup-aware rule (SHADOW, paper, 1 contract)", v2_today)):
+            if rows:
+                plan_html += f"<h3>{title}</h3>" + table([{
+                    "Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"],
+                    "Grade": x["grade"], "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"],
+                    "P&L $": x["pnl"]} for x in rows])
         recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
         if recap:
             plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html

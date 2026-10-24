@@ -330,13 +330,14 @@ def replay_panel(rep: dict | None) -> None:
                      hide_index=True, width="stretch")
 
 
-def tracker(led) -> None:
-    log = (led.get_kv("gex_ideas_log") if led else None) or []
-    open_ = (led.get_kv("gex_ideas_open") if led else None) or []
-    st.subheader("Paper tracking of ACTIVE ideas")
+def tracker(led, key: str = "gex_ideas", title: str = "Paper tracking of ACTIVE ideas",
+            empty: str = "The engine logs every ACTIVE idea during the session as a 1-contract paper trade (entry at "
+                         "the ask, exit at the bid on stop / target / 15:45 ET). Nothing yet.") -> None:
+    log = (led.get_kv(f"{key}_log") if led else None) or []
+    open_ = (led.get_kv(f"{key}_open") if led else None) or []
+    st.subheader(title)
     if not log and not open_:
-        st.caption("The engine logs every ACTIVE idea during the session as a 1-contract paper trade (entry at the ask, "
-                   "exit at the bid on stop / target / 15:45 ET). Nothing yet.")
+        st.caption(empty)
         return
     df = pd.DataFrame(log)
     if not df.empty:
@@ -354,6 +355,24 @@ def tracker(led) -> None:
         st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
     if open_:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
+
+
+def compare_books(led) -> None:
+    """Graded book vs the setup-aware shadow book over the days both have run."""
+    logs = {name: pd.DataFrame((led.get_kv(f"{key}_log") if led else None) or [])
+            for name, key in (("Current grading (A/B)", "gex_ideas"), ("Setup-aware (shadow)", "gex_v2"))}
+    shadow = logs["Setup-aware (shadow)"]
+    if shadow.empty:
+        return
+    since = shadow["date"].min()
+    rows = []
+    for name, df in logs.items():
+        df = df[(df["date"] >= since) & df["pnl"].notna()] if not df.empty else df
+        rows.append({"book": name, "since": since, "ideas": len(df),
+                     "win %": round((df["pnl"] > 0).mean() * 100) if len(df) else None,
+                     "P&L $ (1 contract)": round(df["pnl"].sum()) if len(df) else 0})
+    st.subheader("Current grading vs setup-aware rule")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
 def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> None:
@@ -415,4 +434,9 @@ def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> No
                                        "Put OI": [p.put_oi.get(k, 0) for k in ks]}), hide_index=True, width="stretch")
     st.caption(f"Live · price every 30 s, option chains every 60 s · {now:%H:%M:%S} ET")
     tracker(led)
+    compare_books(led)
+    tracker(led, "gex_v2", "Shadow: setup-aware rule",
+            "Every trigger the setup-aware rule passes, whatever its grade: trend setups (flip reclaim / rejection, "
+            "momentum below the flip) need the 30m structure to agree, wall setups (put-wall bounce, call-wall fade) "
+            "need it flat. Tracked like the ACTIVE ideas above. Nothing yet.")
     replay_panel(replay)

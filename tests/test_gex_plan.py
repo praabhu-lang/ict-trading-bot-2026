@@ -271,3 +271,17 @@ def test_replay_report_shapes():
     rep = bt.report(tr, tr.assign(kind="trigger"))
     assert rep["total"] == {"ideas": 1, "win_R_%": 100, "avg_R": 1.2, "priced": 1, "opt_pnl_$": 400.0}
     assert rep["by_bucket"][0]["bucket"] == "60-74" and rep["trades"][0]["ticker"] == "QQQ"
+
+
+def _idea(setup, s30, side="CALL"):
+    return gp.Idea("SPY", "WAIT", side=side, setup=setup, confluence={"structure_30m": {"score": s30}})
+
+
+def test_setup_aware_rule_flips_the_30m_structure_by_setup():
+    assert gp.setup_aware(_idea("Gamma-flip reclaim", 1))[0]
+    assert not gp.setup_aware(_idea("Gamma-flip reclaim", 0))[0]
+    assert not gp.setup_aware(_idea("Rejected at gamma flip (negative gamma)", -1, "PUT"))[0]
+    assert gp.setup_aware(_idea("Put-wall bounce (positive gamma)", 0))[0]
+    assert not gp.setup_aware(_idea("Put-wall bounce (positive gamma)", 1))[0]
+    assert not gp.setup_aware(_idea("Call-wall fade (positive gamma)", -1, "PUT"))[0]
+    assert not gp.setup_aware(gp.Idea("SPY", "WAIT"))[0]

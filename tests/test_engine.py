@@ -386,3 +386,23 @@ def test_unmanaged_long_keeps_the_info_alert(ledger):
     broker._fill("XOM", 10, "buy", 110.0)
     engine.run_cycle(scan=False)
     assert "ℹ️ Positions not managed by the bot" in notifier.sent
+
+
+def test_gex_shadow_book_takes_setup_aware_triggers_whatever_the_grade(ledger, monkeypatch):
+    from src.strategy import gex_plan as gp
+
+    engine, _, _ = make_engine(ledger, at(11, 0, 30))
+    chain = make_chain(101.6, dtes=(0, 14))
+    p = gp.profile(chain, at(11, 0, 30))
+    c = next(o for o in chain.options if o.put_call == "C")
+    flat = {"structure_30m": {"score": 0}}
+    wall_c = gp.Idea("SPY", "WAIT", side="CALL", setup="Put-wall bounce (positive gamma)", grade="C", rate=45,
+                     stop=100.0, target=103.0, contract=c.symbol, ask=c.ask, confluence=flat)
+    trend_a = gp.Idea("QQQ", "ACTIVE", side="CALL", setup="Gamma-flip reclaim", grade="A", rate=80, stop=100.0,
+                      target=103.0, contract=c.symbol, ask=c.ask, confluence=flat)
+    ideas = {"SPY": wall_c, "QQQ": trend_a}
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now, *a, **k:
+                        {"idea": ideas.get(t), "profile": p} if t in ideas else {})
+    engine.gex_ideas(at(11, 0, 30), scan=True)
+    assert [r["ticker"] for r in ledger.get_kv("gex_v2_open")] == ["SPY"]       # grade C, but a flat-range wall setup
+    assert [r["ticker"] for r in ledger.get_kv("gex_ideas_open")] == ["QQQ"]    # the graded book is unchanged

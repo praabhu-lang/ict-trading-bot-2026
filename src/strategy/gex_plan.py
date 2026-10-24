@@ -25,6 +25,14 @@ against) or is unknown (0, never rescaled):
   options_flow 5    put/call volume on the expiry: CALL < 0.8, PUT > 1.2
   llm_news 5        LLM sentiment >= +0.3 (CALL) / <= -0.3 (PUT); an LLM "block" cancels the idea
 ACTIVE = trigger + rate >= MIN_CONVERGENCE + at most MAX_AGAINST points disagreeing. Grade A >= 75, B >= 60.
+
+Setup-aware rule (SHADOW, setup_aware): the rate above scores trend agreement the same for every setup, but over
+2026 (SPY/QQQ, ~1000 triggers, both Jan 2-Jun 3 and Jun 4-Oct 22) the 30m structure meant opposite things:
+  trend setups (flip reclaim / flip rejection / momentum below flip) work when the 30m structure AGREES
+  wall setups (put-wall bounce / call-wall fade) work when the 30m structure is FLAT (a range - the pinning thesis)
+gex_level, wall_reaction and volume_profile are on for ~80-90% of triggers, so they carry little information.
+The engine paper-tracks every trigger this rule passes, whatever its grade, in its own book (kv gex_v2_open /
+gex_v2_log) next to the graded book, to compare live before it replaces the rate.
 """
 from __future__ import annotations
 
@@ -412,6 +420,20 @@ def choose_contract(options: list[OptionQuote], side: str, target_delta: float =
     ok = [o for o in options if o.put_call == pc and o.bid > 0 and o.ask > 0 and o.delta
           and o.spread_pct <= MAX_SPREAD]
     return min(ok, key=lambda o: abs(abs(o.delta) - target_delta)) if ok else None
+
+
+def is_wall_setup(setup: str) -> bool:
+    return "wall" in setup.lower()
+
+
+def setup_aware(idea: Idea) -> tuple[bool, str]:
+    """(passes, why) - the setup-aware rule (module docstring) for an idea that has a trigger."""
+    if not idea.side:
+        return False, "no trigger"
+    s30 = (idea.confluence.get("structure_30m") or {}).get("score", 0)
+    if is_wall_setup(idea.setup):
+        return s30 == 0, "30m structure flat (range)" if s30 == 0 else "wall setup in a trending 30m"
+    return s30 > 0, "30m structure agrees" if s30 > 0 else "trend setup without 30m agreement"
 
 
 def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime,
