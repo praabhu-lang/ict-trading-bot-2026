@@ -371,3 +371,18 @@ def test_engine_records_gex_levels_each_scan(ledger):
     rows = ledger.gex_levels_before(TODAY + timedelta(days=1))
     assert [r["ticker"] for r in rows] == ["SPY"] and rows[0]["put_wall"] and rows[0]["idea"]
     assert not engine.status["errors"]
+
+
+def test_unmanaged_short_gets_an_urgent_alert(ledger):
+    engine, broker, notifier = make_engine(ledger, at(10, 0))
+    broker._fill("VLO", 6, "sell", 421.90)  # a stray sell stop with no shares behind it
+    status = engine.run_cycle(scan=False)
+    assert status["unmanaged_positions"] == ["VLO"]
+    assert "⚠️ Unmanaged SHORT position: VLO" in notifier.sent and "VLO" in broker.pos
+
+
+def test_unmanaged_long_keeps_the_info_alert(ledger):
+    engine, broker, notifier = make_engine(ledger, at(10, 0))
+    broker._fill("XOM", 10, "buy", 110.0)
+    engine.run_cycle(scan=False)
+    assert "ℹ️ Positions not managed by the bot" in notifier.sent

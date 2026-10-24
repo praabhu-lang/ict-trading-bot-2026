@@ -141,14 +141,23 @@ class TradingEngine:
                 reason = "CLOSED_AT_BROKER (price unknown - check broker)"
             pnl = self.ledger.close_trade(t["id"], exit_price, reason, 100.0 if t["asset_class"] == "option" else 1.0)
             self._trade_closed_email(t, exit_price, reason, pnl)
-        unmanaged = [p.symbol for p in positions.values() if p.symbol not in managed]
+        foreign = [p for p in positions.values() if p.symbol not in managed]
+        unmanaged = [p.symbol for p in foreign]
         self.status["unmanaged_positions"] = unmanaged
         if unmanaged:
             today = self.clock.now().date().isoformat()
+            # A short nobody booked is almost always an accident (e.g. a sell stop placed after the shares were
+            # already sold), and it has no stop and unlimited risk - say so loudly.
+            shorts = [p.symbol for p in foreign if p.qty < 0]
+            rows = "".join(
+                f"<li>{html.escape(p.symbol)}: {'SHORT' if p.qty < 0 else 'long'} {abs(p.qty):g} @ ${p.avg_price:,.2f}, "
+                f"P&amp;L ${p.unrealized_pl:+,.2f}</li>" for p in foreign)
+            warn = (f"<p><b>{html.escape(', '.join(shorts))} {'is' if len(shorts) == 1 else 'are'} SHORT with no stop. "
+                    f"Check the broker's order history and buy to cover if it was not intended.</b></p>") if shorts else ""
             self.notifier.send(
-                "ℹ️ Positions not managed by the bot",
-                f"<p>These broker positions were not opened by the bot and will not be auto-closed: "
-                f"{html.escape(', '.join(unmanaged))}</p>",
+                f"⚠️ Unmanaged SHORT position: {', '.join(shorts)}" if shorts else "ℹ️ Positions not managed by the bot",
+                f"{warn}<p>These broker positions are not in the bot's ledger and will not be auto-closed:</p>"
+                f"<ul>{rows}</ul>",
                 dedupe_key=f"unmanaged:{today}:{','.join(sorted(unmanaged))}",
             )
 
