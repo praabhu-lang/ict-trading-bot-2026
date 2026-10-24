@@ -371,3 +371,62 @@ def test_engine_records_gex_levels_each_scan(ledger):
     rows = ledger.gex_levels_before(TODAY + timedelta(days=1))
     assert [r["ticker"] for r in rows] == ["SPY"] and rows[0]["put_wall"] and rows[0]["idea"]
     assert not engine.status["errors"]
+
+
+def _open_swing(ledger, broker, notes="swing: adopted"):
+    broker._fill("VLO", 6, "buy", 448.51)
+    sid = broker.submit_stop("VLO", 6, "sell", 422.47)
+    tid = ledger.open_trade(trade_date="2026-10-16", broker="alpaca_paper", underlying="VLO", symbol="VLO",
+                            asset_class="stock", direction="bull", qty=6, entry_price=448.51, stop_price=422.47,
+                            target_price=489.18, broker_stop_id=sid, broker_stop_price=422.47, notes=notes)
+    return tid, sid
+
+
+def test_swing_stock_is_not_flattened_and_not_counted_as_open(ledger):
+    engine, broker, _ = make_engine(ledger, at(15, 50))
+    tid, _ = _open_swing(ledger, broker)
+    broker.quotes["VLO"] = (432.30, 432.40)
+    status = engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["status"] == "OPEN" and "VLO" in broker.pos
+    assert status["open_trades"] == 0 and status["unmanaged_positions"] == []
+
+
+def test_intraday_stock_is_still_flattened(ledger):
+    engine, broker, _ = make_engine(ledger, at(15, 50))
+    tid, _ = _open_swing(ledger, broker, notes="stock fallback")
+    broker.quotes["VLO"] = (432.30, 432.40)
+    engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["exit_reason"] == "EOD_FLATTEN"
+
+
+def test_swing_target_cancels_the_broker_stop_first(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid, sid = _open_swing(ledger, broker)
+    broker.quotes["VLO"] = (489.50, 489.60)
+    engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["exit_reason"] == "TARGET"
+    assert broker.orders[sid].status == "canceled"
+
+
+def test_swing_broker_stop_fill_is_booked(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid, sid = _open_swing(ledger, broker)
+    broker.trigger_stop(sid, 422.40)
+    engine.run_cycle(scan=False)
+    t = ledger.trade(tid)
+    assert t["exit_reason"] == "STOP_LOSS (broker)" and t["realized_pnl"] == pytest.approx(-156.66)
+
+
+def test_unmanaged_short_gets_an_urgent_alert(ledger):
+    engine, broker, notifier = make_engine(ledger, at(10, 0))
+    broker._fill("VLO", 6, "sell", 421.90)  # a stray sell stop with no shares behind it
+    status = engine.run_cycle(scan=False)
+    assert status["unmanaged_positions"] == ["VLO"]
+    assert "⚠️ Unmanaged SHORT position: VLO" in notifier.sent and "VLO" in broker.pos
+
+
+def test_unmanaged_long_keeps_the_info_alert(ledger):
+    engine, broker, notifier = make_engine(ledger, at(10, 0))
+    broker._fill("XOM", 10, "buy", 110.0)
+    engine.run_cycle(scan=False)
+    assert "ℹ️ Positions not managed by the bot" in notifier.sent

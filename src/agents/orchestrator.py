@@ -30,7 +30,7 @@ from ..strategy import fomc_react as fr
 from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
-from .monitor_agent import momentum_against, option_exit_reason, stock_exit_reason
+from .monitor_agent import intraday, momentum_against, option_exit_reason, stock_exit_reason
 from .news_agent import NewsAgent, llm_veto
 from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_room, session_gate, size_option, size_stock
 
@@ -65,7 +65,7 @@ class TradingEngine:
             self.run_cycle(scan=self._scan_due(now))
             if on_cycle:
                 on_cycle()
-            if self._session_over(now) and not self.ledger.open_trades():
+            if self._session_over(now) and not intraday(self.ledger.open_trades()):
                 log.info("Session over and flat - exiting loop")
                 return
             sleep(max(1.0, cycle_seconds - (time.monotonic() - started)))
@@ -100,7 +100,7 @@ class TradingEngine:
                 self.scan_and_trade(now)
             except Exception as exc:  # noqa: BLE001
                 self._error("scan failed", exc)
-        self.status["open_trades"] = len(self.ledger.open_trades())
+        self.status["open_trades"] = len(intraday(self.ledger.open_trades()))
         if is_trading_day(now.date()) and now >= flatten_time(now, self.s) and not self.status["open_trades"]:
             self.daily_summary(now)
         self.status["data_health"] = self.market.health
@@ -141,14 +141,23 @@ class TradingEngine:
                 reason = "CLOSED_AT_BROKER (price unknown - check broker)"
             pnl = self.ledger.close_trade(t["id"], exit_price, reason, 100.0 if t["asset_class"] == "option" else 1.0)
             self._trade_closed_email(t, exit_price, reason, pnl)
-        unmanaged = [p.symbol for p in positions.values() if p.symbol not in managed]
+        foreign = [p for p in positions.values() if p.symbol not in managed]
+        unmanaged = [p.symbol for p in foreign]
         self.status["unmanaged_positions"] = unmanaged
         if unmanaged:
             today = self.clock.now().date().isoformat()
+            # A short nobody booked is almost always an accident (e.g. a sell stop placed after the shares were
+            # already sold), and it has no stop and unlimited risk - say so loudly.
+            shorts = [p.symbol for p in foreign if p.qty < 0]
+            rows = "".join(
+                f"<li>{html.escape(p.symbol)}: {'SHORT' if p.qty < 0 else 'long'} {abs(p.qty):g} @ ${p.avg_price:,.2f}, "
+                f"P&amp;L ${p.unrealized_pl:+,.2f}</li>" for p in foreign)
+            warn = (f"<p><b>{html.escape(', '.join(shorts))} {'is' if len(shorts) == 1 else 'are'} SHORT with no stop. "
+                    f"Check the broker's order history and buy to cover if it was not intended.</b></p>") if shorts else ""
             self.notifier.send(
-                "ℹ️ Positions not managed by the bot",
-                f"<p>These broker positions were not opened by the bot and will not be auto-closed: "
-                f"{html.escape(', '.join(unmanaged))}</p>",
+                f"⚠️ Unmanaged SHORT position: {', '.join(shorts)}" if shorts else "ℹ️ Positions not managed by the bot",
+                f"{warn}<p>These broker positions are not in the bot's ledger and will not be auto-closed:</p>"
+                f"<ul>{rows}</ul>",
                 dedupe_key=f"unmanaged:{today}:{','.join(sorted(unmanaged))}",
             )
 
@@ -202,6 +211,8 @@ class TradingEngine:
                     log.warning("Quote failed for %s: %s", t["symbol"], exc)
                 reason = force_reason or stock_exit_reason(t, price or 0.0, self.s, now, flatten_at, fading)
                 if reason:
+                    if not self._release_broker_stop(t):
+                        continue  # the broker stop already filled; reconcile() books it next cycle
                     fill = self.execution.close_stock(t["symbol"])
                     self._record_exit(t, fill, reason, 1.0)
 
@@ -292,7 +303,7 @@ class TradingEngine:
         g = session_gate(now, self.s, self.calendar)
         acct = self.broker.account()
         equity = self.s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
-        open_n = len(self.ledger.open_trades())
+        open_n = len(intraday(self.ledger.open_trades()))
         # Bot-only day P&L (the broker account may hold other activity).
         day_pnl = self.ledger.realized_pnl_on(now.date())
         a = account_gate(self.s, equity, len(self.ledger.trades_on(now.date())), open_n, day_pnl)
@@ -562,7 +573,7 @@ class TradingEngine:
         event = self.calendar.active_blackout(now)
         if event:
             reasons.append(f"Event blackout: {event.name}")
-        reasons += account_gate(s, equity, len(self.ledger.trades_on(d)), len(self.ledger.open_trades()),
+        reasons += account_gate(s, equity, len(self.ledger.trades_on(d)), len(intraday(self.ledger.open_trades())),
                                 self.ledger.realized_pnl_on(d)).reasons
         if not s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")

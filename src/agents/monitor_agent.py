@@ -56,10 +56,24 @@ def option_exit_reason(trade: dict, mid: float, s: Settings, now: datetime, flat
     return None
 
 
+SWING_TAG = "swing"
+
+
+def is_swing(trade: dict) -> bool:
+    """Multi-day stock trade: no EOD flatten / momentum fade, not counted against the intraday position limits."""
+    return trade.get("asset_class", "stock") == "stock" and (trade.get("notes") or "").startswith(SWING_TAG)
+
+
+def intraday(trades: list[dict]) -> list[dict]:
+    return [t for t in trades if not is_swing(t)]
+
+
 def stock_exit_reason(trade: dict, price: float, s: Settings, now: datetime, flatten_at: datetime,
                       fading: bool = False) -> str | None:
-    """Broker bracket legs hold the real stop/target; these checks are the backstop."""
-    if now >= flatten_at:
+    """Broker bracket legs hold the real stop/target; these checks are the backstop. Swing trades only exit on
+    their stop / target."""
+    swing = is_swing(trade)
+    if now >= flatten_at and not swing:
         return "EOD_FLATTEN"
     if price <= 0:
         return None
@@ -70,6 +84,6 @@ def stock_exit_reason(trade: dict, price: float, s: Settings, now: datetime, fla
     if target and (price >= target if bull else price <= target):
         return "TARGET"
     in_profit = price > entry if bull else price < entry
-    if s.momentum_exit and fading and in_profit:
+    if s.momentum_exit and fading and in_profit and not swing:
         return "MOMENTUM_FADE"
     return None
