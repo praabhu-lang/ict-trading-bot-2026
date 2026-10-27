@@ -189,6 +189,13 @@ class Settings:
     fomc_exit: str = "15:45"             # time exit, ET
     fomc_fee: float = 1.50               # $ per contract per side
 
+    # --- Last-45-minute fade: PAPER ONLY, XSP 0DTE debit spread held to cash settlement (src/strategy/last45.py) ---
+    l45_paper: bool = True
+    l45_symbol: str = "XSP"              # cash-settled Mini-SPX, daily expiries, $1 strikes
+    l45_budget: float = 300.0            # $ per day: debit x 100 x spreads + fees (one spread is ~$160)
+    l45_min_votes: int = 2               # net fade votes (of 5) needed to trade
+    l45_fee: float = 0.65                # $ per contract per leg, entry only (cash settled)
+
     # --- VRZ universe scan as PAPER trades while first_candle is the strategy (simulated stock trades) ---
     vrz_paper: bool = True
 
@@ -278,6 +285,9 @@ class Settings:
         "fomc_stop_pct": (0.10, 3.0),
         "fomc_rr": (0.5, 5.0),
         "fomc_fee": (0.0, 10.0),
+        "l45_budget": (50.0, 5000.0),
+        "l45_min_votes": (1, 5),
+        "l45_fee": (0.0, 5.0),
     }
 
     @classmethod

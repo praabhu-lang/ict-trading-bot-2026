@@ -27,6 +27,7 @@ from ..data.market import BAR_MINUTES, MarketData
 from ..data.models import MarketDataUnavailable
 from ..strategy import first_candle as fc
 from ..strategy import fomc_react as fr
+from ..strategy import last45 as l45
 from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
@@ -90,6 +91,7 @@ class TradingEngine:
             if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
                 self.status[key] = previous[key]
         for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now),
+                     lambda: self.last45_paper(now),
                      lambda: self.vrz_paper_manage(now), lambda: self.gex_ideas(now, scan)):
             try:
                 step()
@@ -852,6 +854,136 @@ class TradingEngine:
                     "Reason": reason, "SPY entry": rec["entry_ref"], "SPY exit": rec.get("last_ref"), "P&L $": pnl,
                     "All FOMC paper trades $": total}]) + "<p>Simulated only - no broker orders.</p>",
             dedupe_key=f"fomc_paper_close:{rec['date']}",
+        )
+
+    # ------------------------------------------------ last-45-minute fade (paper only)
+    def last45_paper(self, now: datetime) -> None:
+        """Simulated XSP 0DTE debit spread from 15:15 ET, held to the 16:00 cash settlement (src/strategy/last45.py).
+        Never places broker orders: legs filled at the live Schwab ask (long) and bid (short). State: ledger kv
+        last45_paper:<date>; an unsettled spread's date in last45_paper_open (the engine stops before 16:00, so the
+        next cycle settles it); closed trades in last45_paper_log."""
+        s, d = self.s, now.date()
+        pending = self.ledger.get_kv("last45_paper_open")
+        if pending:
+            rec = self.ledger.get_kv(f"last45_paper:{pending}") or {}
+            if rec.get("status") == "OPEN":
+                self._l45_settle(rec, now)
+                self.ledger.set_kv(f"last45_paper:{pending}", rec)
+            if rec.get("status") != "OPEN":
+                self.ledger.set_kv("last45_paper_open", None)
+            if pending == d.isoformat():
+                self.status["last45_paper"] = rec
+        if not s.l45_paper or not is_trading_day(d) or now.time() < l45.SIGNAL_AT:
+            return
+        key = f"last45_paper:{d.isoformat()}"
+        rec = self.ledger.get_kv(key) or {"date": d.isoformat(), "status": "WAITING", "reason": "signal at 15:15 ET"}
+        if rec["status"] == "WAITING":
+            self._l45_enter(rec, now)
+            self.ledger.set_kv(key, rec)
+            if rec["status"] == "OPEN":
+                self.ledger.set_kv("last45_paper_open", rec["date"])
+        self.status["last45_paper"] = rec
+
+    def _l45_enter(self, rec: dict, now: datetime) -> None:
+        s, d = self.s, now.date()
+        if now > l45.confirm_deadline(d):
+            rec.update(status="SKIPPED",
+                       reason="no 15:10-15:25 bar closed our way" if rec.get("side") else "missed the 15:15 signal")
+            return
+        try:
+            bars = day_slice(self.market.bars("SPY", now), d)
+        except MarketDataUnavailable as exc:
+            rec["reason"] = f"SPY bars unavailable: {exc}"[:200]
+            return
+        if "votes" not in rec:                                    # freeze the 15:15 vote
+            score, detail = l45.votes(bars)
+            rec.update(votes=score, vote_detail=detail)
+            if abs(score) < s.l45_min_votes:
+                rec.update(status="SKIPPED", reason=f"net fade vote {score:+d}, need {s.l45_min_votes}")
+                return
+            rec["side"] = "bull" if score > 0 else "bear"
+        confirmed = l45.confirmation(bars, rec["side"], d)
+        if confirmed is None:
+            rec["reason"] = f"{rec['side']} vote {rec['votes']:+d}: waiting for a 5-min bar closing our way"
+            return
+        if now > confirmed + timedelta(minutes=l45.ENTRY_GRACE_MIN):
+            rec.update(status="SKIPPED", reason=f"confirmation at {confirmed:%H:%M} missed")
+            return
+        try:
+            chain = self.market.chain(s.l45_symbol, d, max_dte=0)
+        except MarketDataUnavailable as exc:
+            rec["reason"] = f"{s.l45_symbol} chain unavailable: {exc}"[:200]
+            return
+        pc, long_k, short_k = l45.strikes(chain.spot, rec["side"])
+        legs = {o.strike: o for o in chain.for_expiry(d) if o.put_call == pc and o.strike in (long_k, short_k)}
+        if len(legs) < 2:
+            rec["reason"] = f"no {d} {pc} {long_k:g}/{short_k:g} in the {s.l45_symbol} chain"
+            return
+        long_o, short_o = legs[long_k], legs[short_k]
+        for o in (long_o, short_o):
+            bid, ask = self._option_bid_ask(o.symbol)
+            if bid > 0 and ask > 0:
+                o.bid, o.ask = bid, ask
+        if long_o.ask <= 0 or short_o.bid <= 0:
+            rec["reason"] = "no ask on the long leg / bid on the short leg yet"
+            return
+        debit = round(long_o.ask - short_o.bid, 2)
+        qty = l45.size(debit, s.l45_budget, s.l45_fee)
+        if qty < 1:
+            rec.update(status="SKIPPED", reason=f"debit {debit:.2f}: over the ${s.l45_budget:,.0f} budget "
+                                                f"or under {l45.MIN_EDGE:.2f} left to gain")
+            return
+        rec.update(status="OPEN", reason="", put_call=pc, long=long_o.symbol, short=short_o.symbol, long_k=long_k,
+                   short_k=short_k, long_ask=long_o.ask, short_bid=short_o.bid, debit=debit, qty=qty,
+                   risk=round(debit * 100 * qty + 2 * s.l45_fee * qty, 2), index_at_entry=chain.spot,
+                   spy_at_entry=rec["vote_detail"].get("spy"), entry_ts=now.isoformat(timespec="seconds"),
+                   confirmed=f"{confirmed:%H:%M}")
+        parts = ", ".join(f"{k} {rec['vote_detail'][k]:+d}" for k in ("ema", "last_60m", "vwap", "open", "range"))
+        why = f"vote {rec['votes']:+d} ({parts})"
+        self.ledger.log("INFO", f"Last-45 paper: bought {qty}x {s.l45_symbol} {pc} {long_k:g}/{short_k:g} @ {debit:.2f} {why}")
+        self.notifier.send(
+            f"📝 PAPER {s.l45_symbol} last-45 spread: {qty}x {pc} {long_k:g}/{short_k:g} @ {debit:.2f}",
+            table([{"Signal": why, "Direction": rec["side"], "Buy (ask)": f"{long_o.symbol} {long_o.ask:.2f}",
+                    "Sell (bid)": f"{short_o.symbol} {short_o.bid:.2f}", "Debit": debit, "Spreads": qty,
+                    "Max loss $": rec["risk"], "Max gain $": round((l45.WIDTH - debit) * 100 * qty - 2 * s.l45_fee * qty, 2),
+                    s.l45_symbol: chain.spot}])
+            + "<p>Simulated only - no order was sent to the broker. Held to the 16:00 cash settlement.</p>",
+            dedupe_key=f"last45_paper_open:{d.isoformat()}",
+        )
+
+    def _l45_settle(self, rec: dict, now: datetime) -> None:
+        """Settle at the XSP 15:55 bar close once the session is over; retry while the bar is unavailable."""
+        s, d = self.s, datetime.fromisoformat(rec["date"]).date()
+        if now < market_close_dt(d):
+            return
+        try:
+            bars = day_slice(self.market.bars(s.l45_symbol, now), d)
+        except MarketDataUnavailable as exc:
+            rec["reason"] = f"settlement: {s.l45_symbol} bars unavailable ({exc})"[:200]
+            return
+        last = bars[bars.index.time == l45.SETTLE_BAR]
+        if last.empty:
+            rec["reason"] = f"settlement: waiting for the {s.l45_symbol} 15:55 bar"
+            return
+        index_px = float(last["close"].iloc[0])
+        value = l45.spread_value(rec["put_call"], float(rec["long_k"]), float(rec["short_k"]), index_px)
+        pnl = l45.pnl(float(rec["debit"]), value, int(rec["qty"]), s.l45_fee)
+        long_only = round((l45.intrinsic(rec["put_call"], float(rec["long_k"]), index_px) - float(rec["long_ask"])) * 100
+                          - s.l45_fee, 2)                        # 1 long option alone, for comparison
+        rec.update(status="CLOSED", reason="", settle_px=round(index_px, 2), value=round(value, 2), pnl=pnl,
+                   long_only_pnl=long_only, exit_ts=now.isoformat(timespec="seconds"))
+        history = self.ledger.get_kv("last45_paper_log") or []
+        self.ledger.set_kv("last45_paper_log", history + [dict(rec)])
+        total = round(sum(float(x.get("pnl") or 0) for x in history) + pnl, 2)
+        self.ledger.log("INFO", f"Last-45 paper: settled {rec['put_call']} {rec['long_k']:g}/{rec['short_k']:g} at "
+                                f"{index_px:.2f}, P&L {pnl:+,.2f}")
+        self.notifier.send(
+            f"{'✅' if pnl >= 0 else '🔻'} PAPER {s.l45_symbol} last-45 spread settled {rec['date']} P&L {pnl:+,.2f}",
+            table([{"Spread": f"{rec['qty']}x {rec['put_call']} {rec['long_k']:g}/{rec['short_k']:g}",
+                    "Debit": rec["debit"], f"{s.l45_symbol} entry": rec["index_at_entry"], "Settlement": round(index_px, 2),
+                    "Value": round(value, 2), "P&L $": pnl, "All last-45 paper trades $": total}])
+            + "<p>Simulated only - no broker orders.</p>",
+            dedupe_key=f"last45_paper_close:{rec['date']}",
         )
 
     # ------------------------------------------------ VRZ universe scan (paper only)

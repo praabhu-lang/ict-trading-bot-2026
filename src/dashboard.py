@@ -589,6 +589,12 @@ with tab_set:
         fomc_stop = c[2].number_input("Stop % (SPY)", 0.10, 3.0, settings.fomc_stop_pct, 0.05)
         fomc_rr = c[3].number_input("Target x stop", 0.5, 5.0, settings.fomc_rr, 0.25)
         fomc_qty = c[4].number_input("Contracts", 1, 10, settings.fomc_qty)
+        st.subheader("Last-45 paper spread (simulated, never sent to the broker)")
+        c = st.columns(3)
+        l45_on = c[0].toggle("On ", settings.l45_paper, help="15:15 ET: fade the day's move (5 votes) with an XSP 0DTE "
+                             "debit spread (2 in the money / at the money), held to the 16:00 cash settlement.")
+        l45_budget = c[1].number_input("Budget $ per day", 50.0, 5000.0, float(settings.l45_budget), 50.0)
+        l45_votes = c[2].number_input("Min net votes (of 5)", 1, 5, settings.l45_min_votes)
         st.subheader("Capital & risk")
         cc = st.columns(3)
         start_cap = cc[0].number_input("Options pool $ (first-candle sizing; option profits added back)",
@@ -676,6 +682,7 @@ with tab_set:
                     "fc_nogap_delta": float(sm_nogapd), "fc_skip_fomc_adjacent": sm_adj,
                     "vrz_paper": vrz_on, "fomc_paper": fomc_on, "fomc_delta": float(fomc_delta), "fomc_stop_pct": float(fomc_stop),
                     "fomc_rr": float(fomc_rr), "fomc_qty": int(fomc_qty),
+                    "l45_paper": l45_on, "l45_budget": float(l45_budget), "l45_min_votes": int(l45_votes),
                 })
                 broker_for.clear()
                 st.success("Saved.")

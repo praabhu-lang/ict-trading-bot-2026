@@ -241,6 +241,7 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
         if pre.get("events") and not evs:
             st.caption(", ".join(pre["events"]))
         fomc_paper_panel(led, settings, today)
+        l45_paper_panel(led, settings, today)
 
     st.subheader("Key pre-market levels")
     if pre.get("levels"):
@@ -357,6 +358,7 @@ def trades_page(led) -> None:
     if df.empty:
         st.info("No closed trades yet.")
         fomc_paper_history(led)
+        l45_paper_history(led)
         vrz_paper_history(led)
         return
     c = st.columns(4)
@@ -380,6 +382,7 @@ def trades_page(led) -> None:
                  column_config={"realized_pnl": st.column_config.NumberColumn("P&L $", format="$%.2f")})
     st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(), "trades.csv", "text/csv")
     fomc_paper_history(led)
+    l45_paper_history(led)
     vrz_paper_history(led)
 
 
@@ -489,6 +492,56 @@ def fomc_paper_history(led) -> None:
     st.dataframe(df[cols].iloc[::-1], hide_index=True, width="stretch",
                  column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f"),
                                 "entry_ref": "SPY entry", "last_ref": "SPY exit"})
+
+
+def l45_paper_panel(led, settings, today: date) -> None:
+    """Today page: the simulated last-45-minute XSP spread (src/strategy/last45.py)."""
+    st.subheader("Last-45 paper spread")
+    if not settings.l45_paper:
+        st.caption("Off (Settings → Last-45 paper spread).")
+        return
+    rec = (led.get_kv(f"last45_paper:{today.isoformat()}") if led else None) or {}
+    status = rec.get("status", "WAITING")
+    badge = {"WAITING": "🟡 WAITING", "OPEN": "🟢 OPEN", "CLOSED": "⚪ SETTLED", "SKIPPED": "⚪ SKIPPED"}.get(status, status)
+    st.markdown(f"**{badge}** · simulated {settings.l45_symbol} 0DTE debit spread, no broker orders")
+    if status in ("WAITING", "SKIPPED"):
+        st.caption(rec.get("reason") or "Votes at 15:15 ET (fade the day's move), enters on the first 5-min bar "
+                   "closing that way by 15:30, held to the 16:00 cash settlement.")
+        if rec.get("vote_detail"):
+            st.caption("Votes: " + ", ".join(f"{k} {v:+d}" for k, v in rec["vote_detail"].items()
+                                             if k in ("ema", "last_60m", "vwap", "open", "range")))
+        return
+    c = st.columns(3)
+    c[0].metric(f"{rec.get('qty')}x {rec.get('put_call')} {rec.get('long_k', 0):g}/{rec.get('short_k', 0):g}",
+                rec.get("side", ""), f"vote {rec.get('votes', 0):+d}")
+    c[1].metric("Debit", f"{rec.get('debit', 0):.2f}", f"max loss {money(rec.get('risk', 0))}")
+    if status == "CLOSED":
+        c[2].metric("P&L", money(rec.get("pnl"), True), f"settled {rec.get('settle_px')}")
+    else:
+        c[2].metric(f"{settings.l45_symbol} at entry", f"{rec.get('index_at_entry', 0):.2f}",
+                    f"entered {rec.get('entry_ts', '')[11:16]} ET")
+        st.caption(rec.get("reason") or "Settles at the 16:00 close on the engine's next cycle.")
+
+
+def l45_paper_history(led) -> None:
+    """Trades page: every simulated last-45 spread so far, next to the backtest it should track."""
+    st.subheader("Last-45 paper spreads (simulated XSP)")
+    log = (led.get_kv("last45_paper_log") if led else None) or []
+    if not log:
+        st.caption("None yet. Backtest ($300/day, 1-2 spreads, XSP modelled from SPY 0DTE bars): Jan 2-Jun 3 2026 "
+                   "+$1,130 (71% wins), Jun 4-Oct 26 2026 +$1,954 (81%), 2025 +$1,914 (66%).")
+        return
+    df = pd.DataFrame(log)
+    pnl = df.pnl.astype(float)
+    w, l = pnl[pnl > 0], pnl[pnl <= 0]
+    stat_row([("Trades", str(len(df)), None), ("Net", money(pnl.sum(), True), None),
+              ("Win rate", f"{len(w) / len(df):.0%}", "backtest 71-81%"),
+              ("Long option alone", money(df.long_only_pnl.astype(float).sum(), True) if "long_only_pnl" in df else "—", None)])
+    cols = [c for c in ("date", "side", "votes", "confirmed", "put_call", "long_k", "short_k", "qty", "debit",
+                        "index_at_entry", "settle_px", "value", "pnl", "long_only_pnl") if c in df]
+    st.dataframe(df[cols].iloc[::-1], hide_index=True, width="stretch",
+                 column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f"),
+                                "long_only_pnl": st.column_config.NumberColumn("Long only $", format="$%.2f")})
 
 
 # ------------------------------------------------------------------------------------ How it works
