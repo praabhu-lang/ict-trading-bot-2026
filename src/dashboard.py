@@ -249,7 +249,8 @@ with tab_today:
     def today_live():
         lv = get_ledger()
         status = (lv.get_kv("engine_status") if lv else None) or {}
-        pages.today_page(lv, settings, status, Clock().now(), broker, broker_error, ss)
+        pages.today_page(lv, settings, status, Clock().now(), broker, broker_error, ss,
+                         store.read_json("manual_trades.json", {}) or {})
         st.caption(f"Live · refreshes every 15 s (new trades and closes pop up here) · {datetime.now():%H:%M:%S}")
 
     today_live()

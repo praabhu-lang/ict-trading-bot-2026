@@ -159,7 +159,8 @@ def pools_panel(led, settings, closed: pd.DataFrame, acct_eq: float | None, toda
 
 
 # ------------------------------------------------------------------------------------------- Today
-def today_page(led, settings, engine_status: dict, now: datetime, broker, broker_error, ss) -> None:
+def today_page(led, settings, engine_status: dict, now: datetime, broker, broker_error, ss,
+               manual: dict | None = None) -> None:
     today = now.date()
     fc_today = (led.get_kv(f"fc_today:{today.isoformat()}") if led else None) or {}
     pre = (led.get_kv("fc_premarket") if led else None) or {}
@@ -277,6 +278,37 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
         c[3].metric("P&L", money(pnl, True) if pnl is not None else "—",
                     f"{pnl / (t['entry_price'] * t['qty'] * mult):+.0%}" if pnl is not None else None)
         c[4].metric("Underlying target", f"{t['underlying_target']:.2f}" if t.get("underlying_target") else "—")
+    manual_positions_panel(positions, {t["symbol"] for t in open_trades}, manual or {})
+
+
+def manual_positions_panel(positions: dict, managed: set, manual: dict) -> None:
+    """Broker positions the bot does not manage (not in its ledger): hand-placed spreads booked in the bucket's
+    manual_trades.json, grouped into their spreads, plus anything else found at the broker."""
+    foreign = {s: p for s, p in positions.items() if s not in managed}
+    if not foreign:
+        return
+    st.subheader("Manual positions (not managed by the bot)")
+    rows, seen = [], set()
+    for entry in manual.get("open", []):
+        for sp in entry.get("spreads", []):
+            lg, sh = foreign.get(sp["long"]["symbol"]), foreign.get(sp["short"]["symbol"])
+            if not lg and not sh:
+                continue
+            seen.update({sp["long"]["symbol"], sp["short"]["symbol"]})
+            value = (lg.current_price if lg else 0.0) - (sh.current_price if sh else 0.0)
+            pnl = sum(p.unrealized_pl for p in (lg, sh) if p)
+            rows.append({"position": sp["name"], "qty": sp["qty"], "paid": sp["debit"], "worth now": round(value, 2),
+                         "P&L $": round(pnl, 2), "max loss $": sp.get("max_loss"), "max gain $": sp.get("max_gain"),
+                         "expiry": sp.get("expiry")})
+    for sym, p in foreign.items():
+        if sym not in seen:
+            rows.append({"position": f"{sym} ({'SHORT' if p.qty < 0 else 'long'})", "qty": abs(p.qty),
+                         "paid": p.avg_price, "worth now": p.current_price, "P&L $": round(p.unrealized_pl, 2)})
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, width="stretch",
+                 column_config={"P&L $": st.column_config.NumberColumn("P&L $", format="$%.2f")})
+    st.caption(f"Total {money(float(df['P&L $'].sum()), True)} at broker marks. Placed by hand: the bot will not "
+               "stop or close these. Booked in the bucket's manual_trades.json.")
 
 
 # -------------------------------------------------------------------------------------- Performance
