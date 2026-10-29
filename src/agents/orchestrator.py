@@ -28,6 +28,7 @@ from ..data.models import MarketDataUnavailable
 from ..strategy import first_candle as fc
 from ..strategy import fomc_react as fr
 from ..strategy import last45 as l45
+from ..strategy import qqq_fade as qf
 from ..strategy.indicators import day_slice
 from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
@@ -91,7 +92,7 @@ class TradingEngine:
             if key in previous:  # entry gates are evaluated per 5-min scan; keep showing the latest
                 self.status[key] = previous[key]
         for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now),
-                     lambda: self.last45_paper(now),
+                     lambda: self.last45_paper(now), lambda: self.qqq_fade_paper(now),
                      lambda: self.vrz_paper_manage(now), lambda: self.gex_ideas(now, scan)):
             try:
                 step()
@@ -985,6 +986,154 @@ class TradingEngine:
             + "<p>Simulated only - no broker orders.</p>",
             dedupe_key=f"last45_paper_close:{rec['date']}",
         )
+
+    # ------------------------------------------------ QQQ +2 sigma VWAP fade (paper only)
+    def qqq_fade_paper(self, now: datetime) -> None:
+        """Four simulated books of QQQ 1DTE puts on a +2 sigma VWAP snap-back (src/strategy/qqq_fade.py): flat or
+        scale-in, entered at the signal or after a confirming red candle. Never places broker orders: fills are
+        simulated on live Schwab quotes. State: ledger kv qqq_fade_paper_books (each book's open position, any day),
+        qqq_fade_paper:<date> (every signal and what each book did), qqq_fade_paper_log (closed positions)."""
+        s, d = self.s, now.date()
+        books = self.ledger.get_kv("qqq_fade_paper_books") or {}
+        if any(books.values()):
+            for name, pos in books.items():
+                if pos:
+                    books[name] = self._qf_manage(pos, now)
+            self.ledger.set_kv("qqq_fade_paper_books", books)
+        if not s.qf_paper or not is_trading_day(d) or now < market_open_dt(d) + timedelta(minutes=20):
+            return
+        key = f"qqq_fade_paper:{d.isoformat()}"
+        rec = self.ledger.get_kv(key) or {"date": d.isoformat(), "signals": [], "last_signal_bar": None}
+        if now.time() < qf.TIME_EXIT and now.timestamp() % (BAR_MINUTES * 60) >= SCAN_DELAY_SECONDS:
+            self._qf_scan(rec, books, now)                # after the vendor has finalised the bar that just closed
+            self.ledger.set_kv(key, rec)
+            self.ledger.set_kv("qqq_fade_paper_books", books)
+        self.status["qqq_fade_paper"] = {"open": {k: v["symbol"] for k, v in books.items() if v},
+                                         "signals": len(rec["signals"])}
+
+    def _qf_scan(self, rec: dict, books: dict, now: datetime) -> None:
+        s, d = self.s, now.date()
+        try:
+            bars = day_slice(self.market.bars("QQQ", now), d)
+        except Exception as exc:  # noqa: BLE001 - MarketDataUnavailable or no QQQ feed: a paper step just waits
+            log.warning("QQQ fade paper: bars unavailable (%s)", exc)
+            return
+        for sig in rec["signals"]:                        # confirm entries waiting for the next candle
+            if sig.get("confirm") == "WAITING":
+                self._qf_confirm(sig, bars, books, now)
+        new = [x for x in qf.signals(bars) if x["bar"] > (rec.get("last_signal_bar") or "")]
+        if not new:
+            return
+        rec["last_signal_bar"] = new[-1]["bar"]
+        rec["signals"] += new
+        for x in new[:-1]:
+            x.update(status="SKIPPED", reason="missed (engine not running)")
+        sig = new[-1]
+        if now > qf.bar_close(sig["bar"]) + timedelta(minutes=qf.ENTRY_GRACE_MIN):
+            sig.update(status="SKIPPED", reason="missed (engine not running)")
+            return
+        levels = getattr(self.market, "gexbot_levels", None)
+        g = levels("QQQ", now, view="zero") if levels else None
+        flip = g.gamma_flip if g else None
+        sig.update(zero_gamma=flip, net_gex=round(g.net_gex, 1) if g else None)
+        if s.qf_require_pos_gamma and (flip is None or sig["spot"] <= flip):
+            sig.update(status="SKIPPED", reason="zero gamma unknown" if flip is None else f"below zero gamma {flip:g}")
+            return
+        sig.update(status="SIGNAL", confirm="WAITING", books={})
+        self._qf_enter(sig, [b for b in qf.BOOKS if b.endswith("_now")], books, now)
+
+    def _qf_confirm(self, sig: dict, bars, books: dict, now: datetime) -> None:
+        ok = qf.confirmed(bars, sig["bar"])
+        if ok is None:
+            return
+        sig["confirm"] = "RED" if ok else "GREEN"
+        confirm_books = [b for b in qf.BOOKS if b.endswith("_confirm")]
+        if not ok:
+            sig["books"].update({b: "skipped: next candle green" for b in confirm_books})
+            return
+        if now > qf.bar_close(sig["bar"]) + timedelta(minutes=5 + qf.ENTRY_GRACE_MIN):
+            sig["books"].update({b: "skipped: confirmation missed" for b in confirm_books})
+            return
+        self._qf_enter(sig, confirm_books, books, now)
+
+    def _qf_enter(self, sig: dict, names: list[str], books: dict, now: datetime) -> None:
+        """One simulated ladder fill shared by the books entering now (each skips if it already holds a put)."""
+        s, d = self.s, now.date()
+        free = [b for b in names if not books.get(b)]
+        sig["books"].update({b: "skipped: already holding" for b in names if b not in free})
+        if not free:
+            return
+        try:
+            chain = self.market.chain("QQQ", d, max_dte=5)
+        except MarketDataUnavailable as exc:
+            sig["books"].update({b: f"skipped: chain unavailable ({exc})"[:120] for b in free})
+            return
+        expiry = qf.next_expiry([o.expiry for o in chain.options], d)
+        k = qf.put_strike(chain.spot)
+        opt = next((o for o in chain.options if o.expiry == expiry and o.put_call == "P" and o.strike == k), None)
+        if opt is None:
+            sig["books"].update({b: f"skipped: no {expiry} P {k:g}" for b in free})
+            return
+        bid, ask = self._option_bid_ask(opt.symbol)
+        fill = (self.execution.paper_buy_option(opt.symbol, bid, ask, self._option_bid_ask,
+                                                s.fc_entry_chase_pct, s.fc_entry_chase_rounds)
+                if ask > 0 else {"price": 0.0, "how": "no ask", "seconds": 0.0})
+        if fill["price"] <= 0:
+            sig["books"].update({b: f"skipped: no fill ({fill['how']})" for b in free})
+            return
+        px = fill["price"]
+        for b in free:
+            pos = qf.new_position(b, opt.symbol, px, s.qf_flat_qty)
+            pos.update(date=d.isoformat(), expiry=expiry.isoformat(), strike=k, signal_bar=sig["bar"],
+                       entry_ts=now.isoformat(timespec="seconds"), bid_at_entry=bid, ask_at_entry=ask,
+                       fill_how=fill["how"], fill_seconds=fill["seconds"], saved_vs_ask=round(ask - px, 2),
+                       spread_pct=round(100 * (ask - bid) / ask, 1) if bid > 0 else None,
+                       seen_after_close_s=int(now.timestamp() - qf.bar_close(sig["bar"]).timestamp()),
+                       qqq_at_entry=chain.spot)
+            books[b] = pos
+            sig["books"][b] = f"bought {pos['qty']} @ {px:.2f}"
+        why = f"z {sig['z_prev']:+.2f} -> {sig['z']:+.2f}, VWAP {sig['vwap']}, zero gamma {sig.get('zero_gamma')}"
+        self.ledger.log("INFO", f"QQQ fade paper: {', '.join(free)} bought {opt.symbol} @ {px:.2f} ({fill['how']}; "
+                                f"bid/ask {bid:.2f}/{ask:.2f}; {why})")
+        self.notifier.send(
+            f"📝 PAPER QQQ fade ({', '.join(free)}): {opt.symbol} @ {px:.2f}",
+            table([{"Books": ", ".join(f"{b} {books[b]['qty']}x" for b in free), "Signal": why, "QQQ": chain.spot,
+                    "Bid / ask": f"{bid:.2f} / {ask:.2f}", "Simulated fill": f"{px:.2f} ({fill['how']})"}])
+            + "<p>Simulated only - no order was sent to the broker.</p>",
+            dedupe_key=f"qqq_fade_paper_open:{'+'.join(free)}:{sig['bar']}",
+        )
+
+    def _qf_manage(self, pos: dict, now: datetime) -> dict | None:
+        """Advance one book's position on the live quote; returns it, or None once it is closed and logged.
+        A position left open from an earlier day closes at once."""
+        s = self.s
+        bid, ask = self._option_bid_ask(pos["symbol"])
+        if bid <= 0:
+            pos["note"] = "no bid - exit check waiting"
+            return pos
+        pos.update(last_bid=bid, note="")
+        why = "TIME" if now.date().isoformat() > pos["date"] else qf.update(pos, bid, ask, now)
+        if why is None:
+            return pos
+        fill = self.execution.paper_sell_option(pos["symbol"], bid, ask, self._option_bid_ask,
+                                                urgent=why in ("STOP", "BREAKEVEN"))
+        pnl = qf.close(pos, fill["price"], s.qf_fee)
+        pos.update(exit=fill["price"], exit_how=fill["how"], exit_reason=why, exit_ts=now.isoformat(timespec="seconds"),
+                   pnl=pnl, ret_pct=round(100 * pnl / (pos["paid"] * 100), 1))
+        history = self.ledger.get_kv("qqq_fade_paper_log") or []
+        self.ledger.set_kv("qqq_fade_paper_log", history + [dict(pos)])
+        total = round(sum(float(x.get("pnl") or 0) for x in history if x.get("book") == pos["book"]) + pnl, 2)
+        self.ledger.log("INFO", f"QQQ fade paper {pos['book']}: closed {pos['symbol']} ({why}, {fill['how']}), "
+                                f"P&L {pnl:+,.2f} [{'; '.join(pos['fills'])}]")
+        self.notifier.send(
+            f"{'✅' if pnl >= 0 else '🔻'} PAPER QQQ fade {pos['book']} closed ({why}) P&L {pnl:+,.2f}",
+            table([{"Put": pos["symbol"], "Fills": "; ".join(pos["fills"]),
+                    "Exit": f"{fill['price']:.2f} ({fill['how']})",
+                    "P&L $": pnl, "Return on premium %": pos["ret_pct"], f"All {pos['book']} trades $": total}])
+            + "<p>Simulated only - no broker orders.</p>",
+            dedupe_key=f"qqq_fade_paper_close:{pos['book']}:{pos['entry_ts']}",
+        )
+        return None
 
     # ------------------------------------------------ VRZ universe scan (paper only)
     def vrz_paper_scan(self, now: datetime) -> None:

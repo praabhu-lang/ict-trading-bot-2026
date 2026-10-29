@@ -131,3 +131,17 @@ def test_xsp_bars_take_spy_volume():
     market = MarketData(FakeSchwab(), None)
     xsp, spy = market.bars("XSP", now), market.bars("SPY", now)
     assert xsp["volume"].sum() > 0 and (xsp["volume"] == spy["volume"].reindex(xsp.index)).all()
+
+
+def test_gex_view_selects_the_endpoint():
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return SAMPLE
+
+    paths = []
+    client = GexbotClient(api_key="k")
+    client._get = lambda path, **k: paths.append(path) or Resp()
+    assert client.gex("QQQ").gamma_flip == 776.5 and client.gex("QQQ", "zero").gamma_flip == 776.5
+    assert paths == ["/QQQ/classic/gex_full", "/QQQ/classic/gex_zero"]

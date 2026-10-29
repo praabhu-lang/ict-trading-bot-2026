@@ -65,10 +65,10 @@ class GexbotClient:
         except (MarketDataUnavailable, requests.RequestException):
             return False
 
-    def gex(self, ticker: str) -> GexResult:
-        """Live levels across all expiries. Walls and net GEX use open interest (the classic definition)."""
+    def gex(self, ticker: str, view: str = "full") -> GexResult:
+        """Live levels; view "full" = all expiries, "zero" = 0DTE only. Walls and net GEX use open interest."""
         try:
-            resp = self._get(f"/{ticker}/classic/gex_full")
+            resp = self._get(f"/{ticker}/classic/gex_{view}")
         except requests.RequestException as exc:
             raise MarketDataUnavailable(f"gexbot {ticker}: {exc}") from exc
         if resp.status_code != 200:

@@ -142,6 +142,64 @@ class ExecutionAgent:
             log.info("buy %s chased (ask was %.2f, cap %.2f): %g of %g filled", symbol, ask, cap, filled, qty)
         return Fill(filled, round(cost / filled, 4) if filled else 0.0, ids)
 
+    # ---- paper: what the ladders above would likely get, from live quotes only (no orders are sent)
+    def _paper_ladder(self, symbol: str, side: str, prices: list[float], requote) -> tuple[float, int, float]:
+        """Walk the ladder polling `requote` (symbol -> (bid, ask)); a buy limit counts as filled once the live ask
+        is at or below it, a sell once the live bid is at or above it. Conservative: real limits often fill inside
+        the spread without the far side touching them. Returns (price, step, seconds) or (0.0, -1, seconds)."""
+        waited = 0.0
+        for i, price in enumerate(prices):
+            budget = self.mid_wait if i == 0 else self.wait
+            spent = 0.0
+            while True:
+                try:
+                    bid, ask = requote(symbol)
+                except Exception:  # noqa: BLE001 - no quote this poll
+                    bid, ask = 0.0, 0.0
+                if (side == "buy" and 0 < ask <= price) or (side == "sell" and bid >= price > 0):
+                    return price, i, waited
+                if spent >= budget:
+                    break
+                self.sleep(self.poll)
+                spent += self.poll
+                waited += self.poll
+        return 0.0, -1, waited
+
+    def paper_buy_option(self, symbol: str, bid: float, ask: float, requote, max_chase_pct: float = 0.0,
+                         chase_rounds: int = 0) -> dict:
+        """buy_option simulated: the mid -> ask ladder, then the chase of a market that ran away, capped at the
+        original ask x (1 + max_chase_pct). Returns {price, how, seconds}; price 0.0 when nothing would fill."""
+        if not (bid > 0 and ask >= bid):
+            return {"price": 0.0, "how": "no two-sided quote", "seconds": 0.0}
+        price, step, waited = self._paper_ladder(symbol, "buy", limit_ladder(symbol, bid, ask, "buy"), requote)
+        if price > 0:
+            return {"price": price, "how": "mid" if step == 0 else f"ladder step {step}", "seconds": waited}
+        cap = floor_tick(ask * (1 + max_chase_pct), symbol)
+        for _ in range(chase_rounds if max_chase_pct > 0 else 0):
+            try:
+                fresh = requote(symbol)[1]
+            except Exception:  # noqa: BLE001
+                fresh = 0.0
+            if 0 < fresh <= cap:
+                return {"price": option_tick(fresh, symbol), "how": "chased", "seconds": waited}
+            self.sleep(self.wait)
+            waited += self.wait
+        return {"price": 0.0, "how": f"ran away (ask {ask:.2f}, cap {cap:.2f})", "seconds": waited}
+
+    def paper_sell_option(self, symbol: str, bid: float, ask: float, requote, urgent: bool) -> dict:
+        """sell_option simulated. Urgent (stops): the bid now. Normal: mid -> bid ladder, then the live bid."""
+        if urgent or not (bid > 0 and ask >= bid):
+            return {"price": bid, "how": "bid", "seconds": 0.0}
+        price, step, waited = self._paper_ladder(symbol, "sell", limit_ladder(symbol, bid, ask, "sell", SELL_STEPS),
+                                                 requote)
+        if price > 0:
+            return {"price": price, "how": "mid" if step == 0 else f"ladder step {step}", "seconds": waited}
+        try:
+            last = requote(symbol)[0]
+        except Exception:  # noqa: BLE001
+            last = 0.0
+        return {"price": last if last > 0 else bid, "how": "market (bid)", "seconds": waited}
+
     def sell_option(self, symbol: str, qty: float, bid: float, ask: float, urgent: bool) -> Fill:
         """Exits must complete. Normal: mid stepping down to the bid, then market. Urgent (stops): bid, then market."""
         if bid <= 0 or ask < bid:

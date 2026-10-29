@@ -83,3 +83,45 @@ def test_normal_exit_tries_mid_first_urgent_goes_to_bid_then_market():
     b = Unfilled(0.0, "sell")
     agent(b).sell_option(QQQ, 2, 2.40, 2.60, urgent=True)
     assert [o["price"] for o in b.submitted] == [2.40, 2.40]             # bid limit, then market (fills at the bid)
+
+
+# ---- paper ladders (no orders): a limit counts as filled once the live far side touches it
+def _quotes(*seq):
+    it = iter(seq)
+    last = [seq[-1]]
+
+    def requote(_symbol):
+        last[0] = next(it, last[0])
+        return last[0]
+    return requote
+
+
+def _paper_agent():
+    return ExecutionAgent(FakeBroker(), wait_seconds=6, poll_seconds=1.5, sleep=lambda _: None)
+
+
+def test_paper_buy_fills_at_mid_when_the_ask_comes_down():
+    got = _paper_agent().paper_buy_option("QQQ261028P00700000", 2.00, 2.10, _quotes((2.00, 2.10), (2.01, 2.05)))
+    assert got["price"] == 2.05 and got["how"] == "mid"
+
+
+def test_paper_buy_walks_to_the_ask_then_chases_within_the_cap():
+    agent = _paper_agent()
+    still = _quotes((2.00, 2.10))
+    assert agent.paper_buy_option("QQQ261028P00700000", 2.00, 2.10, still)["how"] == "ladder step 4"   # the ask
+    ran = _quotes(*[(2.10, 2.20)] * 40, (2.20, 2.25))
+    got = agent.paper_buy_option("QQQ261028P00700000", 2.00, 2.10, ran, max_chase_pct=0.10, chase_rounds=3)
+    assert got["how"] == "chased" and got["price"] == 2.20
+    away = _quotes((2.60, 2.70))
+    got = agent.paper_buy_option("QQQ261028P00700000", 2.00, 2.10, away, max_chase_pct=0.10, chase_rounds=3)
+    assert got["price"] == 0.0 and got["how"].startswith("ran away")
+
+
+def test_paper_sell_stop_takes_the_bid_normal_exit_tries_the_mid():
+    agent = _paper_agent()
+    stop = agent.paper_sell_option("QQQ261028P00700000", 1.60, 1.70, _quotes((1.50, 1.60)), urgent=True)
+    assert stop["price"] == 1.60
+    got = agent.paper_sell_option("QQQ261028P00700000", 1.60, 1.70, _quotes((1.60, 1.70), (1.66, 1.72)), urgent=False)
+    assert got["price"] == 1.65 and got["how"] == "mid"
+    got = agent.paper_sell_option("QQQ261028P00700000", 1.60, 1.70, _quotes((1.50, 1.60)), urgent=False)
+    assert got["price"] == 1.50 and got["how"] == "market (bid)"

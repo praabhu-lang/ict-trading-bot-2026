@@ -595,6 +595,14 @@ with tab_set:
                              "debit spread (2 in the money / at the money), held to the 16:00 cash settlement.")
         l45_budget = c[1].number_input("Budget $ per day", 50.0, 5000.0, float(settings.l45_budget), 50.0)
         l45_votes = c[2].number_input("Min net votes (of 5)", 1, 5, settings.l45_min_votes)
+        st.subheader("QQQ fade paper puts (simulated, never sent to the broker)")
+        c = st.columns(3)
+        qf_on = c[0].toggle("On  ", settings.qf_paper,
+                            help="QQQ snaps back inside its +2σ VWAP band (09:45-15:00 ET): four paper books of 1DTE "
+                                 "puts 1 strike in the money - flat or scale-in (1+2+3), at the signal or after a red "
+                                 "confirming candle. All out by 15:00.")
+        qf_gamma = c[1].toggle("Only above 0DTE zero gamma", settings.qf_require_pos_gamma)
+        qf_qty = c[2].number_input("Puts in the flat books", 1, 20, settings.qf_flat_qty)
         st.subheader("Capital & risk")
         cc = st.columns(3)
         start_cap = cc[0].number_input("Options pool $ (first-candle sizing; option profits added back)",
@@ -683,6 +691,7 @@ with tab_set:
                     "vrz_paper": vrz_on, "fomc_paper": fomc_on, "fomc_delta": float(fomc_delta), "fomc_stop_pct": float(fomc_stop),
                     "fomc_rr": float(fomc_rr), "fomc_qty": int(fomc_qty),
                     "l45_paper": l45_on, "l45_budget": float(l45_budget), "l45_min_votes": int(l45_votes),
+                    "qf_paper": qf_on, "qf_require_pos_gamma": qf_gamma, "qf_flat_qty": int(qf_qty),
                 })
                 broker_for.clear()
                 st.success("Saved.")

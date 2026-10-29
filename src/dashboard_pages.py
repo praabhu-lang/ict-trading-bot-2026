@@ -242,6 +242,7 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
             st.caption(", ".join(pre["events"]))
         fomc_paper_panel(led, settings, today)
         l45_paper_panel(led, settings, today)
+        qf_paper_panel(led, settings, today)
 
     st.subheader("Key pre-market levels")
     if pre.get("levels"):
@@ -359,6 +360,7 @@ def trades_page(led) -> None:
         st.info("No closed trades yet.")
         fomc_paper_history(led)
         l45_paper_history(led)
+        qf_paper_history(led)
         vrz_paper_history(led)
         return
     c = st.columns(4)
@@ -383,6 +385,7 @@ def trades_page(led) -> None:
     st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(), "trades.csv", "text/csv")
     fomc_paper_history(led)
     l45_paper_history(led)
+    qf_paper_history(led)
     vrz_paper_history(led)
 
 
@@ -542,6 +545,59 @@ def l45_paper_history(led) -> None:
     st.dataframe(df[cols].iloc[::-1], hide_index=True, width="stretch",
                  column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f"),
                                 "long_only_pnl": st.column_config.NumberColumn("Long only $", format="$%.2f")})
+
+
+def qf_paper_panel(led, settings, today: date) -> None:
+    """Today page: the four simulated QQQ +2 sigma VWAP fade books (src/strategy/qqq_fade.py)."""
+    st.subheader("QQQ fade paper books")
+    if not settings.qf_paper:
+        st.caption("Off (Settings → QQQ fade paper puts).")
+        return
+    books = (led.get_kv("qqq_fade_paper_books") if led else None) or {}
+    held = {k: v for k, v in books.items() if v}
+    if held:
+        rows = [{"book": k, "put": v["symbol"], "held": v["qty"], "bought": v["bought"], "first price": v["entry"],
+                 "bid now": v.get("last_bid"), "fills": "; ".join(v["fills"])} for k, v in held.items()]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption("No open puts. Waiting for QQQ to close back inside its +2σ VWAP band (09:45-15:00 ET), above 0DTE "
+                   "zero gamma. Simulated fills on live quotes, no broker orders.")
+    rec = (led.get_kv(f"qqq_fade_paper:{today.isoformat()}") if led else None) or {}
+    sigs = rec.get("signals") or []
+    if sigs:
+        rows = [{"bar": x["bar"][11:16], "QQQ": x.get("spot"), "z": f"{x.get('z_prev')} → {x.get('z')}",
+                 "zero gamma": x.get("zero_gamma"), "status": x.get("status"), "reason": x.get("reason", ""),
+                 "next candle": x.get("confirm", ""), **(x.get("books") or {})} for x in sigs]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def qf_paper_history(led) -> None:
+    """Trades page: every closed simulated QQQ fade position, compared book by book."""
+    st.subheader("QQQ fade paper books (simulated)")
+    log = (led.get_kv("qqq_fade_paper_log") if led else None) or []
+    if not log:
+        st.caption("None yet. Backtest on 5-min closes, Jun 4-Oct 27 2026 (93 signals): flat 6 now $14.4k (max DD "
+                   "-$5.9k), scale-in now $27.8k (-$1.3k), flat 6 confirm $18.9k (-$2.8k), scale-in confirm $14.1k "
+                   "(-$1.0k). Picked from many variants, so this paper run is the real test.")
+        return
+    df = pd.DataFrame(log)
+    df["pnl"] = df.pnl.astype(float)
+    summary = df.groupby("book").agg(trades=("pnl", "size"), net=("pnl", "sum"),
+                                     win_rate=("pnl", lambda v: (v > 0).mean()), avg=("pnl", "mean"),
+                                     worst=("pnl", "min"), avg_saved_vs_ask=("saved_vs_ask", "mean")).reset_index()
+    summary["max_dd"] = [float((g.pnl.cumsum() - g.pnl.cumsum().cummax()).min()) for _, g in df.groupby("book")]
+    st.dataframe(summary, hide_index=True, width="stretch",
+                 column_config={"net": st.column_config.NumberColumn("Net $", format="$%.0f"),
+                                "avg": st.column_config.NumberColumn("Avg $", format="$%.0f"),
+                                "worst": st.column_config.NumberColumn("Worst $", format="$%.0f"),
+                                "max_dd": st.column_config.NumberColumn("Max DD $", format="$%.0f"),
+                                "win_rate": st.column_config.NumberColumn("Win rate", format="percent"),
+                                "avg_saved_vs_ask": st.column_config.NumberColumn("Saved vs ask $/sh", format="%.3f")})
+    view = df.assign(fills=df.fills.apply("; ".join))
+    cols = [c for c in ("date", "book", "symbol", "entry_ts", "fill_how", "spread_pct", "fills", "exit_reason",
+                        "exit_ts", "ret_pct", "pnl") if c in view]
+    st.dataframe(view[cols].iloc[::-1], hide_index=True, width="stretch",
+                 column_config={"pnl": st.column_config.NumberColumn("P&L $", format="$%.2f")})
 
 
 # ------------------------------------------------------------------------------------ How it works

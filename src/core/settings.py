@@ -196,6 +196,12 @@ class Settings:
     l45_min_votes: int = 2               # net fade votes (of 5) needed to trade
     l45_fee: float = 0.65                # $ per contract per leg, entry only (cash settled)
 
+    # --- QQQ +2 sigma VWAP fade: PAPER ONLY, four books of 1DTE puts 1 strike ITM (src/strategy/qqq_fade.py) ---
+    qf_paper: bool = True
+    qf_flat_qty: int = 6                 # puts in the two flat books (the scale-in books build up to 1+2+3)
+    qf_require_pos_gamma: bool = True    # only above the 0DTE zero-gamma level (gexbot); skip when unknown
+    qf_fee: float = 0.65                 # $ per contract per side
+
     # --- VRZ universe scan as PAPER trades while first_candle is the strategy (simulated stock trades) ---
     vrz_paper: bool = True
 
@@ -288,6 +294,8 @@ class Settings:
         "l45_budget": (50.0, 5000.0),
         "l45_min_votes": (1, 5),
         "l45_fee": (0.0, 5.0),
+        "qf_flat_qty": (1, 20),
+        "qf_fee": (0.0, 5.0),
     }
 
     @classmethod

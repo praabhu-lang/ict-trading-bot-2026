@@ -20,6 +20,7 @@ from .schwab import SchwabClient
 
 log = logging.getLogger(__name__)
 BAR_MINUTES = 5
+BAR_SETTLE_SECONDS = 20   # a bar fetched sooner after its close may not be final yet (see bars())
 
 
 def regular_session(df: pd.DataFrame) -> pd.DataFrame:
@@ -117,11 +118,26 @@ class MarketData:
     def bars(self, symbol: str, now: datetime, days: int = 6) -> pd.DataFrame:
         """Closed 5-minute regular-session bars for today and the prior `days` sessions."""
         bar_slot = int(now.timestamp() // (BAR_MINUTES * 60))
-        df = self._cached(("bars", symbol, days, bar_slot), 300,
+        key = ("bars", symbol, days, bar_slot)
+        df = self._cached(key, 300,
                           lambda: self._fetch_bars(symbol, now.date(), days, min(now, market_close_dt(now.date()))))
+        if self._bar_unsettled(df, now, bar_slot):
+            self._cache.pop(key, None)        # refetch next call instead of keeping a stale slot for 5 minutes
         if symbol in VOLUME_PROXY:  # the volume-spike filter needs volume: XSP takes SPY's
             df = with_proxy_volume(df, self.bars(VOLUME_PROXY[symbol], now, days))
         return df
+
+    @staticmethod
+    def _bar_unsettled(df: pd.DataFrame, now: datetime, bar_slot: int) -> bool:
+        """During the session: fetched within BAR_SETTLE_SECONDS of a bar's close (the vendor may still be
+        finalising it), or the bar that just closed is missing."""
+        d = now.date()
+        slot_start = bar_slot * BAR_MINUTES * 60
+        if not market_open_dt(d).timestamp() + BAR_MINUTES * 60 <= slot_start <= market_close_dt(d).timestamp():
+            return False
+        if now.timestamp() - slot_start < BAR_SETTLE_SECONDS:
+            return True
+        return df.empty or df.index[-1].timestamp() < slot_start - BAR_MINUTES * 60
 
     def _fetch_bars(self, symbol: str, last_day, days: int, now: datetime) -> pd.DataFrame:
         start_day = last_day
@@ -213,16 +229,16 @@ class MarketData:
         self.health["quotes:schwab"] = "ok"
         return bid, ask
 
-    def gexbot_levels(self, symbol: str, now: datetime):
+    def gexbot_levels(self, symbol: str, now: datetime, view: str = "full"):
         """Live GEX from gexbot.com, or None when not configured / ticker not covered / request failed.
-        XSP uses the SPX levels scaled by 1/10 (GEX_PROXY)."""
+        view "full" = all expiries, "zero" = 0DTE only. XSP uses the SPX levels scaled by 1/10 (GEX_PROXY)."""
         source, scale = GEX_PROXY.get(symbol, (symbol, 1.0))
         if self.gexbot is None or not self.gexbot.supports(source):
             return None
 
         def fetch():
             try:
-                g = self.gexbot.gex(source)
+                g = self.gexbot.gex(source, view) if view != "full" else self.gexbot.gex(source)
                 if scale != 1.0:
                     g = scale_levels(g, scale)
                 self.health["gex:gexbot"] = "ok"
@@ -230,7 +246,7 @@ class MarketData:
             except MarketDataUnavailable as exc:
                 self.health["gex:gexbot"] = f"error: {exc}"[:200]
                 return None
-        return self._cached(("gexbot", symbol, int(now.timestamp() // 60)), 60, fetch)
+        return self._cached(("gexbot", symbol, view, int(now.timestamp() // 60)), 60, fetch)
 
 
 def scale_levels(g: GexResult, k: float) -> GexResult:
