@@ -23,7 +23,3 @@ upsert ict-biotech-scan   "0,30 7 * * 1-5"  ai-trading-biotech   # paper: pre-ma
 upsert ict-biotech-scan8  "0 8 * * 1-5"     ai-trading-biotech   # ... and 08:00
 upsert ict-biotech-settle "30 16 * * 1-5"   ai-trading-biotech   # paper: settle on the regular-session bar
 
-for old in ai-trading-postopen-trigger ai-trading-premarket-trigger ai-trading-premarket-schedule \
-           ai-trading-postopen-schedule ai-trading-cron; do
-  gcloud scheduler jobs pause "$old" --project "$PROJECT" --location "$REGION" 2>/dev/null && echo "paused $old" || true
-done
