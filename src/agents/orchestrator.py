@@ -26,6 +26,7 @@ from ..core.settings import OPTIONS_ONLY, Settings
 from ..data.market import BAR_MINUTES, MarketData
 from ..data.models import MarketDataUnavailable
 from ..strategy import first_candle as fc
+from ..strategy.gex_plan import BROKER_TAG as GEX_TAG
 from ..strategy import fomc_react as fr
 from ..strategy import last45 as l45
 from ..strategy import qqq_fade as qf
@@ -179,7 +180,7 @@ class TradingEngine:
             underlying_px = float(today_bars["close"].iloc[-1]) if today_bars is not None and len(today_bars) else None
 
             if t["asset_class"] == "option":
-                if (t.get("notes") or "").startswith(fc.STRATEGY_TAG):
+                if (t.get("notes") or "").startswith((fc.STRATEGY_TAG, GEX_TAG)):
                     bid, ask = self._option_bid_ask(t["symbol"])
                 else:
                     try:
@@ -195,6 +196,10 @@ class TradingEngine:
                     reason = force_reason or self._first_candle_exit(t, today_bars, now, flatten_at)
                     if not reason:
                         continue                     # no stop loss in this strategy: no broker stop to sync
+                elif (t.get("notes") or "").startswith(GEX_TAG):
+                    reason = force_reason or self._gex_broker_exit(t, now, flatten_at, underlying_px)
+                    if not reason:
+                        continue                     # stop / target are on the underlying, checked every cycle
                 else:
                     reason = force_reason or option_exit_reason(t, mid, self.s, now, flatten_at, underlying_px, fading)
                     if not reason:
@@ -1277,7 +1282,11 @@ class TradingEngine:
         open and the learned gate's verdict (src/strategy/gex_learn.py).
         settings.gex_flip_rules: classic (flip setups as before) | shadow (classic trades; the strict flip rules,
         gex_plan.strict_idea, are tracked in their own book gex_strict_open / gex_strict_log) | strict (the classic
-        flip setups are dropped and the strict ones trade in the main book)."""
+        flip setups are dropped and the strict ones trade in the main book).
+        settings.gex_confirm_rules: off | shadow (flip / momentum ideas that pass gex_plan.confirm are tracked in
+        gex_confirm_open / gex_confirm_log; every main-book record carries its verdict in "confirm") | enforce (those
+        setups enter the main book only once confirmed). Confirmation needs SPY/QQQ/SPX in this scan, so all tickers
+        are analysed before any idea opens."""
         if not self.s.gex_ideas or not is_trading_day(now.date()):
             return
         from ..strategy import gex_plan as gp
@@ -1286,15 +1295,18 @@ class TradingEngine:
         mode = self.s.gex_flip_rules
         keep, closed = self._gex_manage(self.ledger.get_kv("gex_ideas_open") or [], now)
         s_keep, s_closed = self._gex_manage(self.ledger.get_kv("gex_strict_open") or [], now)
+        c_mode = self.s.gex_confirm_rules
+        c_keep, c_closed = self._gex_manage(self.ledger.get_kv("gex_confirm_open") or [], now)
         if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
             names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
             levels, gates = [], self.ledger.get_kv("gex_gate") or {}
-            for ticker in names:
-                r = gp.analyse(self.market, self.news, ticker, now)
-                idea, strict = r.get("idea"), r.get("strict")
-                if not idea:
-                    continue
-                p = r["profile"]
+            results = [(t, r) for t, r in ((t, gp.analyse(self.market, self.news, t, now)) for t in names)
+                       if r.get("idea")]
+            regimes = {t: gp.regime(r["profile"]) for t, r in results}
+            extra = self._vix_tags()
+            for ticker, r in results:
+                idea, strict, p = r["idea"], r.get("strict"), r["profile"]
+                today_bars = (r.get("mtf") or {}).get("today")
                 levels.append({"trade_date": today, "ticker": ticker, "ts": now.isoformat(timespec="seconds"),
                                "expiry": p.expiry.isoformat(), "weight": p.weight, "spot": p.spot,
                                "gamma_flip": p.gex.gamma_flip, "put_wall": p.gex.put_wall, "call_wall": p.gex.call_wall,
@@ -1304,9 +1316,19 @@ class TradingEngine:
                 if strict is not None and mode == "strict":
                     main.append(strict)
                 for x in main:
-                    self._gex_open(x, p, now, keep, gates, "gex_idea")
+                    why = gp.confirm(x, p, today_bars, now, regimes) if c_mode != "off" and x.status == "ACTIVE" else ""
+                    if why and c_mode == "enforce":
+                        continue
+                    self._gex_open(x, p, now, keep, gates, "gex_idea", {**extra, "confirm": why})
+                    if c_mode == "shadow" and not why and x.setup in gp.CONFIRM_SETUPS:
+                        self._gex_open(x, p, now, c_keep, gates, "gex_confirm", extra)
                 if strict is not None and mode == "shadow":
-                    self._gex_open(strict, p, now, s_keep, gates, "gex_strict")
+                    self._gex_open(strict, p, now, s_keep, gates, "gex_strict", extra)
+                if self.s.gex_broker:
+                    for x in main + ([strict] if strict is not None and mode == "shadow" else []):
+                        if not gp.broker_filter(x, p, now, gp.confirm(x, p, today_bars, now, regimes)):
+                            self._gex_broker_enter(x, now)
+                            break
             self.ledger.record_gex_levels(levels)
         self.ledger.set_kv("gex_ideas_open", keep)
         if closed:
@@ -1314,6 +1336,9 @@ class TradingEngine:
         self.ledger.set_kv("gex_strict_open", s_keep)
         if s_closed:
             self.ledger.set_kv("gex_strict_log", (self.ledger.get_kv("gex_strict_log") or []) + s_closed)
+        self.ledger.set_kv("gex_confirm_open", c_keep)
+        if c_closed:
+            self.ledger.set_kv("gex_confirm_log", (self.ledger.get_kv("gex_confirm_log") or []) + c_closed)
         self.status["gex_ideas_open"] = len(keep)
 
     def _gex_manage(self, book: list[dict], now: datetime) -> tuple[list[dict], list[dict]]:
@@ -1347,7 +1372,84 @@ class TradingEngine:
             closed.append(_close_gex(rec, now, o.bid, spot, reason))
         return keep, closed
 
-    def _gex_open(self, idea, p, now: datetime, book: list[dict], gates: dict, key: str) -> None:
+    def _gex_broker_enter(self, idea, now: datetime) -> bool:
+        """Buy a broker_filter idea's contract (settings.gex_broker_qty) and book it in the ledger (notes gex_idea|...)
+        so reconcile / manage_exits own it. Paper broker only, auto_trade on, one per ticker per day, reserve kept."""
+        s, d = self.s, now.date()
+        if not s.auto_trade or not self.broker.is_paper:
+            return False
+        if any(t["underlying"] == idea.ticker and (t.get("notes") or "").startswith(GEX_TAG)
+               for t in self.ledger.open_trades()):
+            return False
+        if self.calendar.active_blackout(now):
+            return False
+        bid, ask = self._option_bid_ask(idea.contract)
+        qty = int(s.gex_broker_qty)
+        try:
+            room = reserve_room(s, self.broker.account().equity, self.broker.positions())
+        except Exception as exc:  # noqa: BLE001 - cannot verify the reserve: do not trade
+            self._error("GEX broker reserve check failed", exc)
+            return False
+        if not (bid > 0 and ask >= bid) or ask * 100 * qty > room:
+            self.ledger.log("INFO", f"GEX broker skip {idea.contract}: bid/ask {bid}/{ask}, reserve room {room:,.0f}")
+            return False
+        if not self.ledger.alert_once(f"gex_broker:{d.isoformat()}:{idea.ticker}"):
+            return False
+        fill = self.execution.buy_option(idea.contract, qty, bid, ask)
+        if not fill.filled:
+            self._error(f"GEX entry {idea.contract} did not fill", RuntimeError("no fill"))
+            return False
+        direction = "bear" if idea.side == "PUT" else "bull"
+        self.ledger.open_trade(
+            trade_date=d.isoformat(), broker=self.broker.name, underlying=idea.ticker, symbol=idea.contract,
+            asset_class="option", direction=direction, qty=fill.qty, entry_price=fill.avg_price,
+            underlying_stop=idea.stop, underlying_target=idea.target, signal_score=idea.rate,
+            entry_order_id=fill.order_ids[-1],
+            notes=f"{GEX_TAG}|{idea.setup}|grade {idea.grade}|level {idea.level}|exp {idea.expiry}",
+        )
+        self.notifier.send(
+            f"🚀 OPENED {idea.contract} x{fill.qty:g} @ {fill.avg_price:.2f} (GEX {idea.side})",
+            table([{"Underlying": idea.ticker, "Setup": idea.setup, "Grade": idea.grade, "Convergence": idea.rate,
+                    "Contract": idea.contract, "Qty": fill.qty, "Fill": fill.avg_price,
+                    "Underlying stop": idea.stop, "Underlying target": idea.target,
+                    "Broker": f"{self.broker.name}{' (paper)' if self.broker.is_paper else ' (LIVE)'}"}])
+            + f"<p>Exits: underlying at the stop or target, else {s.flatten_minutes_before_close} min before the "
+              f"close. No premium stop (1 contract, premium is the risk).</p>",
+        )
+        return True
+
+    def _gex_broker_exit(self, t: dict, now: datetime, flatten_at: datetime, bar_px: float | None) -> str | None:
+        """STOP_LOSS / TARGET when the underlying (live quote, else the last 5-min close) reaches the idea's levels."""
+        if now >= flatten_at:
+            return "EOD_FLATTEN"
+        try:
+            px = (self.market.live_prices([t["underlying"]]).get(t["underlying"]) or {}).get("price") or bar_px
+        except Exception:  # noqa: BLE001
+            px = bar_px
+        stop, target = t.get("underlying_stop"), t.get("underlying_target")
+        if not px or stop is None or target is None:
+            return None
+        bear = t["direction"] == "bear"
+        if (px >= stop) if bear else (px <= stop):
+            return "STOP_LOSS"
+        if (px <= target) if bear else (px >= target):
+            return "TARGET"
+        return None
+
+    def _vix_tags(self) -> dict:
+        """{vix, vix_vs_open, vix_chg} from one Schwab quote, {} when unavailable - recorded on GEX paper ideas."""
+        try:
+            q = self.market.schwab.quotes(["$VIX"]).get("$VIX") or {} if self.market.schwab else {}
+        except Exception:  # noqa: BLE001 - a tag only
+            return {}
+        last, opn = float(q.get("lastPrice") or 0), float(q.get("openPrice") or 0)
+        if last <= 0:
+            return {}
+        return {"vix": last, "vix_vs_open": round(last - opn, 2) if opn else None,
+                "vix_chg": q.get("netChange")}
+
+    def _gex_open(self, idea, p, now: datetime, book: list[dict], gates: dict, key: str,
+                  extra: dict | None = None) -> None:
         """Append an ACTIVE idea to `book` (one open idea per ticker, first of each setup per day), risk-sized."""
         from ..strategy import gex_learn as gl
 
@@ -1367,7 +1469,7 @@ class TradingEngine:
                      "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
                      "spot": p.spot, "stop": idea.stop, "target": idea.target, **snap,
                      "risk_1c": risk_1c, "qty": qty, "gate": gate, "gate_mode": self.s.gex_gate_mode,
-                     "votes": {k: v["score"] for k, v in idea.confluence.items()}})
+                     "votes": {k: v["score"] for k, v in idea.confluence.items()}, **(extra or {})})
 
     def _llm_recap(self, now: datetime, closed, total, month, sigs, plan, vrz, gex) -> str | None:
         llm = getattr(self.news, "llm", None)
@@ -1487,6 +1589,21 @@ class TradingEngine:
                             f"{sum(float(x.get('pnl_sized') or 0) for x in strict_today):+,.2f} · "
                             f"classic flip: {len(classic)} trades, {sum(float(x.get('R') or 0) for x in classic):+.1f}R, "
                             f"{sum(float(x.get('pnl_sized', x['pnl']) or 0) for x in classic):+,.2f}</p>")
+        confirm_today = [x for x in (self.ledger.get_kv("gex_confirm_log") or []) if x["date"] == now.date().isoformat()]
+        if confirm_today or (gex_today and self.s.gex_confirm_rules == "shadow"):
+            from ..strategy.gex_plan import CONFIRM_SETUPS
+            unconf = [x for x in gex_today if x["setup"] in CONFIRM_SETUPS]
+            plan_html += ("<h3>Confirmation rules (shadow, not in the totals above)</h3>"
+                          + (table([{"Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"],
+                                     "Time": str(x.get("opened", ""))[11:16], "VIX": x.get("vix"), "Qty": x.get("qty"),
+                                     "Entry": x["entry"], "Exit": x["exit"], "Reason": x["reason"], "R": x.get("R"),
+                                     "P&L $": x.get("pnl_sized")} for x in confirm_today])
+                             if confirm_today else "<p>No confirmed flip / momentum idea today.</p>")
+                          + f"<p>Confirmed: {len(confirm_today)} trades, "
+                            f"{sum(float(x.get('R') or 0) for x in confirm_today):+.1f}R · "
+                            f"same setups in the main book: {len(unconf)} trades, "
+                            f"{sum(float(x.get('R') or 0) for x in unconf):+.1f}R, "
+                            f"{sum(1 for x in unconf if x.get('confirm'))} of them unconfirmed at entry</p>")
         recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
         if recap:
             plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html

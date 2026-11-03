@@ -43,6 +43,8 @@ GEX_GATE_MODES = {"off": "Off (trade every ACTIVE idea)", "shadow": "Shadow (rec
                   "enforce": "Enforce (losing setups get 0 contracts, still tracked)"}
 GEX_FLIP_RULES = {"classic": "Classic (flip + 15 min drift)", "shadow": "Shadow (classic trades, strict tracked aside)",
                   "strict": "Strict (test, rejection / reclaim close, confirmation bar, 5m momentum)"}
+GEX_CONFIRM_RULES = {"off": "Off", "shadow": "Shadow (classic trades, confirmed tracked aside)",
+                     "enforce": "Enforce (flip / momentum setups trade only once confirmed)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -210,6 +212,9 @@ class Settings:
     gex_risk_per_idea: float = 100.0     # $ each idea risks (stop on the underlying x delta + spread), not 1 contract
     gex_gate_mode: str = "shadow"        # off | shadow | enforce - learned per-setup on/off (src/strategy/gex_learn.py)
     gex_flip_rules: str = "shadow"       # classic | shadow | strict - confirmed flip rejection / reclaim (gex_plan)
+    gex_confirm_rules: str = "shadow"    # off | shadow | enforce - 2 closes past the flip + SPY/QQQ/SPX agree (gex_plan)
+    gex_broker: bool = False             # send gex_plan.broker_filter ideas to the (paper) broker, booked in the ledger
+    gex_broker_qty: int = 1
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -339,6 +344,8 @@ class Settings:
             s.gex_gate_mode = "shadow"
         if s.gex_flip_rules not in GEX_FLIP_RULES:
             s.gex_flip_rules = "shadow"
+        if s.gex_confirm_rules not in GEX_CONFIRM_RULES:
+            s.gex_confirm_rules = "shadow"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

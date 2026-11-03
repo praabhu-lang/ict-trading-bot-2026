@@ -28,7 +28,7 @@ from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
 from src import dashboard_gex as gex_tab  # noqa: E402
 from src import dashboard_pages as pages  # noqa: E402
-from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
+from src.core.settings import BROKERS, DEFAULT_UNIVERSE, FC_MODES, GEX_CONFIRM_RULES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -552,6 +552,18 @@ with tab_set:
                                   help="Strict: the flip must be tested, a candle must reject (or reclaim) it, the next "
                                   "close must confirm, and 5-min momentum must agree. Shadow trades classic and tracks "
                                   "strict on the side (GEX tab, day summary).")
+        gex_confirm = st.selectbox("GEX ideas: confirmation rules", list(GEX_CONFIRM_RULES),
+                                   index=list(GEX_CONFIRM_RULES).index(settings.gex_confirm_rules),
+                                   format_func=GEX_CONFIRM_RULES.get,
+                                   help="Flip and momentum ideas only from 10:15, after two 5-min closes past the flip, "
+                                   "with SPY, QQQ and SPX all in the trade's gamma regime. Shadow tracks the confirmed "
+                                   "ones in their own book (GEX tab, day summary); enforce trades only those.")
+        gex_broker = st.toggle(f"GEX ideas: send the SPY/QQQ confirmed-put slice to the broker "
+                               f"({settings.gex_broker_qty} contract, paper account only)", settings.gex_broker,
+                               help="Same-day SPY / QQQ puts (call-wall fade, flip rejection, momentum below the flip) "
+                               "that pass the confirmation rules, 11:30-14:00 ET. Booked in the ledger and managed by "
+                               "the bot: out when the underlying hits the idea's stop or target, else at the flatten "
+                               "time. Its P&L counts in the options pool. Everything else stays paper-tracked.")
         st.subheader("Strategy")
         strat = st.selectbox("Strategy", list(STRATEGIES), index=list(STRATEGIES).index(settings.strategy),
                              format_func=STRATEGIES.get)
@@ -668,6 +680,7 @@ with tab_set:
                 save_control({
                     "broker": broker_choice, "auto_trade": auto_trade, "universe": universe, "news_llm_mode": news_llm,
                     "gex_risk_per_idea": float(gex_risk), "gex_gate_mode": gex_gate, "gex_flip_rules": gex_flip,
+                    "gex_confirm_rules": gex_confirm, "gex_broker": bool(gex_broker),
                     "starting_capital": float(start_cap), "stock_capital": float(stock_cap),
                     "reserve_capital": float(reserve_cap),
                     "risk_per_trade_pct": risk / 100, "options_allocation_pct": pool / 100,

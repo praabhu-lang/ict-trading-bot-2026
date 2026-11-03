@@ -37,6 +37,26 @@ last STRICT_BARS closed 5-min bars:
        Stop below the lowest low from the last close under the flip.
   Stop buffer 0.1 x near; targets as classic. Convergence is recorded (grade A >= 75, else B) but only the 30m
   structure veto (> MAX_AGAINST against) blocks - the confirmation replaces the score.
+
+Confirmation rules (confirm; settings.gex_confirm_rules: off | shadow | enforce) for the flip and momentum setups
+(CONFIRM_SETUPS). Nov 2 2026 (flip broke after a 2.5 h pin, SPY/QQQ/SPX together) paid 2-5R; Nov 3 (price sat on
+the flip, SPX below its flip but SPY/QQQ above) stopped out every flip touch. An idea is confirmed when
+  time      at or after CONFIRM_FIRST (opening flip touches whipsaw)
+  break     the last CONFIRM_BARS closed 5-min bars all closed beyond the flip on the trade side, the latest at least
+            CONFIRM_DIST x near past it (skipped for "no flip in range" momentum)
+  indexes   SPY, QQQ and SPX are all in the trade's gamma regime (PUT: below their own flip, CALL: above)
+VIX is recorded on each paper record (vix, vix_vs_open) but is not a rule yet.
+
+Broker orders (broker_filter; settings.gex_broker). Only the slice that held up in the Oct 19 - Nov 3 2026 paper
+book goes to the broker (the bot's Alpaca paper account, booked in the ledger with notes "gex_idea|..."):
+SPY / QQQ, PUT setups in BROKER_SETUPS, a same-day contract, BROKER_FROM-BROKER_TO ET, passing confirm.
+settings.gex_broker_qty contracts. Exits (orchestrator._gex_broker_exit): the underlying at the idea's stop or
+target, else the flatten time. Every idea is still paper-tracked as before.
+
+Levels vs contract expiry. Levels (flip, walls, expected move) always come from today's expiry when there is one
+(level_expiry); only the traded contract moves to the next expiry after AUTO_1DTE_AFTER (pick_expiry). The next
+expiry's book is put-heavy and far from today's hedging: switching the levels to it at 14:00 moved SPY's flip from
+755 to 766-768 and QQQ's from 685 to 715-719 (Nov 3 2026), or dropped it entirely.
 """
 from __future__ import annotations
 
@@ -57,6 +77,14 @@ FALLBACK = ["TSLA", "NVDA", "AAPL", "MSFT", "AMD", "NFLX", "GOOGL", "META", "AMZ
 CHAIN_DAYS = 8                            # chain window: next expiry even for Friday-only weeklies
 AUTO_1DTE_AFTER = time(14, 0)             # 0DTE gamma and premium both collapse late in the day
 FIRST_IDEA = time(9, 45)
+CONFIRM_FIRST = time(10, 15)
+CONFIRM_BARS = 2
+CONFIRM_DIST = 0.5
+INDEXES = ("SPY", "QQQ", "SPX")
+BROKER_TAG = "gex_idea"
+BROKER_TICKERS = ("SPY", "QQQ")
+BROKER_FROM = time(11, 30)
+BROKER_TO = time(14, 0)
 LAST_IDEA = time(15, 30)
 TARGET_DELTA = 0.40
 MAX_SPREAD = 0.15
@@ -70,7 +98,11 @@ STRICT_TAG = 0.25         # within this x near of the flip counts as a test
 STRICT_PUT = "Rejected at gamma flip, confirmed (negative gamma)"
 STRICT_CALL = "Gamma-flip reclaim, confirmed"
 CLASSIC_FLIP = ("Rejected at gamma flip (negative gamma)", "Gamma-flip reclaim")
-EXPIRY_MODES = {"auto": "Auto (0DTE until 2 pm ET, then 1DTE)", "0dte": "0DTE", "1dte": "1DTE"}
+CONFIRM_SETUPS = CLASSIC_FLIP + ("Momentum below flip (negative gamma)", "Momentum, negative gamma (no flip in range)",
+                                 STRICT_PUT, STRICT_CALL)
+BROKER_SETUPS = ("Call-wall fade (positive gamma)", "Rejected at gamma flip (negative gamma)",
+                 "Momentum below flip (negative gamma)", STRICT_PUT)
+EXPIRY_MODES = {"auto": "Auto (0DTE levels all day; the contract is 1DTE after 2 pm ET)", "0dte": "0DTE", "1dte": "1DTE"}
 WEIGHTS = {"oi": "Open interest (yesterday's positioning)", "volume": "Today's volume (intraday flow)"}
 
 
@@ -88,6 +120,16 @@ class Profile:
     expected_move: float
     pc_volume: float | None               # today's put / call volume on this expiry
     weight: str = "oi"                    # what the gamma was weighted by (volume when Schwab has no OI)
+    trade_expiry: date | None = None      # contract expiry when it differs from the levels' (auto after 2 pm)
+    trade_dte: int | None = None
+
+    @property
+    def trade_exp(self) -> date:
+        return self.trade_expiry or self.expiry
+
+    @property
+    def trade_days(self) -> int:
+        return self.dte if self.trade_dte is None else self.trade_dte
 
 
 @dataclass
@@ -158,6 +200,14 @@ def pick_expiry(chain: OptionChain, now: datetime, mode: str = "auto") -> date |
     return later[0] if later else expiries[0]
 
 
+def level_expiry(chain: OptionChain, now: datetime, mode: str = "auto") -> date | None:
+    """The expiry the levels come from: today's in auto mode whenever the chain has one, else pick_expiry."""
+    today = now.date()
+    if mode == "auto" and any(o.expiry == today for o in chain.options):
+        return today
+    return pick_expiry(chain, now, mode)
+
+
 def expected_move(options: list[OptionQuote], spot: float, now: datetime) -> float:
     """ATM straddle mid; falls back to spot x IV x sqrt(time) when the straddle has no quotes."""
     strikes = sorted({o.strike for o in options}, key=lambda k: abs(k - spot))
@@ -175,8 +225,8 @@ def expected_move(options: list[OptionQuote], spot: float, now: datetime) -> flo
 
 
 def profile(chain: OptionChain, now: datetime, mode: str = "auto", weight: str = "oi") -> Profile | None:
-    expiry = pick_expiry(chain, now, mode)
-    if expiry is None:
+    expiry, trade = level_expiry(chain, now, mode), pick_expiry(chain, now, mode)
+    if expiry is None or trade is None:
         return None
     spot = chain.spot
     # Schwab rounds gamma to 3 decimals (SPX shows a flat 0.005): re-price it from each contract's IV instead.
@@ -205,7 +255,8 @@ def profile(chain: OptionChain, now: datetime, mode: str = "auto", weight: str =
     cv = sum(o.volume for o in opts if o.put_call == "C")
     pv = sum(o.volume for o in opts if o.put_call == "P")
     return Profile(chain.underlying, spot, expiry, (expiry - now.date()).days, compute_gex(opts_w, spot, now),
-                   calls, puts, call_oi, put_oi, expected_move(opts, spot, now), round(pv / cv, 2) if cv else None, weight)
+                   calls, puts, call_oi, put_oi, expected_move(opts, spot, now), round(pv / cv, 2) if cv else None, weight,
+                   trade if trade != expiry else None, (trade - now.date()).days if trade != expiry else None)
 
 
 # ------------------------------------------------------------------ confluence
@@ -434,7 +485,7 @@ def choose_contract(options: list[OptionQuote], side: str, target_delta: float =
 def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime,
                mtf: dict | None = None) -> Idea:
     near = near_band(p)
-    base = Idea(p.ticker, "WAIT", expiry=p.expiry, dte=p.dte)
+    base = Idea(p.ticker, "WAIT", expiry=p.trade_exp, dte=p.trade_days)
     g = p.gex
     plan = []
     if g.put_wall and g.put_wall < p.spot:
@@ -457,7 +508,7 @@ def build_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now
     grade = "A" if rate >= 75 else "B" if rate >= MIN_CONVERGENCE else "C"
     if against > MAX_AGAINST:
         grade = "C"
-    o = choose_contract(chain.for_expiry(p.expiry), side)
+    o = choose_contract(chain.for_expiry(p.trade_exp), side)
     idea = replace(base, side=side, setup=setup, level=round(level, 2), stop=round(stop, 2), target=round(target, 2),
                    grade=grade, rate=rate, against=against, confluence=conf)
     if o:
@@ -523,7 +574,7 @@ def strict_flip(p: Profile, ctx: dict, mtf: dict) -> tuple[tuple[str, str, float
 
 def strict_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, now: datetime, mtf: dict) -> Idea:
     """The strict flip rules as an Idea (ACTIVE when confirmed), same contract choice as build_idea."""
-    base = Idea(p.ticker, "WAIT", expiry=p.expiry, dte=p.dte)
+    base = Idea(p.ticker, "WAIT", expiry=p.trade_exp, dte=p.trade_days)
     if not FIRST_IDEA <= now.astimezone(ET).time() <= LAST_IDEA:
         base.reason = "Ideas only 9:45-15:30 ET"
         return base
@@ -539,7 +590,7 @@ def strict_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, no
     idea = replace(base, side=side, setup=setup, level=round(level, 2), stop=round(stop, 2), target=round(target, 2),
                    grade="C" if against > MAX_AGAINST else "A" if rate >= 75 else "B", rate=rate, against=against,
                    confluence=conf)
-    o = choose_contract(chain.for_expiry(p.expiry), side)
+    o = choose_contract(chain.for_expiry(p.trade_exp), side)
     if idea.grade == "C":
         idea.reason = f"{setup}, but {against} pts against (30m structure veto)"
     elif not o:
@@ -548,6 +599,57 @@ def strict_idea(p: Profile, chain: OptionChain, ctx: dict, news: dict | None, no
         idea = replace(idea, contract=o.symbol, strike=o.strike, mid=o.mid, ask=o.ask, delta=round(o.delta, 2),
                        status="ACTIVE", reason=f"{setup}; convergence {rate}%")
     return idea
+
+
+# ------------------------------------------------------------------ confirmation rules
+def regime(p: Profile) -> str:
+    """'negative' below the gamma flip (or net GEX < 0 without one), else 'positive'."""
+    g = p.gex
+    return "positive" if (p.spot > g.gamma_flip if g.gamma_flip else g.net_gex >= 0) else "negative"
+
+
+def confirm(idea: Idea, p: Profile, today: pd.DataFrame | None, now: datetime, regimes: dict[str, str]) -> str:
+    """'' when a flip / momentum idea passes the confirmation rules (module docstring), else why not.
+    `regimes` = {ticker: regime(profile)} for this scan; `today` = today's closed 5-min bars."""
+    if idea.setup not in CONFIRM_SETUPS:
+        return ""
+    if now.astimezone(ET).time() < CONFIRM_FIRST:
+        return f"before {CONFIRM_FIRST:%H:%M} (opening flip touches whipsaw)"
+    want = "negative" if idea.side == "PUT" else "positive"
+    off = [t for t in INDEXES if regimes.get(t) != want]
+    if off:
+        return "indexes not all " + want + " gamma: " + ", ".join(f"{t} {regimes.get(t, 'unknown')}" for t in off)
+    flip = p.gex.gamma_flip
+    if not flip:
+        return ""
+    if today is None or len(today) < CONFIRM_BARS:
+        return "not enough 5-min bars"
+    closes = today["close"].tail(CONFIRM_BARS)
+    beyond = (closes < flip) if idea.side == "PUT" else (closes > flip)
+    if not beyond.all():
+        return f"not {CONFIRM_BARS} 5-min closes {'below' if idea.side == 'PUT' else 'above'} the flip {flip:.2f}"
+    need = CONFIRM_DIST * near_band(p)
+    if abs(float(closes.iloc[-1]) - flip) < need:
+        return f"last close within {need:.2f} of the flip {flip:.2f}"
+    return ""
+
+
+def broker_filter(idea: Idea, p: Profile, now: datetime, confirm_why: str) -> str:
+    """'' when an idea may be sent to the broker (module docstring), else why not."""
+    t = now.astimezone(ET).time()
+    if idea.status != "ACTIVE" or not idea.contract:
+        return "not an ACTIVE idea with a contract"
+    if idea.ticker not in BROKER_TICKERS:
+        return f"{idea.ticker} is paper only (broker: {', '.join(BROKER_TICKERS)})"
+    if idea.side != "PUT" or idea.setup not in BROKER_SETUPS:
+        return f"{idea.setup} is paper only"
+    if p.trade_exp != now.date():
+        return f"{p.trade_days}DTE contract (broker: same-day only)"
+    if not BROKER_FROM <= t < BROKER_TO:
+        return f"outside {BROKER_FROM:%H:%M}-{BROKER_TO:%H:%M}"
+    if confirm_why:
+        return f"not confirmed: {confirm_why}"
+    return ""
 
 
 # ------------------------------------------------------------------ one ticker end to end

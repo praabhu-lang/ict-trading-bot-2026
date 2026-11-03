@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 import pandas as pd
 import pytest
@@ -159,3 +159,95 @@ def test_flip_rules_shadow_tracks_strict_aside_and_strict_mode_swaps_it_in(ledge
     engine.gex_ideas(at(10, 40), scan=True)
     assert [r["setup"] for r in ledger.get_kv("gex_ideas_open")] == [gp.STRICT_PUT]     # classic flip dropped
     assert ledger.get_kv("gex_strict_open") == []
+
+
+def test_confirm_rules_shadow_tracks_confirmed_aside_and_enforce_drops_unconfirmed(ledger, monkeypatch):
+    from tests.test_engine import S
+    from tests.test_gex_plan import bars, prof
+    from src.strategy import gex_plan as gp
+
+    engine, _, _ = make_engine(ledger, at(12, 0), settings=S(gex_confirm_rules="shadow", gex_flip_rules="classic"))
+    chain = engine.market.chain("SPY", TODAY)
+    o = next(x for x in chain.options if x.put_call == "P" and x.bid > 0)
+    p = prof(spot=98.5, flip=99.0, net=-1e6, em=1.0)
+    idea = gp.Idea("SPY", "ACTIVE", side="PUT", setup=gp.CLASSIC_FLIP[0], level=99.0, stop=99.25, target=98.0,
+                   contract=o.symbol, mid=1.0, ask=1.05, delta=-0.4, grade="B", rate=60)
+    regime = {"SPY": p, "QQQ": p, "SPX": p}
+    b = {"today": bars([99.3, 99.2, 99.1, 98.8, 98.5], start=99.4)}
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: {
+        "idea": idea if t == "SPY" else gp.Idea(t, "WAIT"), "profile": regime[t], "mtf": b} if t in regime else {})
+    engine.gex_ideas(at(12, 0), scan=True)
+    assert ledger.get_kv("gex_ideas_open")[0]["confirm"] == ""
+    assert [r["setup"] for r in ledger.get_kv("gex_confirm_open")] == [gp.CLASSIC_FLIP[0]]
+
+    regime["SPX"] = prof(spot=7650.0, flip=7600.0)                   # SPX above its flip: indexes disagree
+    for k in ("gex_ideas_open", "gex_confirm_open"):
+        ledger.set_kv(k, [])
+    monkeypatch.setattr(ledger, "alert_once", lambda key: True)
+    engine.gex_ideas(at(12, 5), scan=True)
+    assert "SPX positive" in ledger.get_kv("gex_ideas_open")[0]["confirm"]   # shadow: traded, verdict recorded
+    assert ledger.get_kv("gex_confirm_open") == []
+
+    engine.s.gex_confirm_rules = "enforce"
+    ledger.set_kv("gex_ideas_open", [])
+    engine.gex_ideas(at(12, 10), scan=True)
+    assert ledger.get_kv("gex_ideas_open") == []                     # enforce: unconfirmed flip idea not opened
+
+
+def test_gex_broker_sends_only_the_confirmed_spy_qqq_put_slice_and_exits_on_the_underlying(ledger, monkeypatch):
+    from tests.test_engine import S
+    from tests.test_gex_plan import bars, prof
+    from src.strategy import gex_plan as gp
+
+    engine, broker, notifier = make_engine(ledger, at(12, 0), settings=S(gex_broker=True, gex_flip_rules="classic"))
+    chain = engine.market.chain("SPY", TODAY)
+    o = next(x for x in chain.options if x.put_call == "P" and x.expiry == TODAY and x.bid > 0)
+    p = prof(spot=98.5, flip=99.0, net=-1e6, em=1.0)
+    idea = gp.Idea("SPY", "ACTIVE", side="PUT", setup=gp.CLASSIC_FLIP[0], level=99.0, stop=99.25, target=98.0,
+                   contract=o.symbol, mid=1.0, ask=1.05, delta=-0.4, grade="B", rate=60, expiry=TODAY, dte=0)
+    regime = {"SPY": p, "QQQ": p, "SPX": p}
+    b = {"today": bars([99.3, 99.2, 99.1, 98.8, 98.5], start=99.4)}
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: {
+        "idea": idea if t == "SPY" else gp.Idea(t, "WAIT"), "profile": regime[t], "mtf": b} if t in regime else {})
+
+    assert gp.broker_filter(idea, p, at(11, 0), "").startswith("outside")
+    assert "paper only" in gp.broker_filter(gp.replace(idea, ticker="NVDA"), p, at(12, 0), "")
+    assert "paper only" in gp.broker_filter(gp.replace(idea, setup="Put-wall bounce (positive gamma)"), p, at(12, 0), "")
+    assert "1DTE" in gp.broker_filter(idea, gp.replace(p, trade_expiry=TODAY + timedelta(days=1), trade_dte=1),
+                                      at(12, 0), "")
+    assert gp.broker_filter(idea, p, at(12, 0), "x").startswith("not confirmed")
+
+    engine.gex_ideas(at(12, 0), scan=True)
+    t = ledger.open_trades()[0]
+    assert t["symbol"] == o.symbol and t["notes"].startswith("gex_idea|") and t["qty"] == 1
+    assert t["direction"] == "bear" and t["underlying_stop"] == 99.25 and t["underlying_target"] == 98.0
+    assert [x["side"] for x in broker.submitted] == ["buy"]
+    engine.gex_ideas(at(12, 5), scan=True)                           # one broker trade per ticker per day
+    assert len(ledger.open_trades()) == 1
+
+    flat = engine.clock.now().replace(hour=15, minute=45)
+    assert engine._gex_broker_exit(t, at(12, 10), flat, 98.7) is None
+    assert engine._gex_broker_exit(t, at(12, 10), flat, 99.3) == "STOP_LOSS"
+    assert engine._gex_broker_exit(t, at(12, 10), flat, 97.9) == "TARGET"
+    assert engine._gex_broker_exit(t, flat, flat, 98.7) == "EOD_FLATTEN"
+
+    broker.is_paper = False                                          # never on a live account
+    assert engine._gex_broker_enter(gp.replace(idea, ticker="QQQ"), at(12, 15)) is False
+
+
+def test_gex_broker_off_by_default_sends_nothing(ledger, monkeypatch):
+    from tests.test_engine import S
+    from tests.test_gex_plan import bars, prof
+    from src.strategy import gex_plan as gp
+
+    engine, broker, _ = make_engine(ledger, at(12, 0), settings=S(gex_flip_rules="classic"))
+    p = prof(spot=98.5, flip=99.0, net=-1e6, em=1.0)
+    o = next(x for x in engine.market.chain("SPY", TODAY).options if x.put_call == "P" and x.expiry == TODAY)
+    idea = gp.Idea("SPY", "ACTIVE", side="PUT", setup=gp.CLASSIC_FLIP[0], level=99.0, stop=99.25, target=98.0,
+                   contract=o.symbol, ask=1.05, delta=-0.4, grade="B", rate=60)
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: {
+        "idea": idea if t == "SPY" else gp.Idea(t, "WAIT"), "profile": p,
+        "mtf": {"today": bars([99.3, 99.2, 99.1, 98.8, 98.5], start=99.4)}})
+    engine.gex_ideas(at(12, 0), scan=True)
+    assert ledger.open_trades() == [] and broker.submitted == []
+    assert len(ledger.get_kv("gex_ideas_open")) == 1                 # still paper-tracked

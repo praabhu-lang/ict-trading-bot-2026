@@ -36,7 +36,7 @@ def summary_row(r: dict, live: dict) -> dict:
     q = live.get(p.ticker)
     return {
         "Ticker": p.ticker, "Live": round(q["price"], 2) if q else None, "Src": q["source"] if q else "",
-        "Spot (chain)": round(p.spot, 2), "Expiry": f"{p.dte}DTE", "Gamma": regime,
+        "Spot (chain)": round(p.spot, 2), "Expiry": f"{p.dte}DTE" + (f" (trade {p.trade_days}DTE)" if p.trade_expiry else ""), "Gamma": regime,
         "Flip": g.gamma_flip and round(g.gamma_flip, 2), "Put wall": g.put_wall, "Call wall": g.call_wall,
         "Exp. move ±": round(p.expected_move, 2), "P/C vol": p.pc_volume, "Weighted by": p.weight,
         "Idea": f"{'🟢' if i.status == 'ACTIVE' else '⚪'} {i.side or 'WAIT'}" + (f" {i.rate}%" if i.side else ""),
@@ -301,8 +301,8 @@ that candle's low / high, and 5-min EMA9 vs EMA21 plus VWAP agreeing. Stop just 
 they are tracked aside (*Strict flip rules* below and in the day summary) so the two can be compared in R.
 
 **The contract**
-- Expiry: *Auto* = 0DTE until {gp.AUTO_1DTE_AFTER:%H:%M} ET, then the next expiry (late-day 0DTE gamma and premium
-  collapse). Stocks without daily expiries use their next one.
+- Expiry: *Auto* = levels from today's (0DTE) chain all day; the contract is 0DTE until {gp.AUTO_1DTE_AFTER:%H:%M} ET,
+  then the next expiry (late-day 0DTE premium collapses). Stocks without daily expiries use their next one.
 - Delta closest to {gp.TARGET_DELTA:.2f}, bid/ask spread at most {gp.MAX_SPREAD:.0%} of the mid.
 - Ideas only between {gp.FIRST_IDEA:%H:%M} and {gp.LAST_IDEA:%H:%M} ET; one open idea per ticker.
 
@@ -364,7 +364,7 @@ def tracker(led) -> None:
     if not log and not open_:
         st.caption("The engine logs every ACTIVE idea during the session as a paper trade sized to the GEX risk budget "
                    "(entry at the ask, exit at the bid on stop / target / 15:45 ET). Nothing yet.")
-        strict_tracker(led, pd.DataFrame())
+        shadow_books(led, pd.DataFrame())
         return
     df = pd.DataFrame(log)
     if not df.empty:
@@ -387,26 +387,35 @@ def tracker(led) -> None:
         st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
     if open_:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
-    strict_tracker(led, df)
+    shadow_books(led, df)
 
 
-def strict_tracker(led, main: pd.DataFrame) -> None:
-    """The strict flip rules' shadow book next to the classic flip setups from the main book."""
-    log = (led.get_kv("gex_strict_log") if led else None) or []
-    open_ = (led.get_kv("gex_strict_open") if led else None) or []
+def shadow_books(led, df: pd.DataFrame) -> None:
+    shadow_tracker(led, df, "gex_strict", "strict", gp.CLASSIC_FLIP, "Strict flip rules (shadow)",
+                   "Flip tested, a rejection / reclaim candle, a confirming close beyond it and 5-min momentum agreeing - "
+                   "tracked aside while the classic flip setups trade. Compare R before switching Settings to strict.")
+    shadow_tracker(led, df, "gex_confirm", "confirmed", gp.CONFIRM_SETUPS, "Confirmation rules (shadow)",
+                   f"Flip and momentum ideas from {gp.CONFIRM_FIRST:%H:%M}, after {gp.CONFIRM_BARS} 5-min closes past the "
+                   f"flip (the last at least {gp.CONFIRM_DIST:g} x the near band) with SPY, QQQ and SPX all in the trade's "
+                   "gamma regime. Compare R with the same setups unconfirmed before switching Settings to enforce.")
+
+
+def shadow_tracker(led, main: pd.DataFrame, key: str, label: str, setups: tuple, title: str, caption: str) -> None:
+    """A shadow book (kv `key`_log / `key`_open) next to the same setups from the main book."""
+    log = (led.get_kv(f"{key}_log") if led else None) or []
+    open_ = (led.get_kv(f"{key}_open") if led else None) or []
     if not log and not open_:
         return
-    st.subheader("Strict flip rules (shadow)")
-    st.caption("Flip tested, a rejection / reclaim candle, a confirming close beyond it and 5-min momentum agreeing - "
-               "tracked aside while the classic flip setups trade. Compare R before switching Settings to strict.")
+    st.subheader(title)
+    st.caption(caption)
     df = pd.DataFrame(log)
     rows = []
     if not df.empty and df["pnl"].notna().any():
         df = df[df["pnl"].notna()]
-        rows.append({"rules": "strict", "n": len(df), "win_%": round(float((df["pnl"] > 0).mean() * 100)),
+        rows.append({"rules": label, "n": len(df), "win_%": round(float((df["pnl"] > 0).mean() * 100)),
                      "avg_R": round(float(pd.to_numeric(df["R"], errors="coerce").mean()), 2),
                      "pnl_sized": round(float(df["pnl_sized"].sum()), 0)})
-    classic = main[main["setup"].isin(gp.CLASSIC_FLIP)] if not main.empty and "setup" in main else pd.DataFrame()
+    classic = main[main["setup"].isin(setups)] if not main.empty and "setup" in main else pd.DataFrame()
     if not classic.empty:
         rows.append({"rules": "classic", "n": len(classic), "win_%": round(float((classic["pnl"] > 0).mean() * 100)),
                      "avg_R": round(float(classic["R"].mean()), 2), "pnl_sized": round(float(classic["pnl_sized"].sum()), 0)})

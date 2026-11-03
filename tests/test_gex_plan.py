@@ -294,3 +294,38 @@ def test_strict_idea_is_active_with_a_contract():
     idea = gp.strict_idea(p, make_chain(99.72, dtes=(0,)), {"vwap": 100.2, "poc": 100.0, "vah": 100.3, "val": 99.6},
                           None, at(10, 30), _strict_mtf(today, up=False))
     assert idea.status == "ACTIVE" and idea.side == "PUT" and idea.contract and idea.grade in ("A", "B")
+
+
+def test_levels_stay_on_0dte_after_2pm_while_the_contract_moves_to_1dte():
+    chain = make_chain(100.1, dtes=(0, 1))
+    p = gp.profile(chain, at(14, 30))
+    assert p.expiry == TODAY and p.dte == 0                          # flip / walls from today's book
+    assert p.trade_exp == TODAY + timedelta(days=1) and p.trade_days == 1
+    morning = gp.profile(chain, at(10, 0))
+    assert morning.trade_expiry is None and morning.trade_exp == TODAY
+    one = gp.profile(chain, at(10, 0), "1dte")                       # explicit modes: levels follow the contract
+    assert one.expiry == TODAY + timedelta(days=1) and one.trade_expiry is None
+    b = bars([99.6, 99.7, 99.8, 99.9, 100.0, 100.1], start=99.5)
+    idea = gp.build_idea(p, chain, gp.intraday(b, TODAY), None, at(14, 30), mtf(1, 1, mom30=1, mom5=1, today=b))
+    assert idea.dte == 1 and idea.expiry == TODAY + timedelta(days=1)
+    assert idea.contract is None or idea.contract[3:9] == (TODAY + timedelta(days=1)).strftime("%y%m%d")
+
+
+def test_confirm_needs_time_two_closes_past_the_flip_and_all_indexes_agreeing():
+    p = prof(spot=98.5, flip=99.0, net=-1e6, em=1.0)                 # near = 0.25, needs a close <= 98.875
+    put = gp.Idea("SPY", "ACTIVE", side="PUT", setup=gp.CLASSIC_FLIP[0])
+    neg = {"SPY": "negative", "QQQ": "negative", "SPX": "negative"}
+    b = bars([99.3, 99.2, 99.1, 98.8, 98.5], start=99.4)
+    assert gp.confirm(put, p, b, at(12, 0), neg) == ""
+    assert "10:15" in gp.confirm(put, p, b, at(10, 0), neg)
+    assert "SPX positive" in gp.confirm(put, p, b, at(12, 0), {**neg, "SPX": "positive"})
+    assert "unknown" in gp.confirm(put, p, b, at(12, 0), {"SPY": "negative", "QQQ": "negative"})
+    assert "2 5-min closes below" in gp.confirm(put, p, bars([99.3, 99.1, 98.5], start=99.4), at(12, 0), neg)
+    assert "within" in gp.confirm(put, p, bars([99.3, 98.95, 98.9], start=99.4), at(12, 0), neg)
+    wall = gp.Idea("SPY", "ACTIVE", side="CALL", setup="Put-wall bounce (positive gamma)")
+    assert gp.confirm(wall, p, b, at(10, 0), {}) == ""                # wall setups are not confirmation setups
+    call = gp.Idea("SPY", "ACTIVE", side="CALL", setup=gp.CLASSIC_FLIP[1])
+    up = prof(spot=99.5, flip=99.0, em=1.0)
+    pos = {t: "positive" for t in gp.INDEXES}
+    assert gp.confirm(call, up, bars([98.8, 99.2, 99.5], start=98.7), at(12, 0), pos) == ""
+    assert gp.regime(p) == "negative" and gp.regime(up) == "positive"
