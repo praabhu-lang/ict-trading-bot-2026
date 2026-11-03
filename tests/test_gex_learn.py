@@ -251,3 +251,35 @@ def test_gex_broker_off_by_default_sends_nothing(ledger, monkeypatch):
     engine.gex_ideas(at(12, 0), scan=True)
     assert ledger.open_trades() == [] and broker.submitted == []
     assert len(ledger.get_kv("gex_ideas_open")) == 1                 # still paper-tracked
+
+
+def test_market_shock_is_shared_across_engine_runs_for_30_minutes(ledger):
+    from src.agents.news_agent import NewsResult
+
+    calls = []
+
+    class News:
+        def market_shock(self):
+            calls.append(1)
+            return NewsResult(ok=False, blocked=True, reason="Market shock: circuit breaker")
+
+    engine, _, _ = make_engine(ledger, at(10, 0))
+    engine.news = News()
+    assert engine._market_shock().blocked and len(calls) == 1
+    again, _, _ = make_engine(ledger, at(10, 20))                     # next run: a new process, same ledger
+    again.news = News()
+    assert again._market_shock().reason == "Market shock: circuit breaker" and len(calls) == 1
+    later, _, _ = make_engine(ledger, at(10, 31))
+    later.news = News()
+    later._market_shock()
+    assert len(calls) == 2
+
+
+def test_gex_engine_scan_does_not_search_news(ledger, monkeypatch):
+    from src.strategy import gex_plan as gp
+
+    engine, _, _ = make_engine(ledger, at(12, 0))
+    seen = []
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: seen.append(n) or {})
+    engine.gex_ideas(at(12, 0), scan=True)
+    assert seen and all(n is None for n in seen)

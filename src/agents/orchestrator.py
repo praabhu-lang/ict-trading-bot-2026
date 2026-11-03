@@ -15,6 +15,7 @@ import html
 import logging
 import time
 import traceback
+from dataclasses import asdict
 from datetime import datetime, time as dtime, timedelta
 
 from ..alerts.notifier import Notifier, table
@@ -39,7 +40,8 @@ from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_roo
 
 log = logging.getLogger(__name__)
 URGENT_EXITS = {"STOP_LOSS", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}   # EOD has 15 min: it works the mid first
-SCAN_DELAY_SECONDS = 20  # let the data vendor finalize the bar that just closed
+SCAN_DELAY_SECONDS = 20
+SHOCK_TTL = timedelta(minutes=30)       # market-wide news check, shared across engine runs (Tavily credits)  # let the data vendor finalize the bar that just closed
 
 
 class TradingEngine:
@@ -318,7 +320,7 @@ class TradingEngine:
         reasons = g.reasons + a.reasons
         if not self.s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
-        shock = self.news.market_shock()
+        shock = self._market_shock()
         if shock.blocked:
             reasons.append(shock.reason)
         elif veto := llm_veto(shock.llm, None, self.s.news_llm_mode):
@@ -585,7 +587,7 @@ class TradingEngine:
                                 self.ledger.realized_pnl_on(d)).reasons
         if not s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
-        shock = self.news.market_shock()
+        shock = self._market_shock()
         if shock.blocked:
             reasons.append(shock.reason)
         profile, mult, size_notes = "classic", 1.0, []
@@ -1300,7 +1302,9 @@ class TradingEngine:
         if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
             names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
             levels, gates = [], self.ledger.get_kv("gex_gate") or {}
-            results = [(t, r) for t, r in ((t, gp.analyse(self.market, self.news, t, now)) for t in names)
+            # no news here: the Tavily search per ticker per run was ~80% of the Tavily bill and the llm_news vote
+            # was 0 on all 123 paper ideas (Oct 19 - Nov 3 2026). The dashboard GEX tab still checks news.
+            results = [(t, r) for t, r in ((t, gp.analyse(self.market, None, t, now)) for t in names)
                        if r.get("idea")]
             regimes = {t: gp.regime(r["profile"]) for t, r in results}
             extra = self._vix_tags()
@@ -1435,6 +1439,24 @@ class TradingEngine:
         if (px <= target) if bear else (px >= target):
             return "TARGET"
         return None
+
+    def _market_shock(self):
+        """news.market_shock(), shared across engine runs through ledger kv news_market_shock for SHOCK_TTL: each
+        run is a fresh process, so the NewsAgent's in-memory cache never outlived it. Unknown results are not kept."""
+        from .news_agent import NewsResult
+
+        now = self.clock.now()
+        hit = self.ledger.get_kv("news_market_shock") or {}
+        try:
+            fresh = now - datetime.fromisoformat(hit["at"]) < SHOCK_TTL
+        except (KeyError, TypeError, ValueError):
+            fresh = False
+        if fresh:
+            return NewsResult(**hit["result"])
+        shock = self.news.market_shock()
+        if shock.ok is not None:
+            self.ledger.set_kv("news_market_shock", {"at": now.isoformat(timespec="seconds"), "result": asdict(shock)})
+        return shock
 
     def _vix_tags(self) -> dict:
         """{vix, vix_vs_open, vix_chg} from one Schwab quote, {} when unavailable - recorded on GEX paper ideas."""
