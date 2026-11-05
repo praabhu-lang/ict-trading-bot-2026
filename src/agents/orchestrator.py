@@ -320,11 +320,7 @@ class TradingEngine:
         reasons = g.reasons + a.reasons
         if not self.s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
-        shock = self._market_shock()
-        if shock.blocked:
-            reasons.append(shock.reason)
-        elif veto := llm_veto(shock.llm, None, self.s.news_llm_mode):
-            reasons.append(veto)
+        # market-wide news is checked only when an order is about to go out (_news_block): Tavily credits
         self.status.update({"account_equity": acct.equity, "trading_equity": equity,
                             "buying_power": acct.buying_power, "bot_day_pnl": day_pnl})
         return Gate(not reasons, reasons)
@@ -366,12 +362,18 @@ class TradingEngine:
                                           sig.target, sig.components, "SCAN_ONLY", "forced scan - no orders placed")
             return analysed
 
+        news_block = None
         for sig, chain in sorted(candidates, key=lambda c: c[0].score, reverse=True):
             block = list(gate.reasons)
             if sig.ticker in earnings:
                 block.append("Earnings today")
             if sig.ticker in held:
                 block.append("Already holding this underlying")
+            if not block:                       # about to trade: one market-news search (cached 30 min)
+                news_block = news_block or self._news_block() or ""
+                if news_block:
+                    block.append(news_block)
+                    self.status["gates"] = [news_block]
             if block:
                 self.ledger.record_signal(now.date(), sig.ticker, sig.direction, sig.score, sig.entry, sig.stop,
                                           sig.target, sig.components, "BLOCKED", "; ".join(block))
@@ -587,9 +589,6 @@ class TradingEngine:
                                 self.ledger.realized_pnl_on(d)).reasons
         if not s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
-        shock = self._market_shock()
-        if shock.blocked:
-            reasons.append(shock.reason)
         profile, mult, size_notes = "classic", 1.0, []
         if smart:
             returns = self._fc_returns()
@@ -666,6 +665,11 @@ class TradingEngine:
                                           {"or_high": x.or_high, "or_low": x.or_low}, "BLOCKED", why)
                 self._fc_today(d, decision="NO TRADE", reason=f"{pick} {x.direction} breakout - {why}")
                 return 1
+        shock = self._market_shock()                # news only now that there is a trade to place
+        if shock.blocked:                           # no done_key: the next run may still enter
+            self.status["gates"] = [shock.reason]
+            self._fc_today(d, decision="NO TRADE", reason=shock.reason)
+            return 1
         self.ledger.set_kv(done_key, f"{pick} {x.direction} breakout")
         self._first_candle_enter(x, now, equity, plan)
         return 1
@@ -1397,6 +1401,10 @@ class TradingEngine:
         if not (bid > 0 and ask >= bid) or ask * 100 * qty > room:
             self.ledger.log("INFO", f"GEX broker skip {idea.contract}: bid/ask {bid}/{ask}, reserve room {room:,.0f}")
             return False
+        news_block = self._news_block()
+        if news_block:
+            self.ledger.log("INFO", f"GEX broker skip {idea.contract}: {news_block}")
+            return False
         if not self.ledger.alert_once(f"gex_broker:{d.isoformat()}:{idea.ticker}"):
             return False
         fill = self.execution.buy_option(idea.contract, qty, bid, ask)
@@ -1439,6 +1447,13 @@ class TradingEngine:
         if (px <= target) if bear else (px >= target):
             return "TARGET"
         return None
+
+    def _news_block(self) -> str | None:
+        """Block reason from the market-wide news check, or None. Called only right before an order is placed."""
+        shock = self._market_shock()
+        if shock.blocked:
+            return shock.reason
+        return llm_veto(shock.llm, None, self.s.news_llm_mode)
 
     def _market_shock(self):
         """news.market_shock(), shared across engine runs through ledger kv news_market_shock for SHOCK_TTL: each

@@ -51,9 +51,7 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
     earn = earnings_today(s.universe, d)
     ledger.set_kv(f"earnings:{d.isoformat()}", earn)
     sections.append(f"<p><b>Earnings today (blocked):</b> {html.escape(', '.join(earn) or 'none')}</p>")
-    shock = news.market_shock()
-    if shock.blocked:
-        sections.append(f'<p style="color:#c53030"><b>{html.escape(shock.reason)}</b></p>')
+    # No Tavily search here: news is checked by the engine only right before it places an order (credits).
 
     # --- per-ticker levels ---
     rows = []
@@ -63,7 +61,6 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
             quotes = market.schwab.quotes(s.universe)
         except MarketDataUnavailable as exc:
             log.warning("Quotes failed: %s", exc)
-    news.check_many(s.universe)          # Tavily + LLM verdicts in parallel; the loop below reads the cache
     for ticker in s.universe:
         try:
             bars = market.bars(ticker, now, days=3)
@@ -87,7 +84,6 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
                 gex = compute_gex(chain.options, chain.spot, now)
             except MarketDataUnavailable as exc:
                 log.warning("Premarket chain failed for %s: %s", ticker, exc)
-        n = news.check(ticker)
         rows.append({
             "Ticker": ticker, "Last": last, "Gap %": round(gap, 2),
             "Supply VRZ": f"{supply.low:.2f}-{supply.high:.2f}" if supply else "",
@@ -95,16 +91,13 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
             "GEX": gex.regime if gex else "n/a",
             "Flip": round(gex.gamma_flip, 2) if gex and gex.gamma_flip else None,
             "Call wall": gex.call_wall if gex else None, "Put wall": gex.put_wall if gex else None,
-            "Flags": "; ".join(x for x in ("EARNINGS" if ticker in earn else "",
-                                            n.reason if n.blocked else "") if x),
-            "News (LLM)": (f"{n.llm['risk'].upper()} {n.llm['sentiment']:+.1f}: {n.llm['reason']}"[:140]
-                           if n.llm else ""),
+            "Flags": "EARNINGS" if ticker in earn else "",
         })
         ledger.upsert_levels(
             d, ticker, table="premarket_levels", spot=last, prior_close=prior_close, gap_pct=round(gap, 2),
             net_gex=gex.net_gex if gex else None, gamma_flip=gex.gamma_flip if gex else None,
             call_wall=gex.call_wall if gex else None, put_wall=gex.put_wall if gex else None,
-            gex_regime=gex.regime if gex else None, zones=[z.as_dict() for z in zones], news=n.headlines[:3],
+            gex_regime=gex.regime if gex else None, zones=[z.as_dict() for z in zones],
         )
     if s.strategy == fc.STRATEGY_TAG:
         sections.insert(0, first_candle_plan(s, ledger, market, quotes, now, events, earn))
@@ -119,7 +112,7 @@ def run_premarket(s: Settings, ledger: Ledger, market: MarketData, news: NewsAge
 
     report = {"ts": now.isoformat(timespec="seconds"), "token_ok": token_ok, "token_days_left": days_left,
               "events": [f"{e.start:%H:%M} {e.name}" for e in events], "earnings": earn, "tickers": len(rows),
-              "market_shock": shock.reason if shock.blocked else ""}
+              "market_shock": ""}
     ledger.set_kv("premarket_report", report)
     if send_email:
         notifier.send(f"📋 Pre-market plan {d:%a %b %d}" + ("" if token_ok else " - ⚠️ SCHWAB LOGIN EXPIRED"),

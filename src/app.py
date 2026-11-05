@@ -175,7 +175,8 @@ def cmd_gex_archive() -> int:
     if failed:
         Notifier.from_env().send("⚠️ gexbot EOD archive failed", "<pre>" + json.dumps(results, indent=2) + "</pre>",
                                  dedupe_key=f"gexarchive:{date.today().isoformat()}")
-    return 1 if failed and len(failed) == len(results) else 0
+    covered = [t for t, r in results.items() if r != "not covered by gexbot"]
+    return 1 if failed and len(failed) == len(covered) else 0   # every covered ticker failed (e.g. key rejected)
 
 
 def cmd_nightly() -> int:

@@ -2,8 +2,8 @@
 strategy's monitor.
 
 1. download data/marketdb/market_data.db from the state bucket (marketdb/market_data.db; built by src/market_db.py)
-2. update: daily bars, 5-minute bars (SPY, QQQ, top-10 stocks), SPY/QQQ same-day and next-expiry option bars
-   (+/-12 strikes around the open), event calendar (Mondays)
+2. update: daily bars, 5-minute bars (SPY, QQQ, top-10 stocks; Schwab $VIX, $VIX9D, $VVIX, $SPX), SPY/QQQ same-day
+   and next-expiry option bars (+/-12 strikes around the open), event calendar (Mondays)
 3. save today's end-of-day Schwab option chains with greeks (SPY, SPX, QQQ + STOCKS, expiries 0-7 days)
    -> chain_snapshots
 3b. housekeeping: ledger gex_levels older than LEDGER_GEX_DAYS -> market DB, ledger prune; raw chains older than
@@ -61,6 +61,8 @@ def update_database(market, today: date) -> dict:
         ("options", lambda: [mdb.update_options(tickers=(t,), start=mdb.last_option_day(t) or date(2024, 2, 1))
                              for t in ("SPY", "QQQ")]),
     ]
+    if getattr(market, "schwab", None) is not None:
+        steps.append(("index_bars", lambda: mdb.update_index_bars(market.schwab, end=today)))
     if today.weekday() == 0:
         steps.append(("events", mdb.update_events))
     try:

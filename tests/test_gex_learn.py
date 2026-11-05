@@ -283,3 +283,40 @@ def test_gex_engine_scan_does_not_search_news(ledger, monkeypatch):
     monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: seen.append(n) or {})
     engine.gex_ideas(at(12, 0), scan=True)
     assert seen and all(n is None for n in seen)
+
+
+class _CountingNews:
+    def __init__(self, blocked=False):
+        self.calls, self.blocked = 0, blocked
+
+    def check(self, ticker):
+        from src.agents.news_agent import NewsResult
+        return NewsResult(ok=True)
+
+    def market_shock(self):
+        from src.agents.news_agent import NewsResult
+        self.calls += 1
+        return NewsResult(ok=True, blocked=self.blocked, reason="Market shock: circuit breaker" if self.blocked else "")
+
+
+def test_entry_gates_do_not_search_news(ledger):
+    engine, _, _ = make_engine(ledger, at(10, 0))
+    engine.news = _CountingNews(blocked=True)
+    assert engine.gates(at(10, 0)).ok and engine.news.calls == 0      # news waits until an order is about to go out
+    assert engine._news_block() == "Market shock: circuit breaker" and engine.news.calls == 1
+
+
+def test_gex_broker_checks_news_right_before_buying(ledger, monkeypatch):
+    from tests.test_engine import S
+    from src.strategy import gex_plan as gp
+
+    engine, broker, _ = make_engine(ledger, at(12, 0), settings=S(gex_broker=True))
+    o = next(x for x in engine.market.chain("SPY", TODAY).options if x.put_call == "P" and x.expiry == TODAY and x.bid > 0)
+    idea = gp.Idea("SPY", "ACTIVE", side="PUT", setup=gp.CLASSIC_FLIP[0], level=99.0, stop=99.25, target=98.0,
+                   contract=o.symbol, mid=1.0, ask=1.05, delta=-0.4, grade="B", rate=60, expiry=TODAY, dte=0)
+    engine.news = _CountingNews(blocked=True)
+    assert engine._gex_broker_enter(idea, at(12, 0)) is False and broker.submitted == []
+    assert engine.news.calls == 1
+    engine.news = _CountingNews(blocked=False)
+    ledger.set_kv("news_market_shock", None)                          # drop the cached block
+    assert engine._gex_broker_enter(idea, at(12, 5)) is True and [x["side"] for x in broker.submitted] == ["buy"]

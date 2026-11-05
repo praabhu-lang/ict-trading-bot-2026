@@ -167,6 +167,28 @@ def update_bars(symbols=("SPY", "QQQ"), start=date(2023, 9, 1), end=None):
                 print(f"  {s} {y0}..{y1}: {len(rows)} bars")
 
 
+INDEX_SYMBOLS = ("$VIX", "$VIX9D", "$VVIX", "$SPX")   # Schwab keeps ~7 months of 5-minute index history
+
+
+def update_index_bars(schwab, symbols=INDEX_SYMBOLS, start=date(2026, 3, 2), end=None):
+    """Schwab 5-minute index bars (regular session) into bars_5m, from the last stored bar onward.
+    Stored like the Alpaca bars: ts = bar start, epoch seconds."""
+    con = connect()
+    end = end or date.today()
+    for s in symbols:
+        last = con.execute("SELECT MAX(ts) FROM bars_5m WHERE symbol=?", (s,)).fetchone()[0]
+        a = max(start, datetime.fromtimestamp(last, timezone.utc).date()) if last else start
+        while a <= end:
+            b = min(a + timedelta(days=27), end)
+            df = schwab.price_history(s, datetime.combine(a, datetime.min.time(), timezone.utc),
+                                      datetime.combine(b + timedelta(days=1), datetime.min.time(), timezone.utc))
+            rows = [(s, int(t.timestamp()), r.open, r.high, r.low, r.close, r.volume) for t, r in df.iterrows()]
+            con.executemany("INSERT OR REPLACE INTO bars_5m VALUES (?,?,?,?,?,?,?)", rows)
+            con.commit()
+            print(f"  {s} {a}..{b}: {len(rows)} bars")
+            a = b + timedelta(days=1)
+
+
 def bars_5m(symbol, start: date, end: date, regular_only=True) -> pd.DataFrame:
     """Open/High/Low/Close/Volume, ET index - the same shape backtest_breakout_bot.load_bars returns."""
     a = int(pd.Timestamp(start, tz=ET).timestamp())

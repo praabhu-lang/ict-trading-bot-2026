@@ -443,7 +443,7 @@ def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> No
     weight = c[2].selectbox("Gamma weighted by", list(gp.WEIGHTS), format_func=gp.WEIGHTS.get, key="gex_weight",
                             help="Open interest is yesterday's positioning (Schwab updates it overnight); today's "
                                  "volume shows where 0DTE flow is building intraday.")
-    with_news = c[3].toggle("LLM news", True, key="gex_news", help="NVIDIA LLM verdict on Tavily headlines "
+    with_news = c[3].toggle("LLM news", False, key="gex_news", help="NVIDIA LLM verdict on Tavily headlines "
                             "(for the selected ticker and any ticker at a GEX level; ~10 s the first time, cached 30 min)")
 
     run = lambda t: gp.analyse(market, news, t, now, mode, weight, with_news, pick)  # noqa: E731
