@@ -1,6 +1,7 @@
 """Alpaca broker (paper or live)."""
 from __future__ import annotations
 
+from alpaca.common.rest import RESTClient
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -17,17 +18,35 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from ..data.models import is_option_symbol
 from .base import Account, Broker, OrderStatus, Position, option_tick
+
+
+def harden_session(client: RESTClient) -> RESTClient:
+    """Retry dropped connections on idempotent calls (GET/DELETE) only.
+
+    Alpaca's load balancer sometimes closes an idle keep-alive connection; the next request on that socket fails
+    with RemoteDisconnected, and alpaca-py retries only HTTP 429/504. POST/PATCH (order submit/replace) are never
+    retried here: a dropped order request may already have been accepted, and resending could double the order.
+    """
+    retry = Retry(total=3, connect=3, read=3, status=0, other=0, backoff_factor=0.5,
+                  allowed_methods=frozenset({"GET", "DELETE"}), raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry)
+    client._session.mount("https://", adapter)
+    client._session.mount("http://", adapter)
+    return client
 
 
 class AlpacaBroker(Broker):
     def __init__(self, api_key: str, secret: str, paper: bool, data_feed: str = "iex"):
         self.name = "alpaca_paper" if paper else "alpaca_live"
         self.is_paper = paper
-        self.trading = TradingClient(api_key, secret, paper=paper)
-        self.options_data = OptionHistoricalDataClient(api_key, secret)
-        self.stock_data = StockHistoricalDataClient(api_key, secret)
+        self.trading = harden_session(TradingClient(api_key, secret, paper=paper))
+        self.options_data = harden_session(OptionHistoricalDataClient(api_key, secret))
+        self.stock_data = harden_session(StockHistoricalDataClient(api_key, secret))
         self.feed = DataFeed(data_feed)
 
     def account(self) -> Account:

@@ -49,7 +49,9 @@ class AlpacaBars:
     def __init__(self, api_key: str, secret: str, feed: str = "iex"):
         from alpaca.data.historical.stock import StockHistoricalDataClient
 
-        self.client = StockHistoricalDataClient(api_key, secret)
+        from ..brokers.alpaca import harden_session
+
+        self.client = harden_session(StockHistoricalDataClient(api_key, secret))
         self.feed = feed
 
     def bars(self, symbol: str, start: datetime, end: datetime, minutes: int = BAR_MINUTES) -> pd.DataFrame:
