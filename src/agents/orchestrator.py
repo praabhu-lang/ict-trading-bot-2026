@@ -1303,6 +1303,7 @@ class TradingEngine:
         s_keep, s_closed = self._gex_manage(self.ledger.get_kv("gex_strict_open") or [], now)
         c_mode = self.s.gex_confirm_rules
         c_keep, c_closed = self._gex_manage(self.ledger.get_kv("gex_confirm_open") or [], now)
+        d_keep, d_closed = self._gex_manage(self.ledger.get_kv("debate_open") or [], now)
         if scan and gp.FIRST_IDEA <= now.astimezone(ET).time() <= gp.LAST_IDEA and now < flatten_time(now, self.s):
             names, _ = gp.universe(self.market.schwab) if self.market.schwab else (gp.FIXED_TICKERS, "")
             levels, gates = [], self.ledger.get_kv("gex_gate") or {}
@@ -1338,6 +1339,14 @@ class TradingEngine:
                             self._gex_broker_enter(x, now)
                             break
             self.ledger.record_gex_levels(levels)
+            if self.s.debate_mode == "paper":
+                try:
+                    self._debate(results, now, d_keep, gates, extra)
+                except Exception as exc:  # noqa: BLE001 - the debate must never stop the GEX book
+                    self._error("trade debate", exc)
+        self.ledger.set_kv("debate_open", d_keep)
+        if d_closed:
+            self.ledger.set_kv("debate_log", (self.ledger.get_kv("debate_log") or []) + d_closed)
         self.ledger.set_kv("gex_ideas_open", keep)
         if closed:
             self.ledger.set_kv("gex_ideas_log", (self.ledger.get_kv("gex_ideas_log") or []) + closed)
@@ -1366,7 +1375,9 @@ class TradingEngine:
             call = rec["side"] == "CALL"
             hit_stop = spot <= rec["stop"] if call else spot >= rec["stop"]
             hit_target = spot >= rec["target"] if call else spot <= rec["target"]
-            reason = "STOP" if hit_stop else "TARGET" if hit_target else "TIME" if now >= flatten_time(now, self.s) else ""
+            exit_by = datetime.fromisoformat(rec["exit_by"]) if rec.get("exit_by") else None   # debate book
+            late = now >= flatten_time(now, self.s) or (exit_by is not None and now >= exit_by)
+            reason = "STOP" if hit_stop else "TARGET" if hit_target else "TIME" if late else ""
             if o is None and (reason == "TIME" or rec["date"] != today):
                 # contract no longer quoted (expired 0DTE, chain window moved): close without a price
                 closed.append({**rec, "closed": now.isoformat(timespec="seconds"), "exit": None, "exit_spot": spot,
@@ -1379,6 +1390,52 @@ class TradingEngine:
                 continue
             closed.append(_close_gex(rec, now, o.bid, spot, reason))
         return keep, closed
+
+    def _debate(self, results: list, now: datetime, book: list[dict], gates: dict, extra: dict) -> None:
+        """Trade debate (src/agents/debate.py) on this scan's ACTIVE GEX ideas: bull and bear agents argue, the judge
+        decides TRADE / SKIP and sets stop, target and time exit. TRADEs open in the paper book `book` (kv debate_open,
+        risk-sized like the GEX ideas); every debate is kept in kv debate_decisions. Never orders."""
+        from ..strategy import gex_learn as gl
+        from . import debate as db
+
+        llm = getattr(self.news, "llm", None)
+        if llm is None or not getattr(llm, "enabled", False) or self.s.debate_max_per_scan <= 0:
+            return
+        today = now.date().isoformat()
+        cands = sorted(((t, r["idea"], r["profile"]) for t, r in results
+                        if r["idea"].status == "ACTIVE" and r["idea"].side and r["idea"].ask
+                        and r["idea"].stop is not None and r["idea"].target is not None
+                        and not any(b["ticker"] == t for b in book)),
+                       key=lambda x: -x[1].rate)
+        log = self.ledger.get_kv("gex_ideas_log") or []
+        decisions = self.ledger.get_kv("debate_decisions") or []
+        flat, n = flatten_time(now, self.s), 0
+        for ticker, idea, p in cands:
+            if n >= self.s.debate_max_per_scan:
+                break
+            if not self.ledger.alert_once(f"debate:{today}:{ticker}:{idea.setup}"):
+                continue
+            n += 1
+            snap = gl.snapshot(idea, p, now.astimezone(ET))
+            learn = db.learned(idea.setup, idea.grade, snap["tod"], snap["regime"], log, gates)
+            rec = db.debate(llm, db.facts(idea, snap, p.spot, now, learn, extra), now, flat)
+            rid = f"{today}:{ticker}:{idea.setup}"
+            decisions.append({"id": rid, "date": today, "at": now.isoformat(timespec="seconds"), "ticker": ticker,
+                              "side": idea.side, "setup": idea.setup, "grade": idea.grade, "spot": p.spot,
+                              "scanner_stop": idea.stop, "scanner_target": idea.target, **rec})
+            if rec["decision"] != "TRADE":
+                continue
+            risk_1c = gl.risk_per_contract(p.spot, rec["stop"], idea.delta, snap["bid"], idea.ask)
+            book.append({"id": rid, "date": today, "ticker": ticker, "opened": now.isoformat(timespec="seconds"),
+                         "side": idea.side, "setup": idea.setup, "grade": idea.grade, "contract": idea.contract,
+                         "dte": idea.dte, "entry": idea.ask, "spot": p.spot, **snap,
+                         "stop": rec["stop"], "target": rec["target"], "exit_by": rec["exit_by"],
+                         "scanner_stop": idea.stop, "scanner_target": idea.target, "risk_1c": risk_1c,
+                         "qty": gl.contracts(self.s.gex_risk_per_idea, risk_1c),
+                         "confidence": rec["judge"]["confidence"], "why": rec["why"],
+                         "bull": rec["bull"]["conviction"], "bear": rec["bear"]["conviction"]})
+        self.ledger.set_kv("debate_decisions", decisions[-500:])
+        self.status["debate_open"] = len(book)
 
     def _gex_broker_enter(self, idea, now: datetime) -> bool:
         """Buy a broker_filter idea's contract (settings.gex_broker_qty) and book it in the ledger (notes gex_idea|...)
@@ -1641,6 +1698,20 @@ class TradingEngine:
                             f"same setups in the main book: {len(unconf)} trades, "
                             f"{sum(float(x.get('R') or 0) for x in unconf):+.1f}R, "
                             f"{sum(1 for x in unconf if x.get('confirm'))} of them unconfirmed at entry</p>")
+        debate_today = [x for x in (self.ledger.get_kv("debate_log") or []) if x["date"] == now.date().isoformat()]
+        debated = [x for x in (self.ledger.get_kv("debate_decisions") or []) if x["date"] == now.date().isoformat()]
+        if debated:
+            plan_html += ("<h3>Trade debate (bull / bear / judge, paper, not in the totals above)</h3>"
+                          + (table([{"Ticker": x["ticker"], "Idea": f"{x['side']} {x['contract']}", "Setup": x["setup"],
+                                     "Time": str(x.get("opened", ""))[11:16], "Conf": x.get("confidence"),
+                                     "Qty": x.get("qty"), "Entry": x["entry"], "Exit": x["exit"],
+                                     "Reason": x["reason"], "R": x.get("R"), "P&L $": x.get("pnl_sized"),
+                                     "Why": x.get("why", "")} for x in debate_today])
+                             if debate_today else "<p>The judge traded nothing today.</p>")
+                          + f"<p>Debated {len(debated)} ideas, judge traded "
+                            f"{sum(1 for x in debated if x['decision'] == 'TRADE')} · "
+                            f"{sum(float(x.get('R') or 0) for x in debate_today):+.1f}R, "
+                            f"{sum(float(x.get('pnl_sized') or 0) for x in debate_today):+,.2f}</p>")
         recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
         if recap:
             plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html

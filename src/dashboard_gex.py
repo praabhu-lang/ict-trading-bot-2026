@@ -388,6 +388,49 @@ def tracker(led) -> None:
     if open_:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
     shadow_books(led, df)
+    debate_book(led, df)
+
+
+def debate_book(led, main: pd.DataFrame) -> None:
+    """Trade debate (src/agents/debate.py): the judge's paper trades, and every TRADE / SKIP call next to how the
+    same idea did in the main GEX book (same id), so the judge can be checked against doing nothing."""
+    log = (led.get_kv("debate_log") if led else None) or []
+    open_ = (led.get_kv("debate_open") if led else None) or []
+    calls = (led.get_kv("debate_decisions") if led else None) or []
+    if not (log or open_ or calls):
+        return
+    st.subheader("Trade debate: scanner -> bull / bear -> judge (paper)")
+    st.caption("Each scan's best ACTIVE ideas are argued by a bull agent and a bear agent; the judge trades only when "
+               "the pros clearly win, and sets its own stop (never wider than the scanner's), target and time exit. "
+               "Simulated at the bid/ask - nothing is sent to the broker. The table below compares the judge's TRADE "
+               "and SKIP calls with the same ideas in the main GEX book.")
+    df = pd.DataFrame(log)
+    if not df.empty and df["pnl"].notna().any():
+        df = df[df["pnl"].notna()]
+        c = st.columns(4)
+        c[0].metric("Judge trades", len(df))
+        c[1].metric("Win %", f"{(df['pnl'] > 0).mean() * 100:.0f}%")
+        c[2].metric("Avg R", f"{pd.to_numeric(df['R'], errors='coerce').mean():+.2f}")
+        c[3].metric("P&L (risk-sized)", f"${df['pnl_sized'].sum():,.0f}")
+    cd = pd.DataFrame(calls)
+    if not cd.empty and not main.empty and "id" in main:
+        m = cd.merge(main[["id", "R", "pnl_sized"]], on="id", how="inner")
+        if not m.empty:
+            st.dataframe(m.groupby("decision").agg(n=("R", "size"), win_pct=("R", lambda r: round((r > 0).mean() * 100)),
+                                                   main_book_avg_R=("R", "mean"), main_book_pnl=("pnl_sized", "sum"))
+                         .round(2).reset_index(), hide_index=True, width="stretch")
+    if open_:
+        st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
+    if not df.empty:
+        st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
+    if not cd.empty:
+        with st.expander(f"All debates ({len(cd)})"):
+            for x in reversed(calls[-30:]):
+                st.markdown(f"**{x['at'][5:16]} {x['ticker']} {x['side']} - {x['setup']} ({x['grade']}) -> "
+                            f"{x['decision']}**: {x.get('why', '')}")
+                for side in ("bull", "bear"):
+                    if x.get(side):
+                        st.caption(f"{side} {x[side]['conviction']}/10: " + " · ".join(x[side]["case"]))
 
 
 def shadow_books(led, df: pd.DataFrame) -> None:

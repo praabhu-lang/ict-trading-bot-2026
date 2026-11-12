@@ -20,7 +20,7 @@ from ..core.settings import env
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"   # reasoning model: ~10-15 s and ~700 tokens per call
+DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"   # super-120b returned 404 from Nov 12 2026; ~10-35 s per call
 RISKS = ("block", "caution", "none")
 CATALYST_KINDS = ("released", "scheduled", "none")
 OUTCOMES = ("positive", "negative", "mixed", "unknown")
@@ -148,12 +148,12 @@ class NvidiaLLM:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(self, prompt: str, max_tokens: int = 1500) -> str:
         resp = self.http.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
             json={"model": self.model, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.0, "max_tokens": 1500},   # room for the reasoning before the JSON
+                  "temperature": 0.0, "max_tokens": max_tokens},   # room for the reasoning before the JSON
             timeout=self.timeout,
         )
         resp.raise_for_status()
@@ -181,6 +181,25 @@ class NvidiaLLM:
             log.warning("NVIDIA LLM failed for %s: %s", what, exc)
             return None
         return text or None
+
+    def ask_json(self, prompt: str, what: str, max_tokens: int = 2500) -> dict | None:
+        """First JSON object in the reply as a dict, or None (no key, error, no / bad JSON). Trade debate agents."""
+        if not self.enabled:
+            return None
+        try:
+            text = self._complete(prompt, max_tokens)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("NVIDIA LLM failed for %s: %s", what, exc)
+            return None
+        m = re.search(r"\{.*\}", text or "", re.S)
+        try:
+            data = json.loads(m.group(0)) if m else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            log.warning("NVIDIA LLM returned no usable JSON for %s", what)
+            return None
+        return data
 
     def judge_ticker(self, ticker: str, headlines: list[str]) -> Verdict | None:
         if not headlines:

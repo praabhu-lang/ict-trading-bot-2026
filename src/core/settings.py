@@ -45,6 +45,7 @@ GEX_FLIP_RULES = {"classic": "Classic (flip + 15 min drift)", "shadow": "Shadow 
                   "strict": "Strict (test, rejection / reclaim close, confirmation bar, 5m momentum)"}
 GEX_CONFIRM_RULES = {"off": "Off", "shadow": "Shadow (classic trades, confirmed tracked aside)",
                      "enforce": "Enforce (flip / momentum setups trade only once confirmed)"}
+DEBATE_MODES = {"off": "Off", "paper": "Paper (scan -> bull / bear -> judge, simulated fills, never orders)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -215,6 +216,9 @@ class Settings:
     gex_confirm_rules: str = "shadow"    # off | shadow | enforce - 2 closes past the flip + SPY/QQQ/SPX agree (gex_plan)
     gex_broker: bool = False             # send gex_plan.broker_filter ideas to the (paper) broker, booked in the ledger
     gex_broker_qty: int = 1
+    # --- Trade debate (src/agents/debate.py): scanner -> bull agent / bear agent -> judge, PAPER book only ---
+    debate_mode: str = "paper"           # off | paper
+    debate_max_per_scan: int = 3         # ideas debated per 5-min scan (3 LLM calls each, ~30 s)
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -255,6 +259,7 @@ class Settings:
         "trail_giveback_pct": (0.02, 1.0),
         "fc_premium_pct": (0.005, 0.20),
         "gex_risk_per_idea": (10.0, 5_000.0),
+        "debate_max_per_scan": (0, 10),
         "fc_delta": (0.10, 0.80),
         "fc_friday_dte": (0, 3),
         "fc_target_mult": (0.5, 10.0),
@@ -346,6 +351,8 @@ class Settings:
             s.gex_flip_rules = "shadow"
         if s.gex_confirm_rules not in GEX_CONFIRM_RULES:
             s.gex_confirm_rules = "shadow"
+        if s.debate_mode not in DEBATE_MODES:
+            s.debate_mode = "paper"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)
