@@ -389,6 +389,7 @@ def tracker(led) -> None:
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
     shadow_books(led, df)
     debate_book(led, df)
+    vol_debate_book(led)
 
 
 def debate_book(led, main: pd.DataFrame) -> None:
@@ -428,6 +429,40 @@ def debate_book(led, main: pd.DataFrame) -> None:
             for x in reversed(calls[-30:]):
                 st.markdown(f"**{x['at'][5:16]} {x['ticker']} {x['side']} - {x['setup']} ({x['grade']}) -> "
                             f"{x['decision']}**: {x.get('why', '')}")
+                for side in ("bull", "bear"):
+                    if x.get(side):
+                        st.caption(f"{side} {x[side]['conviction']}/10: " + " · ".join(x[side]["case"]))
+
+
+def vol_debate_book(led) -> None:
+    """Stock debate slice (src/agents/vol_debate.py): its broker trades (ledger notes vol_debate|...) and debates."""
+    if led is None:
+        return
+    trades = [t for t in led.trades(limit=5000) if (t.get("notes") or "").startswith("vol_debate")]
+    calls = led.get_kv("vol_debate_decisions") or []
+    if not trades and not calls:
+        return
+    st.subheader("Stock debate slice: volume scan -> bull / bear -> judge (paper broker)")
+    st.caption("Every 15 min (10:00-14:30 ET) today's most traded names with unusual volume are argued by a bull "
+               "(buy) and a bear (short) agent; the judge buys, shorts or skips and sets stop, take-profit and a time "
+               "exit. Bracket orders on the bot's Alpaca paper account, own $ sleeve (Settings).")
+    df = pd.DataFrame(trades)
+    closed = df[df["status"] == "CLOSED"] if not df.empty else df
+    if not closed.empty:
+        c = st.columns(4)
+        c[0].metric("Closed trades", len(closed))
+        c[1].metric("Win %", f"{(closed['realized_pnl'] > 0).mean() * 100:.0f}%")
+        c[2].metric("Realized P&L", f"${closed['realized_pnl'].sum():,.0f}")
+        c[3].metric("Open now", int((df["status"] == "OPEN").sum()))
+    if not df.empty:
+        cols = [c for c in ("trade_date", "symbol", "direction", "qty", "entry_price", "stop_price", "target_price",
+                            "exit_price", "exit_reason", "realized_pnl", "status", "notes") if c in df]
+        st.dataframe(df[cols].iloc[::-1].head(50), hide_index=True, width="stretch")
+    if calls:
+        with st.expander(f"All stock debates ({len(calls)})"):
+            for x in reversed(calls[-30:]):
+                st.markdown(f"**{x['at'][5:16]} {x['ticker']} (RVOL {x.get('rvol')}, {x.get('change_pct')}%) -> "
+                            f"{x['decision']}** {x.get('order', '')}: {x.get('why', '')}")
                 for side in ("bull", "bear"):
                     if x.get(side):
                         st.caption(f"{side} {x[side]['conviction']}/10: " + " · ".join(x[side]["case"]))

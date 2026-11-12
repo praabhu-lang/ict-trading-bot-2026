@@ -28,7 +28,7 @@ from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
 from src import dashboard_gex as gex_tab  # noqa: E402
 from src import dashboard_pages as pages  # noqa: E402
-from src.core.settings import BROKERS, DEBATE_MODES, DEFAULT_UNIVERSE, FC_MODES, GEX_CONFIRM_RULES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
+from src.core.settings import BROKERS, DEBATE_MODES, VOL_DEBATE_MODES, DEFAULT_UNIVERSE, FC_MODES, GEX_CONFIRM_RULES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
@@ -563,6 +563,16 @@ with tab_set:
                                    help="Each 5-min scan the best ACTIVE GEX ideas are argued by a bull and a bear LLM "
                                    "agent; a judge trades the clear winners with its own stop / target / time exit. "
                                    "Paper book only (GEX tab, day summary).")
+        vc = st.columns(2)
+        vol_mode = vc[0].selectbox("Stock debate slice (volume scan, bull / bear / judge)", list(VOL_DEBATE_MODES),
+                                   index=list(VOL_DEBATE_MODES).index(settings.vol_debate_mode),
+                                   format_func=VOL_DEBATE_MODES.get,
+                                   help="Every 15 min 10:00-14:30 ET: unusual-volume names are debated; the judge's "
+                                   "BUY / SELL goes to the paper broker as a bracket order (stop + take-profit), "
+                                   "closed at its time exit or the flatten time.")
+        vol_cap = vc[1].number_input("Stock debate sleeve ($)", 0.0, 1_000_000.0, float(settings.vol_capital), 1000.0,
+                                     help=f"Sizing base (+ the slice's realized P&L). Risk "
+                                     f"{settings.vol_risk_pct:.0%} at the stop, max {settings.vol_max_open} open.")
         gex_broker = st.toggle(f"GEX ideas: send the SPY/QQQ confirmed-put slice to the broker "
                                f"({settings.gex_broker_qty} contract, paper account only)", settings.gex_broker,
                                help="Same-day SPY / QQQ puts (call-wall fade, flip rejection, momentum below the flip) "
@@ -686,6 +696,7 @@ with tab_set:
                     "broker": broker_choice, "auto_trade": auto_trade, "universe": universe, "news_llm_mode": news_llm,
                     "gex_risk_per_idea": float(gex_risk), "gex_gate_mode": gex_gate, "gex_flip_rules": gex_flip,
                     "gex_confirm_rules": gex_confirm, "gex_broker": bool(gex_broker), "debate_mode": debate_mode,
+                    "vol_debate_mode": vol_mode, "vol_capital": float(vol_cap),
                     "starting_capital": float(start_cap), "stock_capital": float(stock_cap),
                     "reserve_capital": float(reserve_cap),
                     "risk_per_trade_pct": risk / 100, "options_allocation_pct": pool / 100,

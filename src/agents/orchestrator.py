@@ -36,12 +36,14 @@ from .execution_agent import ExecutionAgent, choose_option
 from .market_analyst import MarketAnalystAgent
 from .monitor_agent import intraday, momentum_against, option_exit_reason, stock_exit_reason
 from .news_agent import NewsAgent, llm_veto
+from .vol_debate import TAG as VOL_TAG
 from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_room, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
 URGENT_EXITS = {"STOP_LOSS", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}   # EOD has 15 min: it works the mid first
 SCAN_DELAY_SECONDS = 20
 SHOCK_TTL = timedelta(minutes=30)       # market-wide news check, shared across engine runs (Tavily credits)  # let the data vendor finalize the bar that just closed
+VOL_FIRST, VOL_LAST = dtime(10, 0), dtime(14, 30)   # stock debate slice: new entries (ET)
 
 
 class TradingEngine:
@@ -96,7 +98,8 @@ class TradingEngine:
                 self.status[key] = previous[key]
         for step in (self.reconcile, lambda: self.manage_exits(now), lambda: self.fomc_paper(now),
                      lambda: self.last45_paper(now), lambda: self.qqq_fade_paper(now),
-                     lambda: self.vrz_paper_manage(now), lambda: self.gex_ideas(now, scan)):
+                     lambda: self.vrz_paper_manage(now), lambda: self.gex_ideas(now, scan),
+                     lambda: self.vol_debate_trade(now, scan)):
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - one failing step must not stop exit management
@@ -219,7 +222,10 @@ class TradingEngine:
                         price = (bid + ask) / 2.0
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Quote failed for %s: %s", t["symbol"], exc)
-                reason = force_reason or stock_exit_reason(t, price or 0.0, self.s, now, flatten_at, fading)
+                vol = _is_vol(t)      # stock debate slice: the judge's exits only, no momentum-fade exit
+                reason = force_reason or stock_exit_reason(t, price or 0.0, self.s, now, flatten_at, fading and not vol)
+                if not reason and vol and _vol_exit_by(t) and now >= _vol_exit_by(t):
+                    reason = "TIME_EXIT"
                 if reason:
                     if not self._release_broker_stop(t):
                         continue  # the broker stop already filled; reconcile() books it next cycle
@@ -313,10 +319,9 @@ class TradingEngine:
         g = session_gate(now, self.s, self.calendar)
         acct = self.broker.account()
         equity = self.s.trading_equity(acct.equity, self.ledger.total_realized_pnl())
-        open_n = len(intraday(self.ledger.open_trades()))
-        # Bot-only day P&L (the broker account may hold other activity).
-        day_pnl = self.ledger.realized_pnl_on(now.date())
-        a = account_gate(self.s, equity, len(self.ledger.trades_on(now.date())), open_n, day_pnl)
+        n_today, open_n, day_pnl = self._main_counts(now.date())
+        # Bot-only day P&L (the broker account may hold other activity; the stock debate slice has its own limits).
+        a = account_gate(self.s, equity, n_today, open_n, day_pnl)
         reasons = g.reasons + a.reasons
         if not self.s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
@@ -324,6 +329,14 @@ class TradingEngine:
         self.status.update({"account_equity": acct.equity, "trading_equity": equity,
                             "buying_power": acct.buying_power, "bot_day_pnl": day_pnl})
         return Gate(not reasons, reasons)
+
+    def _main_counts(self, d) -> tuple[int, int, float]:
+        """(trades today, open intraday positions, realized P&L today) without the stock debate slice, which has its
+        own sleeve and limits (vol_max_open / vol_max_per_day)."""
+        today = [t for t in self.ledger.trades_on(d) if not _is_vol(t)]
+        open_n = len([t for t in intraday(self.ledger.open_trades()) if not _is_vol(t)])
+        pnl = sum(float(t.get("realized_pnl") or 0) for t in today if t["status"] == "CLOSED")
+        return len(today), open_n, pnl
 
     def scan_and_trade(self, now: datetime, trade: bool = True) -> int:
         """Scan the universe. trade=False is the dashboard's forced post-open scan: it refreshes levels and
@@ -585,8 +598,7 @@ class TradingEngine:
         event = self.calendar.active_blackout(now)
         if event:
             reasons.append(f"Event blackout: {event.name}")
-        reasons += account_gate(s, equity, len(self.ledger.trades_on(d)), len(intraday(self.ledger.open_trades())),
-                                self.ledger.realized_pnl_on(d)).reasons
+        reasons += account_gate(s, equity, *self._main_counts(d)).reasons
         if not s.auto_trade:
             reasons.append("Auto-trade off (alerts only)")
         profile, mult, size_notes = "classic", 1.0, []
@@ -1437,6 +1449,127 @@ class TradingEngine:
         self.ledger.set_kv("debate_decisions", decisions[-500:])
         self.status["debate_open"] = len(book)
 
+    # ------------------------------------------------ stock debate slice (volume scan -> bull / bear -> judge)
+    def vol_debate_trade(self, now: datetime, scan: bool) -> None:
+        """Every 15 min (VOL_FIRST-VOL_LAST ET): scan today's most traded names for unusual volume, debate the best
+        settings.vol_per_scan (src/agents/vol_debate.py), and send the judge's BUY / SELL as a bracket order on the
+        paper broker, booked in the ledger (notes vol_debate|...). Own sleeve: vol_capital + its realized P&L."""
+        from ..strategy import vol_scan as vs
+        from ..strategy.gex_plan import top_traded
+        from . import vol_debate as vd
+
+        s, d = self.s, now.date()
+        if s.vol_debate_mode != "broker" or not scan or not is_trading_day(d):
+            return
+        t_et = now.astimezone(ET)
+        if not VOL_FIRST <= t_et.time() <= VOL_LAST or now >= flatten_time(now, s):
+            return
+        if not self.ledger.alert_once(f"vol_scan:{d.isoformat()}:{t_et.hour}:{t_et.minute // 15}"):
+            return                                                   # one scan per 15-min slot
+        llm = getattr(self.news, "llm", None)
+        if not s.auto_trade or not self.broker.is_paper or llm is None or not getattr(llm, "enabled", False):
+            return
+        open_vol = [t for t in self.ledger.open_trades() if _is_vol(t)]
+        if len(open_vol) >= s.vol_max_open or \
+                sum(1 for t in self.ledger.trades_on(d) if _is_vol(t)) >= s.vol_max_per_day:
+            return
+        if self.calendar.active_blackout(now) or self.market.schwab is None:
+            return
+        movers = self.market.schwab.movers("$SPX", "VOLUME") + self.market.schwab.movers("$COMPX", "VOLUME")
+        held = {t["underlying"] for t in self.ledger.open_trades()} | {p.symbol for p in self.broker.positions()}
+        names = [n for n in top_traded(movers, s.vol_universe, exclude={"SPY", "QQQ", "SPX"} | set(OPTIONS_ONLY))
+                 if n not in held]
+        cands = vs.scan(self.market, names, now, s.vol_min_rvol)
+        if not cands:
+            return
+        spy = vs.features("SPY", self.market.bars("SPY", now), now) or {}
+        closed = self._vol_closed()
+        decisions = self.ledger.get_kv("vol_debate_decisions") or []
+        flat, opened = flatten_time(now, s), 0
+        for f in cands[:s.vol_per_scan]:
+            if len(open_vol) + opened >= s.vol_max_open:
+                break
+            if not self.ledger.alert_once(f"vol_debate:{d.isoformat()}:{f['ticker']}"):
+                continue
+            facts = {**f, "spy_change_pct": spy.get("change_pct"), "learned": vd.learned(closed)}
+            rec = vd.debate(llm, facts, now, flat, s.vol_allow_short)
+            row = {"id": f"{d.isoformat()}:{f['ticker']}", "date": d.isoformat(), "at": now.isoformat(timespec="seconds"),
+                   **{k: f[k] for k in ("ticker", "price", "rvol", "change_pct", "pct_from_vwap")}, **rec}
+            if rec["decision"] in ("BUY", "SELL"):
+                row["order"] = self._vol_enter(f, rec, now)
+                opened += row["order"] == "FILLED"
+            decisions.append(row)
+        self.ledger.set_kv("vol_debate_decisions", decisions[-500:])
+
+    def _vol_closed(self) -> list[dict]:
+        """Closed slice trades with R = realized P&L / the risk at the stop."""
+        out = []
+        for t in self.ledger.trades(limit=5000):
+            if not _is_vol(t) or t["status"] != "CLOSED":
+                continue
+            risk = abs(float(t["entry_price"]) - float(t.get("stop_price") or t["entry_price"])) * float(t["qty"] or 0)
+            out.append({**t, "R": round(float(t["realized_pnl"] or 0) / risk, 2) if risk > 0 else None})
+        return out
+
+    def _vol_enter(self, f: dict, rec: dict, now: datetime) -> str:
+        """Bracket order for the judge's decision; returns FILLED or why it was not sent."""
+        from . import vol_debate as vd
+
+        s, ticker, buy = self.s, f["ticker"], rec["decision"] == "BUY"
+        stop, target = rec["stop"], rec["target"]
+        news_block = self._news_block()
+        if news_block:
+            return f"skip: {news_block}"
+        try:
+            bid, ask = self.broker.quote(ticker)
+        except Exception:  # noqa: BLE001
+            bid = ask = 0.0
+        live = ask if buy else bid
+        if live <= 0 or abs(live - f["price"]) > 0.5 * f["risk_unit"]:
+            return f"skip: live price {live:.2f} moved from {f['price']:.2f} during the debate"
+        if not (stop < live < target if buy else target < live < stop):
+            return f"skip: live {live:.2f} outside stop {stop} / target {target}"
+        try:
+            acct, positions = self.broker.account(), self.broker.positions()
+            room = reserve_room(s, acct.equity, positions)
+        except Exception as exc:  # noqa: BLE001 - cannot verify the reserve: do not trade
+            self._error("vol debate reserve check failed", exc)
+            return "skip: reserve check failed"
+        sleeve = s.vol_capital + sum(float(t["realized_pnl"] or 0) for t in self._vol_closed())
+        in_use = sum(float(t["entry_price"]) * float(t["qty"]) for t in self.ledger.open_trades() if _is_vol(t))
+        qty = vd.shares(sleeve, s.vol_risk_pct, s.vol_max_open, live, stop, min(room, sleeve - in_use))
+        if qty < 1:
+            return f"skip: size < 1 share (sleeve {sleeve:,.0f}, in use {in_use:,.0f}, reserve room {room:,.0f})"
+        direction = "bull" if buy else "bear"
+        try:
+            fill, legs = self.execution.open_stock(ticker, qty, direction, stop, target)
+        except Exception as exc:  # noqa: BLE001 - e.g. not shortable
+            self._error(f"vol debate order {ticker}", exc)
+            return f"skip: order rejected ({str(exc)[:120]})"
+        if not fill.filled:
+            self._error(f"vol debate entry {ticker} did not fill", RuntimeError("bracket order not filled"))
+            return "not filled"
+        conf = rec["judge"]["confidence"]
+        self.ledger.open_trade(
+            trade_date=now.date().isoformat(), broker=self.broker.name, underlying=ticker, symbol=ticker,
+            asset_class="stock", direction=direction, qty=fill.qty, entry_price=fill.avg_price,
+            stop_price=stop, target_price=target, underlying_stop=stop, underlying_target=target,
+            signal_score=conf * 10, entry_order_id=fill.order_ids[0], exit_order_ids=legs,
+            notes=f"{VOL_TAG}|exit_by {rec['exit_by']}|conf {conf}|rvol {f['rvol']}|{rec['why'][:160]}",
+        )
+        self.notifier.send(
+            f"🚀 {'BOUGHT' if buy else 'SHORTED'} {ticker} x{fill.qty:g} @ {fill.avg_price:.2f} (stock debate)",
+            table([{"Ticker": ticker, "Side": rec["decision"], "Qty": fill.qty, "Fill": fill.avg_price, "Stop": stop,
+                    "Target": target, "Exit by": rec["exit_by"][11:16], "RVOL": f["rvol"], "Judge": f"{conf}/10",
+                    "Broker": f"{self.broker.name} (paper)"}])
+            + f"<p><b>Judge:</b> {html.escape(rec['why'])}</p>"
+            + f"<p><b>Bull {rec['bull']['conviction']}/10:</b> {html.escape(' · '.join(rec['bull']['case']))}</p>"
+            + f"<p><b>Bear {rec['bear']['conviction']}/10:</b> {html.escape(' · '.join(rec['bear']['case']))}</p>"
+            + ("<p>Bracket at the broker (stop + take-profit).</p>" if legs
+               else "<p>⚠️ Bracket legs not confirmed - check the broker.</p>"),
+        )
+        return "FILLED"
+
     def _gex_broker_enter(self, idea, now: datetime) -> bool:
         """Buy a broker_filter idea's contract (settings.gex_broker_qty) and book it in the ledger (notes gex_idea|...)
         so reconcile / manage_exits own it. Paper broker only, auto_trade on, one per ticker per day, reserve kept."""
@@ -1712,6 +1845,12 @@ class TradingEngine:
                             f"{sum(1 for x in debated if x['decision'] == 'TRADE')} · "
                             f"{sum(float(x.get('R') or 0) for x in debate_today):+.1f}R, "
                             f"{sum(float(x.get('pnl_sized') or 0) for x in debate_today):+,.2f}</p>")
+        vol_calls = [x for x in (self.ledger.get_kv("vol_debate_decisions") or []) if x["date"] == now.date().isoformat()]
+        if vol_calls:
+            plan_html += ("<h3>Stock debate slice (volume scan, bull / bear / judge)</h3>" + table([{
+                "Time": x["at"][11:16], "Ticker": x["ticker"], "RVOL": x.get("rvol"), "Decision": x["decision"],
+                "Order": x.get("order", ""), "Why": x.get("why", "")} for x in vol_calls])
+                + "<p>Its fills are in the broker table below (notes vol_debate).</p>")
         recap = self._llm_recap(now, closed, total, month, sigs, today, vrz_today, gex_today)
         if recap:
             plan_html = f"<p><i>{html.escape(recap)}</i></p>" + plan_html
@@ -1734,6 +1873,20 @@ Mention P&L, what traded and why it exited, anything blocked, and the paper-trac
 Plain text, no markdown, no preamble.
 
 {facts}"""
+
+
+def _is_vol(t: dict) -> bool:
+    return (t.get("notes") or "").startswith(VOL_TAG)
+
+
+def _vol_exit_by(t: dict) -> datetime | None:
+    import re
+
+    m = re.search(r"exit_by ([^|\s]+)", t.get("notes") or "")
+    try:
+        return datetime.fromisoformat(m.group(1)) if m else None
+    except ValueError:
+        return None
 
 
 def _close_gex(rec: dict, now: datetime, bid: float, spot: float, reason: str) -> dict:

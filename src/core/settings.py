@@ -45,6 +45,7 @@ GEX_FLIP_RULES = {"classic": "Classic (flip + 15 min drift)", "shadow": "Shadow 
                   "strict": "Strict (test, rejection / reclaim close, confirmation bar, 5m momentum)"}
 GEX_CONFIRM_RULES = {"off": "Off", "shadow": "Shadow (classic trades, confirmed tracked aside)",
                      "enforce": "Enforce (flip / momentum setups trade only once confirmed)"}
+VOL_DEBATE_MODES = {"off": "Off", "broker": "On: bracket orders on the bot's paper account (paper broker only)"}
 DEBATE_MODES = {"off": "Off", "paper": "Paper (scan -> bull / bear -> judge, simulated fills, never orders)"}
 
 
@@ -219,6 +220,16 @@ class Settings:
     # --- Trade debate (src/agents/debate.py): scanner -> bull agent / bear agent -> judge, PAPER book only ---
     debate_mode: str = "paper"           # off | paper
     debate_max_per_scan: int = 3         # ideas debated per 5-min scan (3 LLM calls each, ~30 s)
+    # --- Stock debate slice (src/agents/vol_debate.py): volume scan -> bull / bear -> judge -> bracket order ---
+    vol_debate_mode: str = "broker"      # off | broker (paper broker only; booked in the ledger, notes vol_debate|)
+    vol_capital: float = 10_000.0        # the slice's own sleeve; sizing uses this + its realized P&L
+    vol_risk_pct: float = 0.01           # loss at the stop, share of the sleeve
+    vol_max_open: int = 3                # open positions at once; each capped at sleeve / vol_max_open notional
+    vol_max_per_day: int = 6
+    vol_min_rvol: float = 1.5            # today's volume vs the 5-session average up to the same time
+    vol_per_scan: int = 2                # candidates debated per 15-min scan
+    vol_universe: int = 20               # most traded names scanned
+    vol_allow_short: bool = True         # the judge may SELL short
 
     # --- extra blackout events added from the dashboard ---
     # [{"date": "2026-10-15", "time": "14:00", "duration_min": 30, "name": "Fed Chair speech"}]
@@ -260,6 +271,13 @@ class Settings:
         "fc_premium_pct": (0.005, 0.20),
         "gex_risk_per_idea": (10.0, 5_000.0),
         "debate_max_per_scan": (0, 10),
+        "vol_capital": (0.0, 1_000_000.0),
+        "vol_risk_pct": (0.001, 0.05),
+        "vol_max_open": (1, 10),
+        "vol_max_per_day": (0, 30),
+        "vol_min_rvol": (1.0, 10.0),
+        "vol_per_scan": (0, 5),
+        "vol_universe": (5, 50),
         "fc_delta": (0.10, 0.80),
         "fc_friday_dte": (0, 3),
         "fc_target_mult": (0.5, 10.0),
@@ -353,6 +371,8 @@ class Settings:
             s.gex_confirm_rules = "shadow"
         if s.debate_mode not in DEBATE_MODES:
             s.debate_mode = "paper"
+        if s.vol_debate_mode not in VOL_DEBATE_MODES:
+            s.vol_debate_mode = "off"
         if s.broker not in BROKERS:
             s.broker = "alpaca_paper"
         s.universe = [t.strip().upper() for t in s.universe if str(t).strip()] or list(DEFAULT_UNIVERSE)

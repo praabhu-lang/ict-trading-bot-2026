@@ -162,6 +162,18 @@ def clamp_exits(side: str, spot: float, scan_stop: float, scan_target: float, st
     return round(spot - sign * d, 2), round(spot + sign * dt, 2), notes
 
 
+JUDGE_TOKENS = 6000         # the judge reasons over both cases: 2,500 tokens sometimes ran out before the JSON
+
+
+def ask_judge(llm, prompt: str, what: str, parse):
+    """The judge's parsed answer, one retry when the reply is missing or malformed."""
+    for _ in range(2):
+        out = parse(llm.ask_json(prompt, what, max_tokens=JUDGE_TOKENS))
+        if out is not None:
+            return out
+    return None
+
+
 def parse_judgment(data: dict | None) -> dict | None:
     if not data:
         return None
@@ -187,10 +199,10 @@ def debate(llm, f: dict, now: datetime, flatten_at: datetime) -> dict:
     if bull is None or bear is None:
         rec["why"] = "LLM unavailable (bull / bear)"
         return rec
-    judge = parse_judgment(llm.ask_json(JUDGE.format(
+    judge = ask_judge(llm, JUDGE.format(
         **ctx, bull="\n".join(f"- {p}" for p in bull["case"]) or "- (nothing)", bull_conv=bull["conviction"],
         bear="\n".join(f"- {p}" for p in bear["case"]) or "- (nothing)", bear_conv=bear["conviction"],
-        stop=f["stop"], target=f["target"]), f"judge {what}"))
+        stop=f["stop"], target=f["target"]), f"judge {what}", parse_judgment)
     rec["judge"] = judge
     if judge is None:
         rec["why"] = "LLM unavailable (judge)"
