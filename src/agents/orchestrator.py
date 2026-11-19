@@ -1717,7 +1717,23 @@ class TradingEngine:
                      "grade": idea.grade, "contract": idea.contract, "dte": idea.dte, "entry": idea.ask,
                      "spot": p.spot, "stop": idea.stop, "target": idea.target, **snap,
                      "risk_1c": risk_1c, "qty": qty, "gate": gate, "gate_mode": self.s.gex_gate_mode,
-                     "votes": {k: v["score"] for k, v in idea.confluence.items()}, **(extra or {})})
+                     "votes": {k: v["score"] for k, v in idea.confluence.items()}, **(extra or {}),
+                     **({"tm": self._time_machine(idea, p.spot, now)} if self.s.tm_mode == "shadow" else {})})
+
+    def _time_machine(self, idea, spot: float, now: datetime) -> dict:
+        """SHADOW: replay odds for this idea's underlying stop / target until the flatten time. Never gates or sizes;
+        one replay per ticker + setup + bar, shared by the GEX books (ideas, strict, confirm)."""
+        from ..strategy import timemachine as tm
+
+        key = (idea.ticker, idea.setup, idea.stop, idea.target, int(now.timestamp() // 300))
+        cache = self.__dict__.setdefault("_tm_cache", {})
+        if key not in cache:
+            try:
+                cache[key] = tm.replay_plan(self.market.session_bars(idea.ticker, now), now,
+                                            flatten_time(now, self.s), spot, idea.stop, idea.target)
+            except Exception as exc:  # noqa: BLE001 - shadow data must never block an idea
+                cache[key] = {"error": f"{exc}"[:200]}
+        return cache[key]
 
     def _llm_recap(self, now: datetime, closed, total, month, sigs, plan, vrz, gex) -> str | None:
         llm = getattr(self.news, "llm", None)

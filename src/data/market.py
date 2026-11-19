@@ -117,6 +117,14 @@ class MarketData:
             return df.groupby(df.index.date)["close"].last()
         return self._cached(("daily", symbol, now.date()), 86400, fetch)
 
+    def session_bars(self, symbol: str, now: datetime, sessions: int = 60) -> pd.DataFrame:
+        """Closed 5-minute regular-session bars of the last `sessions` completed days, today excluded (cached for
+        the day: the time machine's pool, src/strategy/timemachine.py)."""
+        def fetch():
+            yesterday = previous_trading_day(now.date())
+            return self._fetch_bars(symbol, yesterday, sessions, market_close_dt(yesterday))
+        return self._cached(("session_bars", symbol, sessions, now.date()), 86400, fetch)
+
     def bars(self, symbol: str, now: datetime, days: int = 6) -> pd.DataFrame:
         """Closed 5-minute regular-session bars for today and the prior `days` sessions."""
         bar_slot = int(now.timestamp() // (BAR_MINUTES * 60))

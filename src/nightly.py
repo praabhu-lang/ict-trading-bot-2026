@@ -156,6 +156,17 @@ def run_nightly(store, market, ledger_fn, today: date) -> dict:
         log.exception("GEX ideas replay failed")
         report["gex_replay"] = f"FAILED: {exc}"[:300]
     try:
+        from .strategy import timemachine as tm
+        books: dict[str, list] = {}
+        ledger_fn(lambda led: books.update({k: led.get_kv(f"{k}_log") or [] for k in ("gex_ideas", "gex_confirm",
+                                                                                       "gex_strict")}))
+        cal = {"generated": today.isoformat(), **{k: tm.calibration(v) for k, v in books.items()}}
+        ledger_fn(lambda led: led.set_kv("tm_calibration", cal))
+        report["tm_calibration"] = {k: cal[k]["n"] for k in books}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("time machine calibration failed")
+        report["tm_calibration"] = f"FAILED: {exc}"[:300]
+    try:
         shadow, summary = smart_rule_research(today)
         report["shadow_signals"] = len(shadow)
         report["profile"] = summary["current_profile"]

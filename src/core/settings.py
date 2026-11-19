@@ -219,7 +219,8 @@ class Settings:
     gex_broker_qty: int = 1
     # --- Trade debate (src/agents/debate.py): scanner -> bull agent / bear agent -> judge, PAPER book only ---
     debate_mode: str = "paper"           # off | paper
-    debate_max_per_scan: int = 3         # ideas debated per 5-min scan (3 LLM calls each, ~30 s)
+    tm_mode: str = "shadow"              # off | shadow - time-machine odds logged on each GEX idea (src/strategy/timemachine.py)
+    debate_max_per_scan: int = 3         # ideas debated per 5-min scan, in parallel (3+ LLM calls each, <= 240 s)
     # --- Stock debate slice (src/agents/vol_debate.py): volume scan -> bull / bear -> judge -> bracket order ---
     vol_debate_mode: str = "broker"      # off | broker (paper broker only; booked in the ledger, notes vol_debate|)
     vol_capital: float = 10_000.0        # the slice's own sleeve; sizing uses this + its realized P&L
@@ -371,6 +372,8 @@ class Settings:
             s.gex_confirm_rules = "shadow"
         if s.debate_mode not in DEBATE_MODES:
             s.debate_mode = "paper"
+        if s.tm_mode not in ("off", "shadow"):
+            s.tm_mode = "shadow"
         if s.vol_debate_mode not in VOL_DEBATE_MODES:
             s.vol_debate_mode = "off"
         if s.broker not in BROKERS:
