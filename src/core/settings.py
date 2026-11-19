@@ -46,7 +46,8 @@ GEX_FLIP_RULES = {"classic": "Classic (flip + 15 min drift)", "shadow": "Shadow 
 GEX_CONFIRM_RULES = {"off": "Off", "shadow": "Shadow (classic trades, confirmed tracked aside)",
                      "enforce": "Enforce (flip / momentum setups trade only once confirmed)"}
 VOL_DEBATE_MODES = {"off": "Off", "broker": "On: bracket orders on the bot's paper account (paper broker only)"}
-DEBATE_MODES = {"off": "Off", "paper": "Paper (scan -> bull / bear -> judge, simulated fills, never orders)"}
+DEBATE_MODES = {"off": "Off", "paper": "Paper (scan -> bull / bear -> judge, simulated fills, never orders)",
+                "broker": "Broker: the judge's TRADE calls buy the option on the bot's paper account (paper book kept too)"}
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -218,11 +219,17 @@ class Settings:
     gex_broker: bool = False             # send gex_plan.broker_filter ideas to the (paper) broker, booked in the ledger
     gex_broker_qty: int = 1
     # --- Trade debate (src/agents/debate.py): scanner -> bull agent / bear agent -> judge, PAPER book only ---
-    debate_mode: str = "paper"           # off | paper
+    debate_mode: str = "paper"           # off | paper | broker (broker = paper account; only once it shows a profit)
+    debate_capital: float = 5_000.0      # broker sleeve; notional per trade <= (this + its realized P&L) / debate_max_open
+    debate_risk_per_trade: float = 100.0  # $ lost if the underlying hits the judge's stop (sets the contracts)
+    debate_max_open: int = 2
+    debate_max_per_day: int = 4
+    debate_max_contracts: int = 5
     tm_mode: str = "shadow"              # off | shadow - time-machine odds logged on each GEX idea (src/strategy/timemachine.py)
     debate_max_per_scan: int = 3         # ideas debated per 5-min scan, in parallel (3+ LLM calls each, <= 240 s)
     # --- Stock debate slice (src/agents/vol_debate.py): volume scan -> bull / bear -> judge -> bracket order ---
-    vol_debate_mode: str = "broker"      # off | broker (paper broker only; booked in the ledger, notes vol_debate|)
+    vol_debate_mode: str = "off"         # off | broker (paper broker only; booked in the ledger, notes vol_debate|).
+                                         # Off since 2026-11-19: -$26 on 2 broker trades; only proven books trade
     vol_capital: float = 10_000.0        # the slice's own sleeve; sizing uses this + its realized P&L
     vol_risk_pct: float = 0.01           # loss at the stop, share of the sleeve
     vol_max_open: int = 3                # open positions at once; each capped at sleeve / vol_max_open notional
@@ -272,6 +279,11 @@ class Settings:
         "fc_premium_pct": (0.005, 0.20),
         "gex_risk_per_idea": (10.0, 5_000.0),
         "debate_max_per_scan": (0, 10),
+        "debate_capital": (0.0, 1_000_000.0),
+        "debate_risk_per_trade": (10.0, 5_000.0),
+        "debate_max_open": (1, 10),
+        "debate_max_per_day": (0, 30),
+        "debate_max_contracts": (1, 50),
         "vol_capital": (0.0, 1_000_000.0),
         "vol_risk_pct": (0.001, 0.05),
         "vol_max_open": (1, 10),

@@ -39,6 +39,8 @@ from .market_analyst import MarketAnalystAgent
 from .monitor_agent import intraday, momentum_against, option_exit_reason, stock_exit_reason
 from .news_agent import NewsAgent, llm_veto
 from .vol_debate import TAG as VOL_TAG
+
+DEBATE_TAG = "debate"                   # trade-debate broker orders (notes debate|...); not vol_debate
 from .risk_agent import Gate, account_gate, flatten_time, open_risk, reserve_room, session_gate, size_option, size_stock
 
 log = logging.getLogger(__name__)
@@ -211,7 +213,7 @@ class TradingEngine:
             underlying_px = float(today_bars["close"].iloc[-1]) if today_bars is not None and len(today_bars) else None
 
             if t["asset_class"] == "option":
-                if (t.get("notes") or "").startswith((fc.STRATEGY_TAG, GEX_TAG)):
+                if (t.get("notes") or "").startswith((fc.STRATEGY_TAG, GEX_TAG, DEBATE_TAG)):
                     bid, ask = self._option_bid_ask(t["symbol"])
                 else:
                     try:
@@ -227,8 +229,11 @@ class TradingEngine:
                     reason = force_reason or self._first_candle_exit(t, today_bars, now, flatten_at)
                     if not reason:
                         continue                     # no stop loss in this strategy: no broker stop to sync
-                elif (t.get("notes") or "").startswith(GEX_TAG):
+                elif (t.get("notes") or "").startswith((GEX_TAG, DEBATE_TAG)):
                     reason = force_reason or self._gex_broker_exit(t, now, flatten_at, underlying_px)
+                    exit_by = _vol_exit_by(t) if (t.get("notes") or "").startswith(DEBATE_TAG) else None
+                    if not reason and exit_by and now >= exit_by:
+                        reason = "TIME_EXIT"             # the debate judge's time exit
                     if not reason:
                         continue                     # stop / target are on the underlying, checked every cycle
                 else:
@@ -1377,7 +1382,7 @@ class TradingEngine:
                             self._gex_broker_enter(x, now)
                             break
             self.ledger.record_gex_levels(levels)
-            if self.s.debate_mode == "paper":
+            if self.s.debate_mode in ("paper", "broker"):
                 try:
                     self._debate(results, now, d_keep, gates, extra)
                 except Exception as exc:  # noqa: BLE001 - the debate must never stop the GEX book
@@ -1477,6 +1482,12 @@ class TradingEngine:
                          "qty": gl.contracts(self.s.gex_risk_per_idea, risk_1c),
                          "confidence": rec["judge"]["confidence"], "why": rec["why"],
                          "bull": rec["bull"]["conviction"], "bear": rec["bear"]["conviction"]})
+            if self.s.debate_mode == "broker":
+                try:
+                    decisions[-1]["order"] = self._debate_broker_enter(rid, idea, rec, now, risk_1c)
+                except Exception as exc:  # noqa: BLE001 - keep the paper book and the other debates going
+                    self._error(f"debate broker entry {idea.contract}", exc)
+                    decisions[-1]["order"] = f"error: {exc}"[:200]
         self.ledger.set_kv("debate_decisions", decisions[-500:])
         self.status["debate_open"] = len(book)
 
@@ -1655,6 +1666,65 @@ class TradingEngine:
               f"close. No premium stop (1 contract, premium is the risk).</p>",
         )
         return True
+
+    def _debate_broker_enter(self, rid: str, idea, rec: dict, now: datetime, risk_1c: float) -> str:
+        """Buy the contract of a debate TRADE on the paper broker and book it (notes debate|...). Own sleeve:
+        settings.debate_capital + its realized P&L, debate_risk_per_trade at the judge's underlying stop, at most
+        debate_max_contracts / debate_max_open / debate_max_per_day; the reserve is kept. Returns FILLED or why not."""
+        from ..strategy import gex_learn as gl
+
+        s, d = self.s, now.date()
+        if not s.auto_trade or not self.broker.is_paper:
+            return "skip: auto trade off or not the paper broker"
+        mine = [t for t in self.ledger.trades(limit=5000) if (t.get("notes") or "").startswith(DEBATE_TAG + "|")]
+        if sum(t["status"] == "OPEN" for t in mine) >= s.debate_max_open:
+            return f"skip: {s.debate_max_open} debate trades already open"
+        if sum(t["trade_date"] == d.isoformat() for t in mine) >= s.debate_max_per_day:
+            return f"skip: {s.debate_max_per_day} debate trades today"
+        if any(t["underlying"] == idea.ticker for t in self.ledger.open_trades()):
+            return f"skip: the bot already holds {idea.ticker}"
+        if self.calendar.active_blackout(now):
+            return "skip: event blackout"
+        qty = min(int(s.debate_max_contracts), gl.contracts(s.debate_risk_per_trade, risk_1c))
+        if qty < 1:
+            return f"skip: one contract risks {risk_1c:.0f} > {s.debate_risk_per_trade:.0f}"
+        bid, ask = self._option_bid_ask(idea.contract)
+        sleeve = s.debate_capital + sum(float(t["realized_pnl"] or 0) for t in mine if t["status"] == "CLOSED")
+        try:
+            room = reserve_room(s, self.broker.account().equity, self.broker.positions())
+        except Exception as exc:  # noqa: BLE001 - cannot verify the reserve: do not trade
+            return f"skip: reserve check failed ({exc})"[:200]
+        cap = min(room, sleeve / max(1, s.debate_max_open))
+        if not (bid > 0 and ask >= bid):
+            return f"skip: no quote ({bid}/{ask})"
+        qty = min(qty, int(cap // (ask * 100)))
+        if qty < 1:
+            return f"skip: one contract ({ask * 100:,.0f}) over the cap {cap:,.0f}"
+        news_block = self._news_block()
+        if news_block:
+            return f"skip: {news_block}"
+        if not self.ledger.alert_once(f"debate_broker:{rid}"):
+            return "skip: already sent"
+        fill = self.execution.buy_option(idea.contract, qty, bid, ask)
+        if not fill.filled:
+            return "no fill"
+        conf = rec["judge"]["confidence"]
+        self.ledger.open_trade(
+            trade_date=d.isoformat(), broker=self.broker.name, underlying=idea.ticker, symbol=idea.contract,
+            asset_class="option", direction="bear" if idea.side == "PUT" else "bull", qty=fill.qty,
+            entry_price=fill.avg_price, underlying_stop=rec["stop"], underlying_target=rec["target"],
+            signal_score=idea.rate, entry_order_id=fill.order_ids[-1],
+            notes=f"{DEBATE_TAG}|exit_by {rec['exit_by']}|conf {conf}|{idea.setup}|grade {idea.grade}|{rec['why'][:140]}",
+        )
+        self.notifier.send(
+            f"🚀 OPENED {idea.contract} x{fill.qty:g} @ {fill.avg_price:.2f} (debate {idea.side}, judge {conf}/10)",
+            table([{"Underlying": idea.ticker, "Setup": idea.setup, "Judge": f"{conf}/10", "Contract": idea.contract,
+                    "Qty": fill.qty, "Fill": fill.avg_price, "Underlying stop": rec["stop"],
+                    "Underlying target": rec["target"], "Exit by": rec["exit_by"][11:16],
+                    "Broker": f"{self.broker.name}{' (paper)' if self.broker.is_paper else ' (LIVE)'}"}])
+            + f"<p>{html.escape(rec['why'])}</p>",
+        )
+        return "FILLED"
 
     def _gex_broker_exit(self, t: dict, now: datetime, flatten_at: datetime, bar_px: float | None) -> str | None:
         """STOP_LOSS / TARGET when the underlying (live quote, else the last 5-min close) reaches the idea's levels."""

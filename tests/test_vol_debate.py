@@ -92,7 +92,7 @@ def test_debate_buy_sell_and_guards():
 
 
 def _engine(ledger, judge, **kw):
-    engine, broker, notifier = make_engine(ledger, at(11, 0), settings=S(**kw), broker=FakeBroker(equity=100_000))
+    engine, broker, notifier = make_engine(ledger, at(11, 0), settings=S(**{"vol_debate_mode": "broker", **kw}), broker=FakeBroker(equity=100_000))
     engine.market._bars["HOOD"] = hot_bars()
     engine.market._bars["SPY"] = hot_bars(base=100.0, mult=1.0)
     engine.market.schwab = FakeSchwab()

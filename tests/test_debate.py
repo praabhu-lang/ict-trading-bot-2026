@@ -142,6 +142,51 @@ def test_engine_redebates_next_scan_after_llm_failure(ledger, monkeypatch):
     assert len(calls) == 2 and calls[-1]["why"] == "late"
 
 
+def _broker_engine(ledger, monkeypatch, **settings):
+    from tests.test_engine import S
+    from tests.test_gex_plan import prof
+    from src.strategy import gex_plan as gp
+
+    engine, broker, notifier = make_engine(ledger, at(10, 35), settings=S(gex_risk_per_idea=100.0, **settings))
+    chain = engine.market.chain("SPY", TODAY)
+    o = next(x for x in chain.options if x.put_call == "C" and x.bid > 0)
+    p = prof()
+    idea = gp.Idea("SPY", "ACTIVE", side="CALL", setup=SETUP, level=p.spot - 0.1, stop=p.spot - 1.0,
+                   target=p.spot + 1.0, contract=o.symbol, mid=1.0, ask=1.05, delta=0.4, grade="A", rate=80)
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: {"idea": idea, "profile": p} if t == "SPY" else {})
+    engine.news.llm = FakeLLM(judge={"decision": "TRADE", "confidence": 8, "stop": p.spot - 0.5,
+                                     "target": p.spot + 3.0, "exit_by": "10:55", "reason": "wall held"})
+    return engine, broker, notifier, o, p
+
+
+def test_debate_broker_mode_buys_books_and_time_exits(ledger, monkeypatch):
+    engine, broker, notifier, o, p = _broker_engine(ledger, monkeypatch, debate_mode="broker",
+                                                     debate_risk_per_trade=100.0, debate_max_contracts=2)
+    engine.gex_ideas(at(10, 35), scan=True)
+    t = next(x for x in ledger.open_trades() if x["notes"].startswith("debate|"))
+    assert t["symbol"] == o.symbol and t["qty"] == 2                      # 3 by risk, capped at 2 contracts
+    assert t["underlying_stop"] == round(p.spot - 0.5, 2) and "exit_by" in t["notes"]
+    assert ledger.get_kv("debate_decisions")[-1]["order"] == "FILLED"
+    assert len(ledger.get_kv("debate_open")) == 1                        # the paper book still records it
+    assert any("debate CALL" in x for x in notifier.sent)
+    engine.manage_exits(at(10, 56))
+    assert ledger.trade(t["id"])["exit_reason"] == "TIME_EXIT"
+
+
+def test_debate_broker_skips_a_ticker_the_bot_already_holds_and_paper_mode_never_orders(ledger, monkeypatch):
+    engine, broker, _, o, _ = _broker_engine(ledger, monkeypatch, debate_mode="broker")
+    ledger.open_trade(trade_date=TODAY.isoformat(), broker="alpaca_paper", underlying="SPY", symbol="SPY",
+                      asset_class="stock", direction="bull", qty=1, entry_price=100.0, notes="vrz")
+    engine.gex_ideas(at(10, 35), scan=True)
+    assert ledger.get_kv("debate_decisions")[-1]["order"].startswith("skip: the bot already holds SPY")
+
+    led2 = Ledger(":memory:")
+    engine, broker, _, o, _ = _broker_engine(led2, monkeypatch, debate_mode="paper")
+    engine.gex_ideas(at(10, 35), scan=True)
+    assert not [x for x in led2.open_trades() if x["notes"].startswith("debate|")]
+    assert "order" not in led2.get_kv("debate_decisions")[-1]
+
+
 def test_engine_debate_off_or_no_llm_does_nothing(ledger, monkeypatch):
     from tests.test_engine import S
     from tests.test_gex_plan import prof
