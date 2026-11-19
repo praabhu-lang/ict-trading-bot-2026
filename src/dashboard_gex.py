@@ -49,6 +49,19 @@ def summary_row(r: dict, live: dict) -> dict:
     }
 
 
+COMPACT = ["Ticker", "Live", "Gamma", "Flip", "Put wall", "Call wall", "Idea", "Best zone"]
+
+
+def compact_rows(rows: list[dict]) -> pd.DataFrame:
+    """The scan table with only what a decision needs; the full row stays one click away."""
+    df = pd.DataFrame(rows)
+    if "Gamma" in df:
+        df["Gamma"] = df["Gamma"].map({"Positive": "🟢 Positive (pins)", "Negative": "🔴 Negative (trends)"}).fillna("")
+    if "Live" in df and "Spot (chain)" in df:
+        df["Live"] = df["Live"].fillna(df["Spot (chain)"])
+    return df[[c for c in COMPACT if c in df]]
+
+
 def _levels(fig, p: gp.Profile, ctx: dict, idea: gp.Idea, colors: dict) -> list[tuple[float, str]]:
     """Draw every level across both panels; return (price, label) for the right-hand label gutter."""
     g = p.gex
@@ -197,27 +210,25 @@ def idea_card(r: dict) -> None:
     i, p = r["idea"], r["profile"]
     if i.status == "ACTIVE":
         tone = st.success if i.side == "CALL" else st.error
-        tone(f"**{i.side} {p.ticker} {i.strike:g} {i.expiry:%b %d} ({i.dte}DTE)** · convergence **{i.rate}%** "
-             f"(grade {i.grade}) · mid {i.mid:.2f}, ask {i.ask:.2f}, delta {i.delta:+.2f}  \n"
-             f"Underlying stop **{i.stop:,.2f}** · target **{i.target:,.2f}** · {i.reason}")
+        tone(f"**🟢 BUY {i.side} {p.ticker} {i.strike:g} {i.expiry:%b %d} ({i.dte}DTE)** near {i.ask:.2f} · "
+             f"exit if {p.ticker} hits **{i.stop:,.2f}** (stop) or **{i.target:,.2f}** (target), or at 15:45 ET  \n"
+             f"{i.setup} · convergence {i.rate}% (grade {i.grade}) · delta {i.delta:+.2f}")
     else:
         st.info(f"**{p.ticker}: WAIT** · {i.reason}")
     zones = r.get("zones") or []
-    if zones:
-        st.caption(f"Convergence if traded now (ACTIVE needs >= {gp.MIN_CONVERGENCE}% with <= {gp.MAX_AGAINST} pts "
-                   "against, and price inside the zone):")
-        cols = st.columns(len(zones))
-        for col, z in zip(cols, zones):
-            col.metric(f"{z['label']} {z['level']:,.2f}", f"{z['rate']}%",
-                       delta=f"-{z['against']} against" if z["against"] else "nothing against",
-                       delta_color="inverse" if z["against"] else "off")
-    if i.confluence:
-        st.dataframe(factor_table(i.confluence), hide_index=True, width="stretch")
-    for z in zones:
-        with st.expander(f"Why {z['rate']}%: {z['label']} {z['level']:,.2f}"):
-            _, _, conf = gp.convergence(z["side"], z["level"], p, r["ctx"], r.get("mtf") or {}, r.get("news"),
-                                        (z["low"], z["high"]))
-            st.dataframe(factor_table(conf), hide_index=True, width="stretch")
+    if not (zones or i.confluence):
+        return
+    with st.expander("Why? Convergence and the factors behind it"):
+        if i.confluence:
+            st.dataframe(factor_table(i.confluence), hide_index=True, width="stretch")
+        if zones:
+            st.caption(f"Each zone if traded now. ACTIVE needs price inside the zone, >= {gp.MIN_CONVERGENCE}% "
+                       f"and <= {gp.MAX_AGAINST} points against.")
+            for t, z in zip(st.tabs([f"{z['label']} {z['level']:,.2f} · {z['rate']}%" for z in zones]), zones):
+                with t:
+                    _, _, conf = gp.convergence(z["side"], z["level"], p, r["ctx"], r.get("mtf") or {},
+                                                r.get("news"), (z["low"], z["high"]))
+                    st.dataframe(factor_table(conf), hide_index=True, width="stretch")
 
 
 FACTOR_RULES = {
@@ -238,8 +249,7 @@ FACTOR_RULES = {
 def rules_guide() -> None:
     """The page's rules, generated from the constants the code uses (gex_plan), so it cannot drift."""
     w = gp.CONV_WEIGHTS
-    with st.expander("📘 How GEX works & how to use this chart", expanded=True):
-        st.markdown(f"""
+    st.markdown(f"""
 **How GEX works.** When you buy a call or put, a market maker (the dealer) usually sells it to you and hedges by
 trading the stock. *Gamma* is how much that hedge must change per $1 move; summed over every strike's open interest
 it is the **gamma exposure (GEX)**: how much dealers must buy or sell as price moves.
@@ -253,8 +263,9 @@ into a CALL or PUT idea per ticker. **Suggestions only - nothing places orders.*
 else is a map of where an idea could appear.
 
 **Step by step**
-1. Pick a ticker (SPY / SPX / QQQ + today's 10 most traded), the expiry and the gamma weighting.
-2. Scan the table: *Gamma* (regime), *Best zone* (highest convergence right now), *30m structure*.
+1. Pick a ticker (SPY / SPX / QQQ + today's 10 most traded); expiry, gamma weighting and the chart panels are under
+   **⚙ Options**.
+2. Scan the *All tickers* table: *Gamma* (regime), *Idea* (🟢 = ACTIVE), *Best zone* (highest convergence now).
 3. On the chart, shaded bands are the zones where a trade can trigger; the % on each is its convergence **now**.
 4. Wait for price to reach a zone **and** the idea box to turn 🟢 ACTIVE. Buy the shown contract near the ask;
    manage it on the **underlying**: out at the stop or target line, or at 15:45 ET.
@@ -298,7 +309,7 @@ rescaled), so missing data can only lower the rate.
 of drift next to the flip. Strict needs the flip *tested* (a 5-min wick within a quarter of the band), a candle that
 *rejects* it (closes back below, bearish) or *reclaims* it (closes above after a close below), a later close beyond
 that candle's low / high, and 5-min EMA9 vs EMA21 plus VWAP agreeing. Stop just past the rejection wick. In shadow
-they are tracked aside (*Strict flip rules* below and in the day summary) so the two can be compared in R.
+they are tracked aside (**📊 Results** → Strict, and the day summary) so the two can be compared in R.
 
 **The contract**
 - Expiry: *Auto* = levels from today's (0DTE) chain all day; the contract is 0DTE until {gp.AUTO_1DTE_AFTER:%H:%M} ET,
@@ -307,8 +318,8 @@ they are tracked aside (*Strict flip rules* below and in the day summary) so the
 - Ideas only between {gp.FIRST_IDEA:%H:%M} and {gp.LAST_IDEA:%H:%M} ET; one open idea per ticker.
 
 **How far to trust it.** These rules are new and not proven. Two independent checks run automatically:
-the engine paper-trades every ACTIVE idea live (*Paper tracking* below) and the nightly job replays the rules over
-every saved chain (*Replay backtest* below). Your VRZ backtests found 0DTE options lost money - wait until both show
+the engine paper-trades every ACTIVE idea live (**📊 Results** → GEX ideas) and the nightly job replays the rules over
+every saved chain (**📊 Results** → Nightly replay). Your VRZ backtests found 0DTE options lost money - wait until both show
 an edge over a few weeks (20+ ideas) before trading real size.
 """)
 
@@ -357,39 +368,111 @@ def learning_panel(rep: dict | None) -> None:
             st.dataframe(pd.DataFrame(lc.get(key) or []), hide_index=True, width="stretch")
 
 
-def tracker(led) -> None:
-    log = (led.get_kv("gex_ideas_log") if led else None) or []
-    open_ = (led.get_kv("gex_ideas_open") if led else None) or []
-    st.subheader("Paper tracking of ACTIVE ideas")
-    if not log and not open_:
-        st.caption("The engine logs every ACTIVE idea during the session as a paper trade sized to the GEX risk budget "
-                   "(entry at the ask, exit at the bid on stop / target / 15:45 ET). Nothing yet.")
-        shadow_books(led, pd.DataFrame())
-        return
+def _closed(log: list[dict]) -> pd.DataFrame:
+    """Closed, priced ideas with numeric R and pnl_sized (1-contract P&L for ideas from before risk sizing)."""
     df = pd.DataFrame(log)
-    if not df.empty:
-        df = df[df["pnl"].notna()]      # UNQUOTED closes (contract vanished from the chain) have no price
-    if not df.empty:
-        none = pd.Series(float("nan"), index=df.index)        # ideas from before sizing: 1 contract, no R
-        df = df.assign(R=pd.to_numeric(df.get("R", none), errors="coerce"),
-                       pnl_sized=pd.to_numeric(df.get("pnl_sized", none), errors="coerce").fillna(df["pnl"]))
-        wins = (df["pnl"] > 0).mean() * 100
-        c = st.columns(4)
-        c[0].metric("Ideas closed", len(df))
-        c[1].metric("Win rate", f"{wins:.0f}%")
-        c[2].metric("P&L (risk-sized)", f"${df['pnl_sized'].sum():,.0f}",
-                    help=f"1 contract each: ${df['pnl'].sum():,.0f}. Ideas before risk sizing count as 1 contract.")
-        c[3].metric("Open now", len(open_))
-        by = df.groupby(["setup", "grade"]).agg(n=("pnl", "size"), win_pct=("pnl", lambda s: round((s > 0).mean() * 100)),
-                                                avg_R=("R", "mean"), pnl_1c=("pnl", "sum"),
-                                                pnl_sized=("pnl_sized", "sum")).round(2).reset_index()
-        st.dataframe(by, hide_index=True, width="stretch")
-        st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
+    if df.empty or "pnl" not in df:
+        return pd.DataFrame()
+    df = df[df["pnl"].notna()]            # UNQUOTED closes (contract vanished from the chain) have no price
+    if df.empty:
+        return df
+    none = pd.Series(float("nan"), index=df.index)
+    return df.assign(R=pd.to_numeric(df.get("R", none), errors="coerce"),
+                     pnl_sized=pd.to_numeric(df.get("pnl_sized", none), errors="coerce").fillna(df["pnl"]))
+
+
+def _row(book: str, df: pd.DataFrame, open_n: int, pnl: str = "pnl_sized", what: str = "") -> dict:
+    if df.empty:
+        return {"Book": book, "Trades": 0, "Win %": None, "Avg R": None, "P&L $": None, "Open": open_n, "What": what}
+    R = pd.to_numeric(df["R"], errors="coerce") if "R" in df else pd.Series(dtype=float)
+    win = df["pnl"] if "pnl" in df else df[pnl]          # 1-contract result: ideas sized to 0 still won or lost
+    return {"Book": book, "Trades": len(df), "Win %": round(float((win > 0).mean() * 100)),
+            "Avg R": round(float(R.mean()), 2) if R.notna().any() else None,
+            "P&L $": round(float(df[pnl].sum())), "Open": open_n, "What": what}
+
+
+def scorecard(led, rep: dict | None) -> pd.DataFrame:
+    kv = (lambda k: (led.get_kv(k) if led else None) or [])
+    rows = [_row("GEX ideas", _closed(kv("gex_ideas_log")), len(kv("gex_ideas_open")),
+                 what="every ACTIVE idea, paper, risk-sized"),
+            _row("Strict flip (shadow)", _closed(kv("gex_strict_log")), len(kv("gex_strict_open")),
+                 what="flip setups with tested + rejected / reclaimed rules"),
+            _row("Confirmed (shadow)", _closed(kv("gex_confirm_log")), len(kv("gex_confirm_open")),
+                 what="flip / momentum after closes past the flip, SPY-QQQ-SPX agree"),
+            _row("Trade debate (paper)", _closed(kv("debate_log")), len(kv("debate_open")),
+                 what="LLM bull / bear / judge on the best ideas")]
+    vol = pd.DataFrame([t for t in (led.trades(limit=5000) if led else []) if (t.get("notes") or "").startswith("vol_debate")])
+    closed = vol[vol["status"] == "CLOSED"].assign(R=float("nan")) if not vol.empty else pd.DataFrame()
+    rows.append(_row("Stock debate (broker)", closed, int((vol["status"] == "OPEN").sum()) if not vol.empty else 0,
+                     pnl="realized_pnl", what="volume scan -> LLM debate -> paper-broker bracket"))
+    tot = (rep or {}).get("total") or {}
+    if tot.get("ideas"):
+        rows.append({"Book": "Nightly replay", "Trades": tot.get("ideas"), "Win %": tot.get("win_R_%"),
+                     "Avg R": tot.get("avg_R"), "P&L $": tot.get("opt_pnl_$"), "Open": None,
+                     "What": "rules replayed on saved chains (1 contract, SPY / QQQ priced)"})
+    return pd.DataFrame(rows)
+
+
+def by_setup(led, rep: dict | None) -> pd.DataFrame:
+    """Live results per setup next to the learned gate - the one table that says what to trust."""
+    df = _closed((led.get_kv("gex_ideas_log") if led else None) or [])
+    gates = (((rep or {}).get("gate") or {}).get("gates")
+             or ((led.get_kv("gex_gate") or {}).get("gates") if led else None) or {})
+    if df.empty:
+        return pd.DataFrame()
+    out = df.groupby("setup").agg(Trades=("pnl", "size"), **{"Win %": ("pnl", lambda x: round((x > 0).mean() * 100))},
+                                  **{"Avg R": ("R", "mean"), "P&L $": ("pnl_sized", "sum")}).round(2).reset_index()
+    out["Gate"] = out["setup"].map(lambda k: "" if k not in gates else
+                                   f"{'✅ ON' if gates[k]['on'] else '⛔ OFF'} ({gates[k]['exp_R']:+.2f}R / {gates[k]['n']})")
+    return out.rename(columns={"setup": "Setup"}).sort_values("P&L $", ascending=False)
+
+
+def ideas_detail(led) -> None:
+    df = _closed((led.get_kv("gex_ideas_log") if led else None) or [])
+    open_ = (led.get_kv("gex_ideas_open") if led else None) or []
     if open_:
+        st.markdown("**Open now**")
         st.dataframe(pd.DataFrame(open_), hide_index=True, width="stretch")
-    shadow_books(led, df)
-    debate_book(led, df)
-    vol_debate_book(led)
+    if not df.empty:
+        st.markdown("**By setup and grade**")
+        st.dataframe(df.groupby(["setup", "grade"]).agg(n=("pnl", "size"),
+                                                        win_pct=("pnl", lambda s: round((s > 0).mean() * 100)),
+                                                        avg_R=("R", "mean"), pnl_sized=("pnl_sized", "sum"))
+                     .round(2).reset_index(), hide_index=True, width="stretch")
+        st.markdown("**Last 50 closed**")
+        st.dataframe(df.sort_values("closed", ascending=False).head(50), hide_index=True, width="stretch")
+    if df.empty and not open_:
+        st.caption("Nothing yet: the engine logs every ACTIVE idea during the session.")
+
+
+def results_view(led, rep: dict | None) -> None:
+    st.markdown("**Every book at a glance** · paper unless it says broker · P&L risk-sized")
+    st.dataframe(scorecard(led, rep), hide_index=True, width="stretch",
+                 column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
+    setups = by_setup(led, rep)
+    if not setups.empty:
+        st.markdown(f"**GEX ideas by setup** · the gate switches a setup off after {gl.GATE_MIN_N}+ results with a "
+                    "negative recent average (Settings → GEX gate)")
+        st.dataframe(setups, hide_index=True, width="stretch",
+                     column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
+    pick = st.segmented_control("Details", ["GEX ideas", "Strict", "Confirmed", "Trade debate", "Stock debate",
+                                            "Nightly replay", "Learning"], default="GEX ideas", key="gex_detail")
+    main = _closed((led.get_kv("gex_ideas_log") if led else None) or [])
+    if pick == "GEX ideas":
+        ideas_detail(led)
+    elif pick == "Strict":
+        shadow_tracker(led, main, "gex_strict", "strict", gp.CLASSIC_FLIP, "Strict flip rules (shadow)", STRICT_NOTE)
+    elif pick == "Confirmed":
+        shadow_tracker(led, main, "gex_confirm", "confirmed", gp.CONFIRM_SETUPS, "Confirmation rules (shadow)",
+                       CONFIRM_NOTE)
+    elif pick == "Trade debate":
+        debate_book(led, main)
+    elif pick == "Stock debate":
+        vol_debate_book(led)
+    elif pick == "Nightly replay":
+        replay_panel(rep)
+    elif pick == "Learning":
+        learning_panel(rep)
 
 
 def debate_book(led, main: pd.DataFrame) -> None:
@@ -468,14 +551,11 @@ def vol_debate_book(led) -> None:
                         st.caption(f"{side} {x[side]['conviction']}/10: " + " · ".join(x[side]["case"]))
 
 
-def shadow_books(led, df: pd.DataFrame) -> None:
-    shadow_tracker(led, df, "gex_strict", "strict", gp.CLASSIC_FLIP, "Strict flip rules (shadow)",
-                   "Flip tested, a rejection / reclaim candle, a confirming close beyond it and 5-min momentum agreeing - "
-                   "tracked aside while the classic flip setups trade. Compare R before switching Settings to strict.")
-    shadow_tracker(led, df, "gex_confirm", "confirmed", gp.CONFIRM_SETUPS, "Confirmation rules (shadow)",
-                   f"Flip and momentum ideas from {gp.CONFIRM_FIRST:%H:%M}, after {gp.CONFIRM_BARS} 5-min closes past the "
-                   f"flip (the last at least {gp.CONFIRM_DIST:g} x the near band) with SPY, QQQ and SPX all in the trade's "
-                   "gamma regime. Compare R with the same setups unconfirmed before switching Settings to enforce.")
+STRICT_NOTE = ("Flip tested, a rejection / reclaim candle, a confirming close beyond it and 5-min momentum agreeing - "
+               "tracked aside while the classic flip setups trade. Compare R before switching Settings to strict.")
+CONFIRM_NOTE = (f"Flip and momentum ideas from {gp.CONFIRM_FIRST:%H:%M}, after {gp.CONFIRM_BARS} 5-min closes past the "
+                f"flip (the last at least {gp.CONFIRM_DIST:g} x the near band) with SPY, QQQ and SPX all in the trade's "
+                "gamma regime. Compare R with the same setups unconfirmed before switching Settings to enforce.")
 
 
 def shadow_tracker(led, main: pd.DataFrame, key: str, label: str, setups: tuple, title: str, caption: str) -> None:
@@ -483,6 +563,7 @@ def shadow_tracker(led, main: pd.DataFrame, key: str, label: str, setups: tuple,
     log = (led.get_kv(f"{key}_log") if led else None) or []
     open_ = (led.get_kv(f"{key}_open") if led else None) or []
     if not log and not open_:
+        st.caption(f"{title}: nothing yet.")
         return
     st.subheader(title)
     st.caption(caption)
@@ -506,23 +587,33 @@ def shadow_tracker(led, main: pd.DataFrame, key: str, label: str, setups: tuple,
 
 
 def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> None:
-    st.caption("Our own dealer gamma exposure from Schwab option chains (dealers long calls / short puts). "
-               "**Suggestions only - no orders are placed.** Not backtested (no historical open interest): the "
-               "engine paper-tracks every ACTIVE idea below. Your VRZ backtests found 0DTE options lost money, "
-               "so treat these as untested until the tracker says otherwise.")
-    rules_guide()
+    live_tab, results_tab, guide_tab = st.tabs(["📈 Live", "📊 Results", "📘 Guide"])
+    with live_tab:
+        live_view(market, news, now)
+    with results_tab:
+        results_view(led, replay)
+    with guide_tab:
+        rules_guide()
+
+
+def live_view(market, news, now: datetime) -> None:
     if market is None or market.schwab is None:
         st.error("Schwab is not configured - no option chains.")
         return
     names, source = tickers(market)
-    c = st.columns([2, 2, 2, 1])
-    pick = c[0].selectbox("Ticker", names, key="gex_pick", help=f"SPY / SPX / QQQ + {source}")
-    mode = c[1].selectbox("Expiry", list(gp.EXPIRY_MODES), format_func=gp.EXPIRY_MODES.get, key="gex_mode")
-    weight = c[2].selectbox("Gamma weighted by", list(gp.WEIGHTS), format_func=gp.WEIGHTS.get, key="gex_weight",
-                            help="Open interest is yesterday's positioning (Schwab updates it overnight); today's "
-                                 "volume shows where 0DTE flow is building intraday.")
-    with_news = c[3].toggle("LLM news", False, key="gex_news", help="NVIDIA LLM verdict on Tavily headlines "
-                            "(for the selected ticker and any ticker at a GEX level; ~10 s the first time, cached 30 min)")
+    c = st.columns([3, 1])
+    pick = c[0].selectbox("Ticker", names, key="gex_pick", help=f"SPY / SPX / QQQ + {source}",
+                          label_visibility="collapsed")
+    with c[1].popover("⚙ Options", width="stretch"):
+        mode = st.selectbox("Expiry", list(gp.EXPIRY_MODES), format_func=gp.EXPIRY_MODES.get, key="gex_mode")
+        weight = st.selectbox("Gamma weighted by", list(gp.WEIGHTS), format_func=gp.WEIGHTS.get, key="gex_weight",
+                              help="Open interest is yesterday's positioning (Schwab updates it overnight); today's "
+                                   "volume shows where 0DTE flow is building intraday.")
+        tf = st.radio("Candles", [5, 15, 30], format_func=lambda m: f"{m}-min", horizontal=True, key="gex_tf",
+                      help="Swing labels: HH/HL = higher high / higher low (up structure), LH/LL = lower (down)")
+        show = st.radio("Right panel", ["GEX", "Open interest", "Volume"], horizontal=True, key="gex_show")
+        with_news = st.toggle("LLM news", False, key="gex_news", help="NVIDIA LLM verdict on Tavily headlines "
+                              "(selected ticker and any ticker at a GEX level; ~10 s the first time, cached 30 min)")
 
     run = lambda t: gp.analyse(market, news, t, now, mode, weight, with_news, pick)  # noqa: E731
     rows = [run(names[0])]                  # first call refreshes the Schwab token once, then fan out
@@ -531,38 +622,37 @@ def gex_page(market, news, led, now: datetime, replay: dict | None = None) -> No
     if all("error" in r for r in rows):
         st.error(f"No option chains from Schwab: {rows[0]['error']}. If the login expired: Settings → Schwab connection.")
         return
-
     try:
         live = market.live_prices(names)
     except Exception:  # noqa: BLE001 - the chain spot (<= 60 s old) is still shown
         live = {}
-    st.dataframe(pd.DataFrame([summary_row(r, live) for r in rows]), hide_index=True, width="stretch")
+
     r = next(x for x in rows if x["ticker"] == pick)
     if "error" in r:
         st.warning(f"{pick}: {r['error']}")
     else:
-        q = live.get(pick)
+        q, p = live.get(pick), r["profile"]
+        g = p.gex
+        above = p.spot > g.gamma_flip if g.gamma_flip else g.net_gex >= 0
         c = st.columns(4)
-        c[0].metric(f"{pick} live", f"{q['price']:,.2f}" if q else f"{r['profile'].spot:,.2f}",
-                    help="Schwab quote (Alpaca latest trade if Schwab misses it); otherwise the chain's spot")
-        c[1].metric("Source", f"{q['source']} {q['ts']:%H:%M:%S}" if q and q["ts"] else (q["source"] if q else "chain"))
-        g = r["profile"].gex
+        c[0].metric(pick, f"{q['price']:,.2f}" if q else f"{p.spot:,.2f}",
+                    help=(f"{q['source']} {q['ts']:%H:%M:%S}" if q and q.get("ts") else "option chain spot"))
+        c[1].metric("Gamma", "🟢 Positive" if above else "🔴 Negative",
+                    help="Positive: dealers fight moves, price pins - fade the walls. Negative: dealers chase moves, "
+                         "price trends - go with momentum.")
         c[2].metric("Gamma flip", f"{g.gamma_flip:,.2f}" if g.gamma_flip else "—")
-        c[3].metric("Expected move ±", f"{r['profile'].expected_move:,.2f}")
+        c[3].metric("Expected move ±", f"{p.expected_move:,.2f}")
         idea_card(r)
-        cc = st.columns(2)
-        tf = cc[0].radio("Candles", [5, 15, 30], format_func=lambda m: f"{m}-min", horizontal=True, key="gex_tf",
-                         help="Swing labels: HH/HL = higher high / higher low (up structure), LH/LL = lower (down)")
-        show = cc[1].radio("Right panel", ["GEX", "Open interest", "Volume"], horizontal=True, key="gex_show")
         st.plotly_chart(chart(r, show, now, q, tf), width="stretch", key="gex_chart")
         with st.expander(f"{pick} by strike (table)"):
-            p = r["profile"]
             ks = sorted(set(p.calls) | set(p.puts))
             st.dataframe(pd.DataFrame({"Strike": ks, "Call GEX $M": [round(p.calls.get(k, 0) / 1e6, 2) for k in ks],
                                        "Put GEX $M": [round(p.puts.get(k, 0) / 1e6, 2) for k in ks],
                                        "Call OI": [p.call_oi.get(k, 0) for k in ks],
                                        "Put OI": [p.put_oi.get(k, 0) for k in ks]}), hide_index=True, width="stretch")
-    st.caption(f"Live · price every 30 s, option chains every 60 s · {now:%H:%M:%S} ET")
-    tracker(led)
-    replay_panel(replay)
-    learning_panel(replay)
+    full = [summary_row(x, live) for x in rows]
+    st.markdown("**All tickers** · 🟢 = an ACTIVE idea right now")
+    st.dataframe(compact_rows(full), hide_index=True, width="stretch")
+    with st.expander("All columns (contract, stop, target, structure, P/C volume...)"):
+        st.dataframe(pd.DataFrame(full), hide_index=True, width="stretch")
+    st.caption(f"Suggestions only - no orders from this page · price every 30 s, chains every 60 s · {now:%H:%M:%S} ET")
