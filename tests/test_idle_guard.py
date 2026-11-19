@@ -24,6 +24,7 @@ def test_idle_minutes_env(monkeypatch):
 def test_install_disabled_when_zero(monkeypatch):
     calls = []
     monkeypatch.setattr(idle_guard.components, "html", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(idle_guard, "_beacon", lambda: None)
     monkeypatch.setenv("DASHBOARD_IDLE_MINUTES", "0")
     idle_guard.install()
     assert calls == []

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 
+import streamlit as st
 import streamlit.components.v1 as components
 
 DEFAULT_IDLE_MINUTES = 20.0
@@ -141,9 +142,19 @@ def script(minutes: float) -> str:
     return _LOADER % json.dumps(_JS.replace("__IDLE_MS__", str(int(minutes * 60000))))
 
 
+@st.fragment(run_every="30s")
+def _beacon() -> None:
+    """Empty auto-rerun so the browser sends on its socket at least every 30 s, letting the guard grab it.
+
+    Pages without other auto-refreshing fragments (the login screen) would otherwise never send, and an
+    idle tab there would hold its connection forever. Renders nothing and is not counted as activity.
+    """
+
+
 def install() -> None:
     """Inject the idle cutoff once per page; a value <= 0 disables it."""
     minutes = idle_minutes()
     if minutes <= 0:
         return
     components.html(script(minutes), height=0)
+    _beacon()
