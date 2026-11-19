@@ -84,7 +84,7 @@ def closed_trades(led) -> pd.DataFrame:
     df = df[df.status == "CLOSED"].copy()
     if df.empty:
         return df
-    df["closed_ts"] = pd.to_datetime(df.closed_at, utc=True).dt.tz_convert(ET)
+    df["closed_ts"] = pd.to_datetime(df.closed_at, utc=True, format="ISO8601").dt.tz_convert(ET)
     df["day"] = pd.to_datetime(df.trade_date).dt.date
     df["realized_pnl"] = df.realized_pnl.astype(float)
     mult = df.asset_class.map({"option": 100.0}).fillna(1.0)
@@ -125,6 +125,9 @@ def _paper_log(led, key: str, kind: str) -> pd.DataFrame:
 def pool_pnl(led, closed: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Realized P&L rows per capital pool. Options: the bot's option trades. Stocks: the bot's stock trades plus the
     simulated VRZ and biotech paper trades (labelled by source)."""
+    if not closed.empty and "notes" in closed:      # imported broker history is account-level, not a pool's
+        closed = closed[~closed.notes.fillna("").str.startswith("imported|")]
+
     def book(cls):
         if closed.empty:
             return pd.DataFrame(columns=["day", "pnl", "source"])
@@ -158,6 +161,125 @@ def pools_panel(led, settings, closed: pd.DataFrame, acct_eq: float | None, toda
     ])
 
 
+# ------------------------------------------------------------------------------------------- strategy table
+BROKER_BOOKS = [   # (label, notes prefix) - first match wins, so the more specific prefixes come first
+    ("First-candle 0DTE", "first_candle"), ("GEX SPY/QQQ put slice", "gex_idea"), ("Trade debate", "debate|"),
+    ("Stock debate", "vol_debate"), ("Old engine (Sep 22 - Oct 8)", "imported|old_engine"),
+    ("Manual trades", "imported|manual"),
+]
+PAPER_BOOKS = [    # (label, kv log, kv open)
+    ("GEX ideas", "gex_ideas_log", "gex_ideas_open"), ("Trade debate", "debate_log", "debate_open"),
+    ("QQQ VWAP fade", "qqq_fade_paper_log", None), ("Last-45 XSP spread", "last45_paper_log", "last45_paper_open"),
+    ("Biotech gap", "bio_paper_log", "bio_paper_open"), ("VRZ stocks", "vrz_paper_log", "vrz_paper_open"),
+    ("FOMC reaction", "fomc_paper_log", None),
+]
+
+
+def _book_of(notes: str) -> str:
+    notes = notes or ""
+    return next((label for label, prefix in BROKER_BOOKS if notes.startswith(prefix)), "Other bot trades")
+
+
+def _live_flag(label: str, settings) -> str:
+    on = {"First-candle 0DTE": settings.auto_trade and settings.strategy == "first_candle",
+          "GEX SPY/QQQ put slice": settings.auto_trade and settings.gex_broker,
+          "Trade debate": settings.auto_trade and settings.debate_mode == "broker",
+          "Stock debate": settings.auto_trade and settings.vol_debate_mode == "broker"}
+    if label in on:
+        return "🟢 live" if on[label] else "⚪ off"
+    return "📦 history"
+
+
+def _stats(pnl: pd.Series, day: pd.Series, today: date, win: pd.Series | None = None) -> dict:
+    """`win` (default pnl): what decides a win - the 1-contract result for risk-sized books, where an idea sized
+    to 0 contracts still won or lost."""
+    month0 = today.replace(day=1)
+    win = pnl if win is None else win
+    return {"Today $": float(pnl[day == today].sum()), "Month $": float(pnl[day >= month0].sum()),
+            "Total $": float(pnl.sum()), "Trades": int(len(pnl)),
+            "Win %": round(float((win > 0).mean() * 100)) if len(win) else None}
+
+
+def broker_books(led, settings, today: date) -> pd.DataFrame:
+    """One row per strategy that places (or placed) orders on the broker, from the ledger."""
+    df = pd.DataFrame(led.trades(limit=5000)) if led else pd.DataFrame()
+    rows = []
+    labels = [b for b, _ in BROKER_BOOKS] + ["Other bot trades"]
+    for label in labels:
+        x = df[df.notes.map(_book_of) == label] if not df.empty else df
+        c = x[x.status == "CLOSED"] if not x.empty else x
+        live = _live_flag(label, settings)
+        if x.empty and live != "🟢 live":
+            continue
+        st_ = _stats(c.realized_pnl.astype(float) if not c.empty else pd.Series(dtype=float),
+                     pd.to_datetime(c.trade_date).dt.date if not c.empty else pd.Series(dtype=object), today)
+        rows.append({"Strategy": label, "Status": live, "Open": int((x.status == "OPEN").sum()) if not x.empty else 0,
+                     **st_})
+    return pd.DataFrame(rows)
+
+
+def paper_books(led, today: date) -> pd.DataFrame:
+    """One row per simulated book (ledger kv logs): never sent to the broker."""
+    rows = []
+    for label, log_key, open_key in PAPER_BOOKS:
+        log = pd.DataFrame((led.get_kv(log_key) if led else None) or [])
+        opened = (led.get_kv(open_key) if led and open_key else None) or []
+        n_open = len(opened) if isinstance(opened, list) else int(bool(opened))
+        if log.empty and not n_open:
+            continue
+        base = "pnl" if "pnl" in log else "pnl_sized"
+        log = log[pd.to_numeric(log[base], errors="coerce").notna()] if base in log else log.iloc[0:0]
+        day_col = "exit_date" if "exit_date" in log else "date"
+        win = pd.to_numeric(log[base], errors="coerce") if not log.empty else pd.Series(dtype=float)
+        pnl = (pd.to_numeric(log["pnl_sized"], errors="coerce").fillna(win) if "pnl_sized" in log else win)
+        day = pd.to_datetime(log[day_col]).dt.date if not log.empty else pd.Series(dtype=object)
+        rows.append({"Strategy": label, "Status": "📝 paper", "Open": n_open, **_stats(pnl, day, today, win)})
+    return pd.DataFrame(rows)
+
+
+MONEY_COLS = {k: st.column_config.NumberColumn(format="$%+.0f") for k in ("Today $", "Month $", "Total $")}
+
+
+def strategies_panel(led, settings, today: date) -> None:
+    b = broker_books(led, settings, today)
+    st.subheader("Strategies")
+    st.caption("🟢 live = sends orders to the Alpaca paper account · ⚪ off · 📦 history (imported from Alpaca, not a "
+               "running strategy) · 📝 paper = simulated, never sent. Only strategies with a profit go live.")
+    if not b.empty:
+        st.markdown("**On the broker**")
+        st.dataframe(b, hide_index=True, width="stretch", column_config=MONEY_COLS)
+    p = paper_books(led, today)
+    if not p.empty:
+        st.markdown("**Simulated (paper books)** · GEX ideas and the trade debate are risk-sized")
+        st.dataframe(p, hide_index=True, width="stretch", column_config=MONEY_COLS)
+
+
+def account_row(led, settings, broker, broker_error, engine_status: dict, today: date) -> float | None:
+    """Alpaca's own numbers first: equity, today, since the deposit, open positions."""
+    mode = "PAPER" if (broker and broker.is_paper) or settings.broker == "alpaca_paper" else "LIVE"
+    acct, positions = None, []
+    if broker is not None:
+        try:
+            acct, positions = broker.account(), broker.positions()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Broker error: {exc}")
+    elif broker_error:
+        st.error(f"Broker unavailable: {broker_error}")
+    eq = acct.equity if acct else engine_status.get("account_equity")
+    day = (acct.equity - acct.last_equity) if acct and acct.last_equity else None
+    booked = led.total_realized_pnl(include_imported=True) if led else 0.0
+    stat_row([
+        ("Mode", f"{'🧪' if mode == 'PAPER' else '💵'} {mode}", f"Orders: {settings.broker}"),
+        ("Alpaca equity", money(eq), "Live from the broker"),
+        ("Today", money(day, True) if day is not None else "—", "Equity change since yesterday's close"),
+        ("Since start", money(eq - settings.account_start, True) if eq else "—",
+         f"vs the {money(settings.account_start)} deposit; ledger books {money(booked, True)} "
+         "(the gap is broker fees and open positions)"),
+        ("Open positions", str(len(positions)), ", ".join(p.symbol for p in positions) or "flat"),
+    ])
+    return eq
+
+
 # ------------------------------------------------------------------------------------------- Today
 def today_page(led, settings, engine_status: dict, now: datetime, broker, broker_error, ss,
                manual: dict | None = None) -> None:
@@ -180,28 +302,18 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
             st.toast(f"Trade closed {last.symbol}: {money(last.realized_pnl, True)} ({last.exit_reason})", icon="✅")
     ss["trade_sig"] = sig
 
-    acct_eq = engine_status.get("account_equity")
-    trading_eq = engine_status.get("trading_equity") or (settings.starting_capital + realized)
-    month = closed[closed.day.map(lambda d: d.strftime("%Y-%m")) == today.strftime("%Y-%m")].realized_pnl.sum() \
-        if not closed.empty else 0.0
-    day_pnl = closed[closed.day == today].realized_pnl.sum() if not closed.empty else 0.0
-    mode = "PAPER" if (broker and broker.is_paper) or settings.broker == "alpaca_paper" else "LIVE"
+    acct_eq = account_row(led, settings, broker, broker_error, engine_status, today)
+    strategies_panel(led, settings, today)
+    open_positions(led, open_trades, broker, broker_error, manual)
+
+    trading_eq = engine_status.get("trading_equity") or (
+        settings.starting_capital + (led.total_realized_pnl("option") if led else realized))
     profile = fc_today.get("profile") or pre.get("profile") or "—"
     phase = fc_today.get("phase") or pre.get("phase") or (2 if trading_eq >= settings.fc_phase2_equity else 1)
-    stat_row([
-        ("Mode", f"{'🧪' if mode == 'PAPER' else '💵'} {mode}", f"Orders: {settings.broker}"),
-        ("Trading equity", money(trading_eq), f"Account equity {money(acct_eq)}" if acct_eq else None),
-        ("Today", money(day_pnl, True), None),
-        ("This month", money(month, True), None),
-        ("Profile", str(profile).upper(), fc_today.get("profile_reason") or pre.get("profile_reason")),
-        ("Phase · size", f"{phase} · x{fc_today.get('size_mult', pre.get('size_mult', settings.fc_size_scale))}",
-         "; ".join(fc_today.get("size_notes") or pre.get("size_notes") or [])),
-    ])
-    pools_panel(led, settings, closed, acct_eq, today)
-
+    st.subheader("Today")
     left, right = st.columns([3, 2])
     with left:
-        st.subheader("Today's decision")
+        st.markdown("**First-candle decision**")
         decision = fc_today.get("decision")
         if settings.strategy != "first_candle":
             st.info("Strategy is VRZ - see Signals & levels for today's scan.")
@@ -231,7 +343,7 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
             st.caption("Engine status: " + " · ".join(gates))
 
     with right:
-        st.subheader("Events today")
+        st.markdown("**Events today**")
         cal = EventCalendar(settings.custom_events, settings.event_buffer_minutes)
         evs = [f"{e.start:%H:%M} ET · {e.name}" for e in cal.events_on(today)]
         adj = fomc_adjacent(today)
@@ -241,43 +353,56 @@ def today_page(led, settings, engine_status: dict, now: datetime, broker, broker
             st.markdown(f"- {e}")
         if pre.get("events") and not evs:
             st.caption(", ".join(pre["events"]))
+
+    with st.expander("Paper books today (FOMC reaction, last-45 spread, QQQ fade)"):
         fomc_paper_panel(led, settings, today)
         l45_paper_panel(led, settings, today)
         qf_paper_panel(led, settings, today)
 
-    st.subheader("Key pre-market levels")
-    if pre.get("levels"):
-        st.dataframe(pd.DataFrame(pre["levels"]), hide_index=True, width="stretch")
-        st.caption(f"From the 08:45 ET pre-market run ({pre.get('ts', '')[11:16]} UTC). Trend decides the side: "
-                   "calls only above the 20-day average, puts only below.")
-    else:
-        st.caption("Appears after the 08:45 ET pre-market run on trading days.")
+    with st.expander("Key pre-market levels"):
+        if pre.get("levels"):
+            st.dataframe(pd.DataFrame(pre["levels"]), hide_index=True, width="stretch")
+            st.caption(f"From the 08:45 ET pre-market run ({pre.get('ts', '')[11:16]} UTC). Trend decides the side: "
+                       "calls only above the 20-day average, puts only below.")
+        else:
+            st.caption("Appears after the 08:45 ET pre-market run on trading days.")
+    with st.expander("First-candle sizing and capital pools"):
+        stat_row([
+            ("Trading equity", money(trading_eq), "first-candle options pool: starting capital + its realized P&L"),
+            ("Profile", str(profile).upper(), fc_today.get("profile_reason") or pre.get("profile_reason")),
+            ("Phase · size", f"{phase} · x{fc_today.get('size_mult', pre.get('size_mult', settings.fc_size_scale))}",
+             "; ".join(fc_today.get("size_notes") or pre.get("size_notes") or [])),
+        ])
+        pools_panel(led, settings, closed, acct_eq, today)
+    with st.expander("VRZ paper trades"):
+        vrz_paper_panel(led, settings)
 
-    vrz_paper_panel(led, settings)
 
+def open_positions(led, open_trades: list, broker, broker_error, manual: dict | None) -> None:
     st.subheader("Open positions")
     if broker is None:
-        st.error(f"Broker unavailable: {broker_error}")
+        st.caption(f"Broker unavailable: {broker_error}")
         return
     try:
         positions = {p.symbol: p for p in broker.positions()}
     except Exception as exc:  # noqa: BLE001
         st.error(f"Broker error: {exc}")
         positions = {}
-    if not open_trades:
-        st.caption("Flat - no bot positions open.")
+    if not open_trades and not positions:
+        st.caption("Flat - nothing open at the broker.")
+    rows = []
     for t in open_trades:
         p = positions.get(t["symbol"])
         mult = 100 if t["asset_class"] == "option" else 1
         px = p.current_price if p else None
-        pnl = (px - t["entry_price"]) * t["qty"] * mult if px else None
-        c = st.columns(5)
-        c[0].metric(t["symbol"], f"{t['direction']} x{t['qty']:g}")
-        c[1].metric("Entry", f"{t['entry_price']:.2f}")
-        c[2].metric("Now", f"{px:.2f}" if px else "—")
-        c[3].metric("P&L", money(pnl, True) if pnl is not None else "—",
-                    f"{pnl / (t['entry_price'] * t['qty'] * mult):+.0%}" if pnl is not None else None)
-        c[4].metric("Underlying target", f"{t['underlying_target']:.2f}" if t.get("underlying_target") else "—")
+        pnl = (px - t["entry_price"]) * t["qty"] * mult * (1 if t["asset_class"] == "option" or t["direction"] == "bull" else -1) if px else None
+        rows.append({"Strategy": _book_of(t.get("notes")), "Symbol": t["symbol"], "Side": t["direction"],
+                     "Qty": t["qty"], "Entry": t["entry_price"], "Now": px, "P&L $": pnl,
+                     "Stop (underlying)": t.get("underlying_stop") or t.get("stop_price"),
+                     "Target (underlying)": t.get("underlying_target") or t.get("target_price")})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                     column_config={"P&L $": st.column_config.NumberColumn(format="$%+.0f")})
     manual_positions_panel(positions, {t["symbol"] for t in open_trades}, manual or {})
 
 

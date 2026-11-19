@@ -165,8 +165,14 @@ class Ledger:
     def trades_on(self, d: date) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM trades WHERE trade_date = ?", (d.isoformat(),))]
 
-    def total_realized_pnl(self, asset_class: str | None = None) -> float:
+    IMPORTED = "imported|"     # notes prefix of broker history booked after the fact (old engine, manual trades)
+
+    def total_realized_pnl(self, asset_class: str | None = None, include_imported: bool = False) -> float:
+        """Bot P&L: imported history (account-level only) is left out unless asked for, so strategy pools and
+        sizing never move when old broker trades are booked."""
         sql, args = "SELECT COALESCE(SUM(realized_pnl), 0) FROM trades WHERE status = 'CLOSED'", ()
+        if not include_imported:
+            sql += f" AND COALESCE(notes, '') NOT LIKE '{self.IMPORTED}%'"
         if asset_class:
             sql, args = sql + " AND asset_class = ?", (asset_class,)
         return float(self.conn.execute(sql, args).fetchone()[0])

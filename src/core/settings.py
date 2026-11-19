@@ -79,6 +79,7 @@ class Settings:
     # capped at the broker account's equity. 0 = use the full account equity.
     starting_capital: float = 10_000.0   # options pool (first-candle sizes on this + realized option P&L)
     stock_capital: float = 10_000.0      # stock pool (VRZ paper stock trades: this + their realized P&L)
+    account_start: float = 100_000.0     # Alpaca paper deposit (2026-09-22): the first page's "since start"
     reserve_capital: float = 0.0         # never deployed (live: 80k): pools and real orders stay within account - reserve
     options_allocation_pct: float = 0.20
     risk_per_trade_pct: float = 0.02
