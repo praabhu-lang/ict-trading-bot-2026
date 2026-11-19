@@ -75,3 +75,51 @@ def test_settings_mode_validated():
     assert Settings().news_llm_mode == "shadow"
     assert Settings.from_overrides({"news_llm_mode": "veto"}).news_llm_mode == "veto"
     assert Settings.from_overrides({"news_llm_mode": "yolo"}).news_llm_mode == "shadow"
+
+
+class SeqLLM(NvidiaLLM):
+    """_complete answers from a script: an Exception instance is raised, a string is returned."""
+    def __init__(self, *script):
+        super().__init__(api_key="test", session=None)
+        self.script, self.timeouts = list(script), []
+
+    def _complete(self, prompt, max_tokens=1500, timeout=None):
+        self.timeouts.append(timeout)
+        out = self.script.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
+def _http_error(code):
+    import requests
+    resp = requests.Response()
+    resp.status_code = code
+    return requests.HTTPError(f"{code} error", response=resp)
+
+
+def test_ask_json_retries_timeouts_5xx_and_bad_json_but_not_4xx():
+    import requests
+    from src.agents import llm as L
+
+    ok = '{"case": ["x"], "conviction": 6}'
+    llm = SeqLLM(requests.ReadTimeout("read timed out"), ok)
+    assert llm.ask_json("p", "bull") == {"case": ["x"], "conviction": 6}
+    assert llm.timeouts == [L.JSON_TIMEOUT, L.JSON_TIMEOUT]                 # longer than the 30 s news default
+    assert SeqLLM(_http_error(503), ok).ask_json("p", "bull") is not None
+    assert SeqLLM(_http_error(429), ok).ask_json("p", "bull") is not None
+    assert SeqLLM("thinking... no json", ok).ask_json("p", "bull") is not None
+    bad_key = SeqLLM(_http_error(401), ok)
+    assert bad_key.ask_json("p", "bull") is None and len(bad_key.script) == 1     # not retried
+    assert SeqLLM(requests.ReadTimeout("t"), requests.ReadTimeout("t")).ask_json("p", "bull") is None
+
+
+def test_ask_json_never_waits_past_the_deadline():
+    import time as _t
+    import requests
+
+    llm = SeqLLM(requests.ReadTimeout("t"), '{"a": 1}')
+    assert llm.ask_json("p", "judge", deadline=_t.monotonic() + 40) == {"a": 1}
+    assert 30 < llm.timeouts[0] <= 40                                        # capped by the time left
+    late = SeqLLM('{"a": 1}')
+    assert late.ask_json("p", "judge", deadline=_t.monotonic() + 5) is None and late.timeouts == []

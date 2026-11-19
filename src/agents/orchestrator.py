@@ -11,6 +11,8 @@ Each cycle (every ~30 s):
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import html
 import logging
 import time
@@ -44,6 +46,15 @@ URGENT_EXITS = {"STOP_LOSS", "SIGNAL_INVALIDATED", "MANUAL_FLATTEN"}   # EOD has
 SCAN_DELAY_SECONDS = 20
 SHOCK_TTL = timedelta(minutes=30)       # market-wide news check, shared across engine runs (Tavily credits)  # let the data vendor finalize the bar that just closed
 VOL_FIRST, VOL_LAST = dtime(10, 0), dtime(14, 30)   # stock debate slice: new entries (ET)
+
+
+
+def _run_parallel(calls: list) -> list:
+    """Run zero-argument callables in threads, results in order (debates of one scan: the slowest sets the wait)."""
+    if len(calls) <= 1:
+        return [c() for c in calls]
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return [fut.result() for fut in [pool.submit(c) for c in calls]]
 
 
 class TradingEngine:
@@ -1421,16 +1432,21 @@ class TradingEngine:
                        key=lambda x: -x[1].rate)
         log = self.ledger.get_kv("gex_ideas_log") or []
         decisions = self.ledger.get_kv("debate_decisions") or []
-        flat, n = flatten_time(now, self.s), 0
+        flat, jobs = flatten_time(now, self.s), []
         for ticker, idea, p in cands:
-            if n >= self.s.debate_max_per_scan:
+            if len(jobs) >= self.s.debate_max_per_scan:
                 break
-            if not self.ledger.alert_once(f"debate:{today}:{ticker}:{idea.setup}"):
+            key = f"debate:{today}:{ticker}:{idea.setup}"
+            if not self.ledger.alert_once(key):
                 continue
-            n += 1
             snap = gl.snapshot(idea, p, now.astimezone(ET))
             learn = db.learned(idea.setup, idea.grade, snap["tod"], snap["regime"], log, gates)
-            rec = db.debate(llm, db.facts(idea, snap, p.spot, now, learn, extra), now, flat)
+            jobs.append((key, ticker, idea, p, snap, db.facts(idea, snap, p.spot, now, learn, extra)))
+        # LLM calls only in the threads (the ledger stays on this thread): a scan waits for one debate, not the sum
+        recs = _run_parallel([lambda f=f: db.debate(llm, f, now, flat) for *_, f in jobs])
+        for (key, ticker, idea, p, snap, _), rec in zip(jobs, recs):
+            if rec.get("why", "").startswith(db.UNAVAILABLE):
+                self.ledger.clear_alert(key)                          # retry on the next scan while still ACTIVE
             rid = f"{today}:{ticker}:{idea.setup}"
             decisions.append({"id": rid, "date": today, "at": now.isoformat(timespec="seconds"), "ticker": ticker,
                               "side": idea.side, "setup": idea.setup, "grade": idea.grade, "spot": p.spot,
@@ -1485,16 +1501,21 @@ class TradingEngine:
         spy = vs.features("SPY", self.market.bars("SPY", now), now) or {}
         closed = self._vol_closed()
         decisions = self.ledger.get_kv("vol_debate_decisions") or []
-        flat, opened = flatten_time(now, s), 0
-        for f in cands[:s.vol_per_scan]:
-            if len(open_vol) + opened >= s.vol_max_open:
-                break
-            if not self.ledger.alert_once(f"vol_debate:{d.isoformat()}:{f['ticker']}"):
-                continue
-            facts = {**f, "spy_change_pct": spy.get("change_pct"), "learned": vd.learned(closed)}
-            rec = vd.debate(llm, facts, now, flat, s.vol_allow_short)
+        flat, opened, jobs = flatten_time(now, s), 0, []
+        for f in cands[:min(s.vol_per_scan, s.vol_max_open - len(open_vol))]:
+            key = f"vol_debate:{d.isoformat()}:{f['ticker']}"
+            if self.ledger.alert_once(key):
+                jobs.append((key, f, {**f, "spy_change_pct": spy.get("change_pct"), "learned": vd.learned(closed)}))
+        recs = _run_parallel([lambda x=x: vd.debate(llm, x, now, flat, s.vol_allow_short) for *_, x in jobs])
+        for (key, f, _), rec in zip(jobs, recs):
+            if rec.get("why", "").startswith(vd.UNAVAILABLE):
+                self.ledger.clear_alert(key)                          # the next 15-min scan may debate it again
             row = {"id": f"{d.isoformat()}:{f['ticker']}", "date": d.isoformat(), "at": now.isoformat(timespec="seconds"),
                    **{k: f[k] for k in ("ticker", "price", "rvol", "change_pct", "pct_from_vwap")}, **rec}
+            if rec["decision"] in ("BUY", "SELL") and len(open_vol) + opened >= s.vol_max_open:
+                row["order"] = "SKIPPED: max open positions"
+                decisions.append(row)
+                continue
             if rec["decision"] in ("BUY", "SELL"):
                 row["order"] = self._vol_enter(f, rec, now)
                 opened += row["order"] == "FILLED"

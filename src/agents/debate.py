@@ -13,11 +13,12 @@ The facts each agent sees: the idea (setup, grade, levels, contract, spread), th
 learner has seen so far for that setup (live paper log + the nightly gate). Every debate - TRADE or SKIP - is kept in
 ledger kv debate_decisions, so the judge's calls can later be compared with how the same idea did in the main GEX
 book (gex_ideas_log, same id). Trades: kv debate_open / debate_log, risk-sized like the GEX ideas.
-Any LLM failure means no trade (logged as SKIP with the reason).
+Any LLM failure means no trade (logged as SKIP with the reason; the orchestrator retries it on the next scan).
 """
 from __future__ import annotations
 
 import json
+import time
 import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time as dtime, timedelta
@@ -163,14 +164,19 @@ def clamp_exits(side: str, spot: float, scan_stop: float, scan_target: float, st
 
 
 JUDGE_TOKENS = 6000         # the judge reasons over both cases: 2,500 tokens sometimes ran out before the JSON
+DEBATE_BUDGET_S = 240       # bull + bear + judge, retries included; debates of one scan run in parallel
+UNAVAILABLE = "LLM unavailable"
 
 
-def ask_judge(llm, prompt: str, what: str, parse):
-    """The judge's parsed answer, one retry when the reply is missing or malformed."""
+def ask_judge(llm, prompt: str, what: str, parse, deadline: float | None = None):
+    """The judge's parsed answer: ask_json retries errors / missing JSON, plus one more ask when the JSON is there
+    but not a valid judgment - all within `deadline`."""
     for _ in range(2):
-        out = parse(llm.ask_json(prompt, what, max_tokens=JUDGE_TOKENS))
+        out = parse(llm.ask_json(prompt, what, max_tokens=JUDGE_TOKENS, deadline=deadline))
         if out is not None:
             return out
+        if deadline is not None and time.monotonic() >= deadline:
+            break
     return None
 
 
@@ -186,26 +192,27 @@ def parse_judgment(data: dict | None) -> dict | None:
             "reason": str(data.get("reason", ""))[:400]}
 
 
-def debate(llm, f: dict, now: datetime, flatten_at: datetime) -> dict:
-    """Run bull + bear (in parallel), then the judge. Returns the full record: bull, bear, judge, final decision and,
-    for a TRADE, the guarded exits (stop, target, exit_by ISO)."""
+def debate(llm, f: dict, now: datetime, flatten_at: datetime, budget: float = DEBATE_BUDGET_S) -> dict:
+    """Run bull + bear (in parallel), then the judge, all within `budget` seconds. Returns the full record: bull,
+    bear, judge, final decision and, for a TRADE, the guarded exits (stop, target, exit_by ISO)."""
+    deadline = time.monotonic() + budget
     ctx = {"facts": json.dumps(f, default=str), "flatten": f"{flatten_at.astimezone(ET):%H:%M}"}
     what = f"{f['ticker']} {f['setup']}"
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fb = pool.submit(llm.ask_json, BULL.format(**ctx), f"bull {what}")
-        fr = pool.submit(llm.ask_json, BEAR.format(**ctx), f"bear {what}")
+        fb = pool.submit(llm.ask_json, BULL.format(**ctx), f"bull {what}", deadline=deadline)
+        fr = pool.submit(llm.ask_json, BEAR.format(**ctx), f"bear {what}", deadline=deadline)
         bull, bear = parse_case(fb.result()), parse_case(fr.result())
     rec = {"bull": bull, "bear": bear, "judge": None, "decision": "SKIP"}
     if bull is None or bear is None:
-        rec["why"] = "LLM unavailable (bull / bear)"
+        rec["why"] = f"{UNAVAILABLE} (bull / bear)"
         return rec
     judge = ask_judge(llm, JUDGE.format(
         **ctx, bull="\n".join(f"- {p}" for p in bull["case"]) or "- (nothing)", bull_conv=bull["conviction"],
         bear="\n".join(f"- {p}" for p in bear["case"]) or "- (nothing)", bear_conv=bear["conviction"],
-        stop=f["stop"], target=f["target"]), f"judge {what}", parse_judgment)
+        stop=f["stop"], target=f["target"]), f"judge {what}", parse_judgment, deadline)
     rec["judge"] = judge
     if judge is None:
-        rec["why"] = "LLM unavailable (judge)"
+        rec["why"] = f"{UNAVAILABLE} (judge)"
         return rec
     if judge["decision"] != "TRADE":
         rec["why"] = judge["reason"]

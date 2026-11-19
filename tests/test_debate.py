@@ -28,7 +28,7 @@ class FakeLLM:
                         "JUDGE": judge}
         self.prompts = []
 
-    def ask_json(self, prompt, what, max_tokens=2500):
+    def ask_json(self, prompt, what, max_tokens=2500, deadline=None):
         self.prompts.append(prompt)
         role = next(r for r in ("JUDGE", "BULL", "BEAR") if f"Your role: {r}" in prompt)
         return self.answers[role]
@@ -118,6 +118,28 @@ def test_engine_debates_opens_paper_trade_and_exits_on_time(ledger, monkeypatch)
     engine.gex_ideas(at(10, 56), scan=False)                                               # judge's time exit
     assert ledger.get_kv("debate_open") == []
     assert ledger.get_kv("debate_log")[0]["reason"] == "TIME"
+
+
+def test_engine_redebates_next_scan_after_llm_failure(ledger, monkeypatch):
+    from tests.test_engine import S
+    from tests.test_gex_plan import prof
+    from src.strategy import gex_plan as gp
+
+    engine, _, _ = make_engine(ledger, at(10, 35), settings=S(gex_risk_per_idea=100.0))
+    chain = engine.market.chain("SPY", TODAY)
+    o = next(x for x in chain.options if x.put_call == "C" and x.bid > 0)
+    p = prof()
+    idea = gp.Idea("SPY", "ACTIVE", side="CALL", setup=SETUP, level=p.spot - 0.1, stop=p.spot - 1.0,
+                   target=p.spot + 1.0, contract=o.symbol, mid=1.0, ask=1.05, delta=0.4, grade="A", rate=80)
+    monkeypatch.setattr(gp, "analyse", lambda m, n, t, now: {"idea": idea, "profile": p} if t == "SPY" else {})
+    engine.news.llm = FakeLLM(bull={})                                       # bull agent's call fails
+    engine.gex_ideas(at(10, 35), scan=True)
+    assert "unavailable" in ledger.get_kv("debate_decisions")[0]["why"]
+    engine.news.llm = FakeLLM(judge={"decision": "SKIP", "confidence": 7, "reason": "late"})
+    engine.gex_ideas(at(10, 40), scan=True)                                  # retried, then deduped as before
+    engine.gex_ideas(at(10, 45), scan=True)
+    calls = ledger.get_kv("debate_decisions")
+    assert len(calls) == 2 and calls[-1]["why"] == "late"
 
 
 def test_engine_debate_off_or_no_llm_does_nothing(ledger, monkeypatch):

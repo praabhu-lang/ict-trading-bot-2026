@@ -15,11 +15,13 @@ closes it at the judge's exit_by or the flatten time. Every debate is kept in le
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from ..core.clock import ET
-from .debate import MIN_CONFIDENCE, ask_judge, clamp_exits, parse_case, parse_exit_by
+from .debate import (DEBATE_BUDGET_S, MIN_CONFIDENCE, UNAVAILABLE, ask_judge, clamp_exits, parse_case,
+                     parse_exit_by)
 
 TAG = "vol_debate"
 
@@ -90,25 +92,27 @@ def parse_judgment(data: dict | None) -> dict | None:
             "exit_by": data.get("exit_by"), "reason": str(data.get("reason", ""))[:400]}
 
 
-def debate(llm, f: dict, now: datetime, flatten_at: datetime, allow_short: bool = True) -> dict:
-    """Bull + bear in parallel, then the judge. Returns the record; decision BUY / SELL carries the guarded stop,
-    target and exit_by (ISO)."""
+def debate(llm, f: dict, now: datetime, flatten_at: datetime, allow_short: bool = True,
+           budget: float = DEBATE_BUDGET_S) -> dict:
+    """Bull + bear in parallel, then the judge, all within `budget` seconds. Returns the record; decision BUY / SELL
+    carries the guarded stop, target and exit_by (ISO)."""
+    deadline = time.monotonic() + budget
     ctx = {"facts": json.dumps(f, default=str), "flatten": f"{flatten_at.astimezone(ET):%H:%M}"}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fb = pool.submit(llm.ask_json, BULL.format(**ctx), f"vol bull {f['ticker']}")
-        fr = pool.submit(llm.ask_json, BEAR.format(**ctx), f"vol bear {f['ticker']}")
+        fb = pool.submit(llm.ask_json, BULL.format(**ctx), f"vol bull {f['ticker']}", deadline=deadline)
+        fr = pool.submit(llm.ask_json, BEAR.format(**ctx), f"vol bear {f['ticker']}", deadline=deadline)
         bull, bear = parse_case(fb.result()), parse_case(fr.result())
     rec = {"bull": bull, "bear": bear, "judge": None, "decision": "SKIP"}
     if bull is None or bear is None:
-        rec["why"] = "LLM unavailable (bull / bear)"
+        rec["why"] = f"{UNAVAILABLE} (bull / bear)"
         return rec
     judge = ask_judge(llm, JUDGE.format(
         **ctx, bull="\n".join(f"- {p}" for p in bull["case"]) or "- (nothing)", bull_conv=bull["conviction"],
         bear="\n".join(f"- {p}" for p in bear["case"]) or "- (nothing)", bear_conv=bear["conviction"]),
-        f"vol judge {f['ticker']}", parse_judgment)
+        f"vol judge {f['ticker']}", parse_judgment, deadline)
     rec["judge"] = judge
     if judge is None:
-        rec["why"] = "LLM unavailable (judge)"
+        rec["why"] = f"{UNAVAILABLE} (judge)"
         return rec
     rec["why"] = judge["reason"]
     if judge["decision"] == "SKIP":

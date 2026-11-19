@@ -259,6 +259,11 @@ class Ledger:
         self.conn.commit()
         return cur.rowcount == 1
 
+    def clear_alert(self, key: str) -> None:
+        """Forget a dedupe key so the next alert_once(key) is True again (e.g. retry a debate the LLM failed)."""
+        self.conn.execute("DELETE FROM alerts WHERE key = ?", (key,))
+        self.conn.commit()
+
     def alert_seen(self, key: str) -> bool:
         return self.conn.execute("SELECT 1 FROM alerts WHERE key = ?", (key,)).fetchone() is not None
 

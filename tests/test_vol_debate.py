@@ -31,7 +31,7 @@ class FakeLLM:
     def __init__(self, judge):
         self.judge, self.prompts = judge, []
 
-    def ask_json(self, prompt, what, max_tokens=2500):
+    def ask_json(self, prompt, what, max_tokens=2500, deadline=None):
         self.prompts.append(prompt)
         if "Your role: JUDGE" in prompt:
             return self.judge
