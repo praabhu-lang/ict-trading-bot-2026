@@ -157,8 +157,7 @@ class TradingEngine:
                     reason = "STOP_LOSS (broker)" if is_stop else "TARGET (broker)" if leg.order_type == "limit" else "BROKER_EXIT"
                     break
             if exit_price is None:
-                exit_price = 0.0 if t["asset_class"] == "option" else float(t["entry_price"])
-                reason = "CLOSED_AT_BROKER (price unknown - check broker)"
+                exit_price, reason = self._outside_close(t)
             pnl = self.ledger.close_trade(t["id"], exit_price, reason, 100.0 if t["asset_class"] == "option" else 1.0)
             self._trade_closed_email(t, exit_price, reason, pnl)
         foreign = [p for p in positions.values() if p.symbol not in managed]
@@ -180,6 +179,22 @@ class TradingEngine:
                 f"<ul>{rows}</ul>",
                 dedupe_key=f"unmanaged:{today}:{','.join(sorted(unmanaged))}",
             )
+
+    def _outside_close(self, t: dict) -> tuple[float, str]:
+        """Exit price for a ledger trade that is gone at the broker with no filled bot order: look for any closing
+        fill since it opened (e.g. sold by hand in the broker's app on Nov 5 2026: +$3,084 was booked as -$1,188)."""
+        side = "buy" if t["asset_class"] == "stock" and t["direction"] == "bear" else "sell"
+        try:
+            fill = self.broker.closing_fill(t["symbol"], side, datetime.fromisoformat(t["opened_at"]))
+        except Exception as exc:  # noqa: BLE001 - fall back to the old unknown-price booking
+            log.warning("closing-fill lookup failed for %s: %s", t["symbol"], exc)
+            fill = None
+        if fill is not None and fill.filled_avg_price:
+            if abs(fill.filled_qty - float(t["qty"])) > 1e-9:
+                log.warning("%s: outside closing fills total %g, ledger qty %g", t["symbol"], fill.filled_qty, t["qty"])
+            return float(fill.filled_avg_price), "CLOSED_AT_BROKER (outside order, broker fill price)"
+        return (0.0 if t["asset_class"] == "option" else float(t["entry_price"]),
+                "CLOSED_AT_BROKER (price unknown - check broker)")
 
     # ----------------------------------------------------------------- exits
     def manage_exits(self, now: datetime, force_reason: str | None = None) -> None:

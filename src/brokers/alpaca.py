@@ -122,3 +122,19 @@ class AlpacaBroker(Broker):
 
     def cancel(self, order_id: str) -> None:
         self.trading.cancel_order_by_id(order_id)
+
+    def closing_fill(self, symbol: str, side: str, since) -> OrderStatus | None:
+        orders = self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol],
+                                                          after=since, limit=100, nested=True))
+        flat = []
+        for o in orders:
+            flat += [o, *(o.legs or [])]
+        fills = [o for o in flat if o.symbol == symbol and o.side.value == side and float(o.filled_qty or 0) > 0
+                 and o.filled_avg_price]
+        qty = sum(float(o.filled_qty) for o in fills)
+        if not qty:
+            return None
+        px = sum(float(o.filled_qty) * float(o.filled_avg_price) for o in fills) / qty
+        last = max(fills, key=lambda o: o.filled_at or o.submitted_at)
+        return OrderStatus(str(last.id), "filled", qty, round(px, 4),
+                           order_type=last.order_type.value if last.order_type else "")

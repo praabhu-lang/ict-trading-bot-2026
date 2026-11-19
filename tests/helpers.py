@@ -184,6 +184,7 @@ class FakeBroker(Broker):
         self.fill_limits = True
         self.reject_stops = False
         self.stops: dict[str, dict] = {}
+        self.outside: list[dict] = []
 
     def account(self):
         return Account(self.equity, self.equity * 2, self.equity, self.equity)
@@ -244,6 +245,19 @@ class FakeBroker(Broker):
 
     def get_order(self, order_id):
         return self.orders.get(order_id, OrderStatus(order_id, "canceled"))
+
+    def close_outside(self, symbol, price):
+        """Close a position the way a person would in the broker's app: no order id the bot knows of."""
+        p = self.pos.pop(symbol)
+        self.outside.append({"symbol": symbol, "side": "sell" if p.qty > 0 else "buy", "qty": abs(p.qty),
+                             "price": price})
+
+    def closing_fill(self, symbol, side, since):
+        fills = [f for f in getattr(self, "outside", []) if f["symbol"] == symbol and f["side"] == side]
+        if not fills:
+            return None
+        qty = sum(f["qty"] for f in fills)
+        return OrderStatus("outside", "filled", qty, sum(f["qty"] * f["price"] for f in fills) / qty)
 
     def cancel(self, order_id):
         o = self.orders.get(order_id)

@@ -5,6 +5,7 @@ import pytest
 
 from src.agents.execution_agent import ExecutionAgent, choose_option
 from src.agents.orchestrator import TradingEngine
+from src.brokers.base import Position
 from src.core.clock import ET, FixedClock
 from src.core.ledger import Ledger
 from src.core.settings import Settings
@@ -219,6 +220,35 @@ def test_broker_stop_fill_is_booked_by_reconcile(ledger):
     assert t["exit_reason"] == "STOP_LOSS (broker)" and t["exit_price"] == 0.98
     assert t["realized_pnl"] == pytest.approx((0.98 - 2.0) * 4 * 100)
     assert any("🛑" in x for x in notifier.sent)
+
+
+def test_reconcile_uses_the_broker_fill_of_a_close_placed_by_hand(ledger):
+    engine, broker, notifier = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)                              # 4 puts @ 2.00, no stop / exit ids on file
+    broker.close_outside("SPY261007P00102000", 7.12)                # sold in the broker's app (Nov 5 2026 case)
+    engine.run_cycle(scan=False)
+    t = ledger.trade(tid)
+    assert t["exit_price"] == 7.12 and t["exit_reason"].startswith("CLOSED_AT_BROKER (outside order")
+    assert t["realized_pnl"] == pytest.approx((7.12 - 2.0) * 4 * 100)
+
+
+def test_reconcile_short_stock_closed_by_hand_looks_for_a_buy(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    broker.pos["SPY"] = Position("SPY", -10, 101.6, 101.6, 0.0, "stock")
+    tid = ledger.open_trade(trade_date=TODAY.isoformat(), broker="alpaca_paper", underlying="SPY", symbol="SPY",
+                            asset_class="stock", direction="bear", qty=10, entry_price=101.6, stop_price=102.6,
+                            target_price=99.5)
+    broker.close_outside("SPY", 100.6)
+    engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["realized_pnl"] == pytest.approx(10.0)
+
+
+def test_reconcile_without_any_fill_keeps_the_unknown_price_booking(ledger):
+    engine, broker, _ = make_engine(ledger, at(12, 0))
+    tid = _open_option(ledger, broker)
+    broker.pos.pop("SPY261007P00102000")                            # gone, and no fill anywhere
+    engine.run_cycle(scan=False)
+    assert ledger.trade(tid)["exit_reason"] == "CLOSED_AT_BROKER (price unknown - check broker)"
 
 
 def test_trailing_ratchets_broker_stop_up(ledger):

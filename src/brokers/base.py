@@ -105,6 +105,11 @@ class Broker(ABC):
     @abstractmethod
     def cancel(self, order_id: str) -> None: ...
 
+    def closing_fill(self, symbol: str, side: str, since) -> OrderStatus | None:
+        """Filled `side` orders on `symbol` since `since` (a datetime), any origin - e.g. a close placed by hand in
+        the broker's app, which the bot has no order id for. Qty-weighted average price, or None if none / unsupported."""
+        return None
+
     def cancel_symbol_orders(self, symbol: str) -> None:
         for o in self.open_orders():
             if o.get("symbol") == symbol:
