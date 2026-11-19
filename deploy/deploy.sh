@@ -16,10 +16,11 @@ if [ -n "$missing" ]; then echo "Source files not committed:"; echo "$missing"; 
 
 gcloud builds submit --project "$PROJECT" --tag "$IMAGE" .
 
-# Dashboard: one instance (Streamlit sessions), long timeout for backtests over websockets; 4 GiB holds the
-# ~600 MB market database the Backtest tab replays (Cloud Run files live in memory).
+# Dashboard: one instance (Streamlit sessions), long timeout for backtests over websockets. 2 GiB: normal use
+# is ~0.3 GiB; the Backtest tab adds the ~600 MB market database (Cloud Run files live in memory). Peak seen
+# Oct 2026 was 2.0 GiB of 4 - if a backtest gets OOM-killed, raise this to 3Gi.
 gcloud run deploy ai-trading-dashboard --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
-  --env-vars-file env.yaml --memory 4Gi --cpu 1 --timeout 3600 --max-instances 1 \
+  --env-vars-file env.yaml --memory 2Gi --cpu 1 --timeout 3600 --max-instances 1 \
   --session-affinity --allow-unauthenticated
 
 # Pre-market plan (08:45 ET).

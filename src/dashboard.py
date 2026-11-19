@@ -28,11 +28,13 @@ from src.core.events import EventCalendar  # noqa: E402
 from src.core.ledger import Ledger  # noqa: E402
 from src import dashboard_gex as gex_tab  # noqa: E402
 from src import dashboard_pages as pages  # noqa: E402
+from src import idle_guard  # noqa: E402
 from src.core.settings import BROKERS, DEBATE_MODES, VOL_DEBATE_MODES, DEFAULT_UNIVERSE, FC_MODES, GEX_CONFIRM_RULES, GEX_FLIP_RULES, GEX_GATE_MODES, LIVE_BROKERS, NEWS_LLM_MODES, STRATEGIES, Settings, env, live_trading_allowed  # noqa: E402
 from src.core.store import Store  # noqa: E402
 from src.data.schwab import SchwabTokenStore  # noqa: E402
 
 st.set_page_config(page_title="ICT Trading Bot", page_icon="📈", layout="wide")
+idle_guard.install()   # closes the socket after DASHBOARD_IDLE_MINUTES idle so Cloud Run stops billing
 
 SERIES = "#2a78d6"
 MUTED = "#8a8985"

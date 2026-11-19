@@ -5,6 +5,9 @@ baseRadius = "medium"
 
 [server]
 headless = true
+# Keep a session alive for an hour after its tab disconnects, so "Resume" after the idle cutoff
+# (src/idle_guard.py) reattaches without a new Authenticator login.
+disconnectedSessionTTL = 3600
 
 [browser]
 gatherUsageStats = false
