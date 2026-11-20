@@ -165,9 +165,9 @@ def cmd_gex_archive() -> int:
     from .data.gexbot import GexbotClient, archive_eod
 
     client = GexbotClient()
-    if not client.configured:
-        print("GEXBOT_API_KEY not set")
-        return 1
+    if not client.configured:      # no gexbot subscription: GEX comes from Schwab chains (nightly archives those)
+        print("GEXBOT_API_KEY not set - gexbot EOD archive skipped")
+        return 0
     store = Store.from_env()
     results = archive_eod(client, store, load_settings(store).universe)
     print(json.dumps(results, indent=2))

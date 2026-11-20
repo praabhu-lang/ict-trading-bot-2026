@@ -177,6 +177,7 @@ def test_engine_skips_below_or_unknown_zero_gamma_and_when_off(ledger):  # noqa:
 
     d2 = date(2026, 10, 29)
     eng, *_ = engine_at(ledger, qqq_day(d=d2), flip=None)
+    eng.market._chains.pop("QQQ")                                     # no gexbot and no Schwab chain either
     eng.qqq_fade_paper(at(11, 21, d=d2))
     assert ledger.get_kv(f"qqq_fade_paper:{d2}")["signals"][0]["reason"] == "zero gamma unknown"
 
@@ -198,6 +199,17 @@ def test_engine_skips_below_or_unknown_zero_gamma_and_when_off(ledger):  # noqa:
     eng.qqq_fade_paper(at(11, 31, d=d5))                              # 11:15 bar seen 11 min after it closed
     rec = ledger.get_kv(f"qqq_fade_paper:{d5}")
     assert not any(books(ledger).values()) and rec["signals"][0]["reason"] == "missed (engine not running)"
+
+
+def test_zero_gamma_falls_back_to_the_schwab_chain_without_gexbot(ledger, monkeypatch):  # noqa: F811
+    from src.strategy import gex_plan as gp
+
+    eng, *_ = engine_at(ledger, qqq_day(), flip=None)                 # gexbot: nothing
+    monkeypatch.setattr(gp, "profile", lambda chain, now, mode="auto", weight="oi": type(
+        "P", (), {"gex": GexResult(5.0e8, "POSITIVE", 102.0, 98.0, 99.5)})())
+    eng.qqq_fade_paper(at(11, 21))
+    sig = ledger.get_kv(f"qqq_fade_paper:{DAY}")["signals"][0]
+    assert sig["zero_gamma"] == 99.5 and sig["zero_gamma_src"] == "schwab" and sig["status"] == "SIGNAL"
 
 
 def test_bars_fetched_before_the_bar_settles_are_not_cached():

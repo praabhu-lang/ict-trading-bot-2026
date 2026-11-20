@@ -8,7 +8,8 @@ few hundred signal / structure / exit combinations, so this paper run is the rea
 Signal (QQQ 5-minute bars, session-anchored VWAP from typical price x volume, sigma = volume-weighted st. dev. of
   typical price around the VWAP): a bar closes at z < 2 right after one at z >= 2, the bar starting 09:45-15:00 ET.
   Raw signals are at least COOLDOWN_BARS apart, counted from the session open (as in the backtest).
-Filter: QQQ above the 0DTE zero-gamma level (gexbot); skip when it is below or unknown (qf_require_pos_gamma).
+Filter: QQQ above the 0DTE zero-gamma level (gexbot if configured, else our own from the Schwab chain); skip when
+it is below or unknown (qf_require_pos_gamma).
 Contract: the put of the next expiry after today, strike = round(spot) + 1, bought with the simulated mid -> ask
   ladder on live quotes (passive limits under the price filled mostly on losers in the backtest).
 

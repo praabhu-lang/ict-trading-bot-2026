@@ -205,7 +205,7 @@ class Settings:
     # --- QQQ +2 sigma VWAP fade: PAPER ONLY, four books of 1DTE puts 1 strike ITM (src/strategy/qqq_fade.py) ---
     qf_paper: bool = True
     qf_flat_qty: int = 6                 # puts in the two flat books (the scale-in books build up to 1+2+3)
-    qf_require_pos_gamma: bool = True    # only above the 0DTE zero-gamma level (gexbot); skip when unknown
+    qf_require_pos_gamma: bool = True    # only above the 0DTE zero-gamma level (gexbot, else Schwab); skip when unknown
     qf_fee: float = 0.65                 # $ per contract per side
 
     # --- VRZ universe scan as PAPER trades while first_candle is the strategy (simulated stock trades) ---

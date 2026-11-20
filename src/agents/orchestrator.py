@@ -1086,15 +1086,30 @@ class TradingEngine:
         if now > qf.bar_close(sig["bar"]) + timedelta(minutes=qf.ENTRY_GRACE_MIN):
             sig.update(status="SKIPPED", reason="missed (engine not running)")
             return
-        levels = getattr(self.market, "gexbot_levels", None)
-        g = levels("QQQ", now, view="zero") if levels else None
+        g, src = self._zero_gex("QQQ", now)
         flip = g.gamma_flip if g else None
-        sig.update(zero_gamma=flip, net_gex=round(g.net_gex, 1) if g else None)
+        sig.update(zero_gamma=flip, net_gex=round(g.net_gex, 1) if g else None, zero_gamma_src=src)
         if s.qf_require_pos_gamma and (flip is None or sig["spot"] <= flip):
             sig.update(status="SKIPPED", reason="zero gamma unknown" if flip is None else f"below zero gamma {flip:g}")
             return
         sig.update(status="SIGNAL", confirm="WAITING", books={})
         self._qf_enter(sig, [b for b in qf.BOOKS if b.endswith("_now")], books, now)
+
+    def _zero_gex(self, ticker: str, now: datetime):
+        """(0DTE GexResult, source): gexbot when a key is configured and answers, else our own levels from the
+        Schwab chain - the same profile the GEX ideas use (gex_plan.profile, 0DTE levels all day)."""
+        from ..strategy import gex_plan as gp
+
+        levels = getattr(self.market, "gexbot_levels", None)
+        g = levels(ticker, now, view="zero") if levels else None
+        if g is not None:
+            return g, "gexbot"
+        try:
+            p = gp.profile(self.market.chain(ticker, now.date(), max_dte=gp.CHAIN_DAYS), now, "auto")
+        except Exception as exc:  # noqa: BLE001 - unknown zero gamma: the filter skips the signal
+            log.warning("Schwab zero-gamma for %s failed: %s", ticker, exc)
+            return None, ""
+        return (p.gex, "schwab") if p is not None else (None, "")
 
     def _qf_confirm(self, sig: dict, bars, books: dict, now: datetime) -> None:
         ok = qf.confirmed(bars, sig["bar"])
